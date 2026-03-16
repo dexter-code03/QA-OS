@@ -1,0 +1,1128 @@
+[
+  {
+    "ac_id": "AC-001",
+    "title": "Verify Address Search Field and Initial Suggestions Display",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen after completing personal info.",
+    "steps": [
+      "Locate the single address search input field.",
+      "Type a valid partial address (e.g., '1600 Amphitheatre Pkwy') into the field, ensuring the input meets the minimum threshold (~4 words or 50% expected length).",
+      "Pause typing to trigger the debounce logic."
+    ],
+    "expected_result": "A dropdown list of relevant address suggestions from the Melissa Global Express Entry API appears below the input field within approximately 50-150ms after the debounce period ends.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Suggestions Dropdown",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSuggestionsDropdown",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "partial_address": "1600 Amphitheatre Pkwy"
+    }
+  },
+  {
+    "ac_id": "AC-002",
+    "title": "Verify Debounce Logic Prevents Excessive API Calls",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Locate the address search input field.",
+      "Rapidly type a valid address (e.g., '123 Main Street Anytown USA') without pausing, ensuring the input exceeds the minimum threshold.",
+      "Monitor network requests to the Melissa Global Express Entry API."
+    ],
+    "expected_result": "Only one API call to the Melissa Global Express Entry endpoint is triggered after the user pauses typing and the input threshold is met, preventing multiple calls during continuous rapid typing.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "rapid_address_input": "123 Main Street Anytown USA"
+    }
+  },
+  {
+    "ac_id": "AC-003",
+    "title": "Verify Autocomplete and Address Field Population on Suggestion Selection",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen, and address suggestions are displayed.",
+    "steps": [
+      "Type a partial address that generates suggestions (e.g., '1 Infinite Loop').",
+      "From the displayed dropdown list of suggestions, tap on a specific, complete address (e.g., '1 Infinite Loop, Cupertino, CA 95014')."
+    ],
+    "expected_result": "The selected complete address is populated into the address search field, and subsequently mapped into individual editable address fields (e.g., street name, house/building number, unit/apartment) displayed below the search field.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      },
+      {
+        "name": "First Suggestion Item",
+        "selector_type": "xpath",
+        "selector_value": "//XCUIElementTypeOther[@name='addressSuggestionsDropdown']/XCUIElementTypeCell[1]",
+        "confidence": "medium"
+      },
+      {
+        "name": "Street Name Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "streetNameInputField",
+        "confidence": "medium"
+      },
+      {
+        "name": "House Number Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "houseNumberInputField",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "partial_input": "1 Infinite Loop",
+      "selected_suggestion": "1 Infinite Loop, Cupertino, CA 95014"
+    }
+  },
+  {
+    "ac_id": "AC-004",
+    "title": "Verify Behavior When No Address Suggestions Are Found",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Type a clearly non-existent or highly ambiguous address into the search field (e.g., 'asdfghjkl zxcvbnm'), ensuring the input meets the minimum threshold.",
+      "Pause typing to trigger the Melissa API call."
+    ],
+    "expected_result": "No address suggestions are displayed in the dropdown. The user is allowed to continue typing manually or proceed with the entered address. An appropriate message (e.g., 'No suggestions found, please continue typing or enter manually') may be displayed.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      },
+      {
+        "name": "No Suggestions Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "noSuggestionsMessage",
+        "confidence": "low"
+      }
+    ],
+    "test_data": {
+      "non_existent_address": "asdfghjkl zxcvbnm"
+    }
+  },
+  {
+    "ac_id": "AC-005",
+    "title": "Verify Minimum Input Threshold for API Trigger",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Type a very short input (e.g., '123') into the address search field.",
+      "Pause typing and monitor network requests.",
+      "Continue typing in the same field to meet the minimum threshold (e.g., '123 Main Street'), then pause typing again.",
+      "Monitor network requests."
+    ],
+    "expected_result": "The Melissa Global Express Entry API is NOT triggered after typing '123' and pausing. The API IS triggered after typing '123 Main Street' (as it meets the '~4 words or 50% length' criteria) and pausing, displaying relevant suggestions.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "short_input": "123",
+      "threshold_met_input": "123 Main Street"
+    }
+  },
+  {
+    "ac_id": "AC-006",
+    "title": "Verify User Can Manually Enter Address Without Selecting Suggestion",
+    "module": "Address Search",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Type a complete and valid address (e.g., '742 Evergreen Terrace, Springfield, IL 62704') into the search field.",
+      "Do not select any suggestions from the dropdown.",
+      "Proceed to the next step in the onboarding flow (e.g., by tapping a 'Continue' button)."
+    ],
+    "expected_result": "The system accepts the manually entered address, and it is correctly mapped into individual address fields for verification or storage, without requiring a selection from the Melissa API suggestions.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Search Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "addressSearchInputField",
+        "confidence": "high"
+      },
+      {
+        "name": "Continue Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "continueButton",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "manual_address": "742 Evergreen Terrace, Springfield, IL 62704"
+    }
+  },
+  {
+    "ac_id": "AC-007",
+    "title": "Display and Selection of Address Suggestions",
+    "module": "Address Verification",
+    "precondition": "User is on the 'Complete legal address' screen with the address search input field visible.",
+    "steps": [
+      "Enter a partial, valid address (e.g., '1600 Amphitheatre Pkwy') into the address search field.",
+      "Pause typing for debounce logic to trigger."
+    ],
+    "expected_result": "A dropdown list of address suggestions is displayed below the input field. User can tap on a suggestion to select it.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Suggestion List",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_suggestion_list",
+        "confidence": "high"
+      },
+      {
+        "name": "First Suggestion Item",
+        "selector_type": "xpath",
+        "selector_value": "//XCUIElementTypeOther[@name='address_suggestion_list']/XCUIElementTypeCell[1]",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "partial_address": "1600 Amphitheatre Pkwy"
+    }
+  },
+  {
+    "ac_id": "AC-008",
+    "title": "Automatic Field Population from Selected Suggestion",
+    "module": "Address Verification",
+    "precondition": "User is on the 'Complete legal address' screen and has entered a partial address.",
+    "steps": [
+      "Enter a partial, valid address (e.g., '1600 Amphitheatre Pkwy') into the address search field.",
+      "Select a specific suggestion (e.g., '1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA') from the displayed list."
+    ],
+    "expected_result": "The individual address fields (AddressLine1, City, State, ZIP) are automatically populated with the standardized data from the selected suggestion.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "First Suggestion Item",
+        "selector_type": "xpath",
+        "selector_value": "//XCUIElementTypeOther[@name='address_suggestion_list']/XCUIElementTypeCell[1]",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Line 1 Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_line_1_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_field",
+        "confidence": "high"
+      },
+      {
+        "name": "State Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "state_field",
+        "confidence": "high"
+      },
+      {
+        "name": "ZIP Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "zip_field",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "partial_address": "1600 Amphitheatre Pkwy",
+      "expected_address_line1": "1600 Amphitheatre Pkwy",
+      "expected_city": "Mountain View",
+      "expected_state": "CA",
+      "expected_zip": "94043"
+    }
+  },
+  {
+    "ac_id": "AC-009",
+    "title": "Manual Address Entry and Verification Trigger",
+    "module": "Address Verification",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Enter a complete, valid address manually into the address search field without selecting any suggestions (e.g., '123 Main St, Anytown, CA 90210').",
+      "Tap the 'Confirm Address' button."
+    ],
+    "expected_result": "The system triggers the Global Address Verification API. Upon successful verification, the individual address fields (AddressLine1, City, State, ZIP) are populated with the standardized data.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Confirm Address Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "confirm_address_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Line 1 Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_line_1_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_field",
+        "confidence": "high"
+      },
+      {
+        "name": "State Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "state_field",
+        "confidence": "high"
+      },
+      {
+        "name": "ZIP Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "zip_field",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "manual_address": "123 Main St, Anytown, CA 90210",
+      "expected_address_line1": "123 Main St",
+      "expected_city": "Anytown",
+      "expected_state": "CA",
+      "expected_zip": "90210"
+    }
+  },
+  {
+    "ac_id": "AC-010",
+    "title": "Handling No Address Suggestions Found",
+    "module": "Address Verification",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Enter a highly obscure or intentionally invalid partial address (e.g., 'asdfghjkl') into the address search field.",
+      "Pause typing for debounce logic to trigger."
+    ],
+    "expected_result": "No address suggestions are displayed, or a 'No suggestions found' message appears. The user can still proceed to manually enter the full address and confirm.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "No Suggestions Found Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "no_suggestions_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "invalid_partial_address": "asdfghjkl"
+    }
+  },
+  {
+    "ac_id": "AC-011",
+    "title": "Editability of Populated Address Fields",
+    "module": "Address Verification",
+    "precondition": "Address fields (AddressLine1, City, State, ZIP) have been populated either by suggestion selection or manual entry and verification.",
+    "steps": [
+      "Select an address suggestion or manually enter a valid address to populate the fields.",
+      "Attempt to edit the content of the 'Address Line 1' field (e.g., add 'Apt 101').",
+      "Attempt to edit the content of the 'City' field (e.g., correct a typo).",
+      "Tap the 'Confirm Address' button after editing."
+    ],
+    "expected_result": "The user is able to modify the content of AddressLine1, City, State, and ZIP fields. The system should re-verify the edited address upon confirmation and update if necessary, or allow saving the edited address.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Line 1 Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_line_1_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_field",
+        "confidence": "high"
+      },
+      {
+        "name": "State Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "state_field",
+        "confidence": "high"
+      },
+      {
+        "name": "ZIP Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "zip_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Confirm Address Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "confirm_address_button",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "initial_address_line1": "123 Main St",
+      "edited_address_line1": "123 Main St Apt 101",
+      "initial_city": "Anytown",
+      "edited_city": "Anytown West"
+    }
+  },
+  {
+    "ac_id": "AC-012",
+    "title": "Handling Invalid Address Verification Result",
+    "module": "Address Verification",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Manually enter an address that is known to be invalid or un-verifiable by the Melissa Data API (e.g., '123 Nonexistent St, Fakeville, ZZ 00000').",
+      "Tap the 'Confirm Address' button."
+    ],
+    "expected_result": "The system displays an error message indicating that the address could not be verified or is invalid, prompting the user to correct it or providing options for manual override if applicable.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Confirm Address Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "confirm_address_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Error Message Display",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_verification_error_message",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "invalid_address": "123 Nonexistent St, Fakeville, ZZ 00000"
+    }
+  },
+  {
+    "ac_id": "AC-013",
+    "title": "Empty Address Input Field Submission",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Ensure the address search input field is empty.",
+      "Attempt to proceed to the next step (e.g., by tapping a 'Continue' or 'Verify' button, if available, or by attempting to submit an empty field if the flow allows)."
+    ],
+    "expected_result": "An inline error message (e.g., 'Address cannot be empty' or 'Please enter your address') is displayed below the input field, and the user is prevented from proceeding.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "Error Message Display",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_empty_error_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {}
+  },
+  {
+    "ac_id": "AC-014",
+    "title": "Address Input with Unconventional Special Characters",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen with active network connectivity.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Enter an address string containing a mix of valid address components and various special characters (e.g., '123 Main St #APT B @$%^&*()_+{}[]|\\:;\"'<>,.?/~`', City, State, Zip) into the address search input field.",
+      "Pause typing to trigger the Melissa Global Express Entry API debounce logic."
+    ],
+    "expected_result": "The system should gracefully handle the input. If the special characters render the address invalid or unsearchable by Melissa API, 'No address suggestions found' or a similar informative message should be displayed. The app must not crash or freeze.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "Suggestions Dropdown",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_suggestions_list",
+        "confidence": "medium"
+      },
+      {
+        "name": "No Suggestions Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "no_suggestions_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "input_address": "123 Main St #APT B @$%^&*()_+{}[]|\\:;\"'<>,.?/~`, Anytown, CA 90210"
+    }
+  },
+  {
+    "ac_id": "AC-015",
+    "title": "Melissa API Timeout During Address Search",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen with active network connectivity.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Enter a partial address (e.g., '123 Main St') into the address search input field.",
+      "Simulate a timeout from the Melissa Global Express Entry API (e.g., by using a network proxy to delay/block the response beyond the configured timeout threshold)."
+    ],
+    "expected_result": "A user-friendly error message (e.g., 'Unable to fetch address suggestions. Please try again later.' or 'Network connection unstable.') is displayed. The app remains responsive, allowing the user to retry or manually enter the address.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "Error Message Display",
+        "selector_type": "accessibility_id",
+        "selector_value": "api_timeout_error_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "input_address": "123 Main St"
+    }
+  },
+  {
+    "ac_id": "AC-016",
+    "title": "No Address Suggestions Found for Invalid Input",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen with active network connectivity.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Enter a clearly non-existent or gibberish address (e.g., 'asdfghjkl zxcvbnm qwertyuiop') into the address search input field, ensuring it meets the debounce threshold (approx. 4 words or 50% length).",
+      "Pause typing to trigger the Melissa Global Express Entry API call."
+    ],
+    "expected_result": "The system displays a message indicating 'No address suggestions found' or 'Please check your address and try again' below the input field, allowing the user to continue typing or manually enter the address.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "No Suggestions Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "no_suggestions_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "input_address": "asdfghjkl zxcvbnm qwertyuiop"
+    }
+  },
+  {
+    "ac_id": "AC-017",
+    "title": "Address Search with No Network Connectivity",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Disable all network connectivity (Wi-Fi and mobile data) on the device.",
+      "Enter a partial address (e.g., '456 Oak Ave') into the address search input field.",
+      "Pause typing to trigger the API call."
+    ],
+    "expected_result": "An immediate error message is displayed (e.g., 'No internet connection' or 'Please check your network settings'), preventing API calls and prompting the user to restore connectivity. The app should not crash or freeze.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "Network Error Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "network_error_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "input_address": "456 Oak Ave"
+    }
+  },
+  {
+    "ac_id": "AC-018",
+    "title": "Handling of PO Box Addresses",
+    "module": "Address Edge Cases & Errors",
+    "precondition": "User is on the 'Complete legal address' screen with active network connectivity.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Enter a valid PO Box address (e.g., 'PO Box 123, Anytown, CA 90210') into the address search input field.",
+      "Pause typing to trigger the Melissa Global Express Entry API call.",
+      "If suggestions appear, select the PO Box address and attempt to verify it via Global Address Verification."
+    ],
+    "expected_result": "The system should display a clear message stating that 'PO Box addresses are not accepted. Please provide a physical street address.' and prevent the user from proceeding with a PO Box address.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Address Input Field",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "medium"
+      },
+      {
+        "name": "Suggestions Dropdown",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_suggestions_list",
+        "confidence": "medium"
+      },
+      {
+        "name": "PO Box Error Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "po_box_error_message",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "input_address": "PO Box 123, Anytown, CA 90210"
+    }
+  },
+  {
+    "ac_id": "AC-019",
+    "title": "Display and Pre-population of Legal Address Fields",
+    "module": "Legal Address Form",
+    "precondition": "User has completed Personal Info and either selected an address from suggestions or proceeded to manual entry.",
+    "steps": [
+      "Navigate to the 'Complete legal address' screen.",
+      "Observe the address fields."
+    ],
+    "expected_result": "All relevant address fields (e.g., Street, Building/House Number, Unit/Apartment, City, State, Postal Code, Country) are displayed. If an address was previously selected from suggestions, these fields are pre-populated with the selected address details.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Complete legal address screen",
+        "selector_type": "accessibility_id",
+        "selector_value": "complete_legal_address_screen",
+        "confidence": "high"
+      },
+      {
+        "name": "Street field",
+        "selector_type": "accessibility_id",
+        "selector_value": "street_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Postal Code field",
+        "selector_type": "accessibility_id",
+        "selector_value": "postal_code_input_field",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "pre_populated_address": "123 Main St, Apt 4B, Anytown, CA 90210, USA"
+    }
+  },
+  {
+    "ac_id": "AC-020",
+    "title": "Manual Entry and Editing of Address Details",
+    "module": "Legal Address Form",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Tap on an address field (e.g., 'Street').",
+      "Enter or modify text in the field.",
+      "Repeat for other editable fields (e.g., 'Unit/Apartment', 'City')."
+    ],
+    "expected_result": "The user is able to freely enter and modify text in all editable address fields.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Street field",
+        "selector_type": "accessibility_id",
+        "selector_value": "street_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Unit/Apartment field",
+        "selector_type": "accessibility_id",
+        "selector_value": "unit_apartment_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_input_field",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "new_street_name": "456 Oak Avenue",
+      "new_unit_number": "Suite 100"
+    }
+  },
+  {
+    "ac_id": "AC-021",
+    "title": "Validation for Missing Required Address Fields",
+    "module": "Legal Address Form",
+    "precondition": "User is on the 'Complete legal address' screen with some required fields empty.",
+    "steps": [
+      "Ensure at least one required field (e.g., 'Street', 'City', 'Postal Code') is empty or cleared.",
+      "Tap the 'Save' or 'Continue' button."
+    ],
+    "expected_result": "An error message is displayed indicating the missing required field(s), and the user is prevented from proceeding. The empty required fields are highlighted.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Save/Continue button",
+        "selector_type": "accessibility_id",
+        "selector_value": "save_continue_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Error message text",
+        "selector_type": "accessibility_id",
+        "selector_value": "error_message_text",
+        "confidence": "high"
+      },
+      {
+        "name": "Street field",
+        "selector_type": "accessibility_id",
+        "selector_value": "street_input_field",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "empty_field": "Street"
+    }
+  },
+  {
+    "ac_id": "AC-022",
+    "title": "Field-Specific Data Format Validation",
+    "module": "Legal Address Form",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Enter invalid data into a specific field (e.g., alphabetic characters in a 'Postal Code' field that expects numeric, or exceeding character limits).",
+      "Tap the 'Save' or 'Continue' button."
+    ],
+    "expected_result": "An appropriate error message is displayed for the specific field, and the user is prevented from proceeding. The invalid field is highlighted.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Postal Code field",
+        "selector_type": "accessibility_id",
+        "selector_value": "postal_code_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Save/Continue button",
+        "selector_type": "accessibility_id",
+        "selector_value": "save_continue_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Error message text",
+        "selector_type": "accessibility_id",
+        "selector_value": "error_message_text",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "invalid_postal_code": "ABCDE",
+      "valid_postal_code_format": "12345"
+    }
+  },
+  {
+    "ac_id": "AC-023",
+    "title": "Successful Submission of Valid Legal Address",
+    "module": "Legal Address Form",
+    "precondition": "User is on the 'Complete legal address' screen with all required fields filled with valid, verifiable address data.",
+    "steps": [
+      "Enter a complete and valid legal address into all required fields.",
+      "Tap the 'Save' or 'Continue' button."
+    ],
+    "expected_result": "The address is successfully submitted, verified by the Melissa Global Address Verification API, and the user is navigated to the next step in the onboarding flow (e.g., 'Terms and Conditions' or 'Saving info').",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Street field",
+        "selector_type": "accessibility_id",
+        "selector_value": "street_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "City field",
+        "selector_type": "accessibility_id",
+        "selector_value": "city_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Postal Code field",
+        "selector_type": "accessibility_id",
+        "selector_value": "postal_code_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Save/Continue button",
+        "selector_type": "accessibility_id",
+        "selector_value": "save_continue_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Next screen title (e.g., Terms and Conditions)",
+        "selector_type": "accessibility_id",
+        "selector_value": "terms_conditions_title",
+        "confidence": "medium"
+      }
+    ],
+    "test_data": {
+      "valid_address": {
+        "street": "100 Main Street",
+        "city": "Springfield",
+        "state": "IL",
+        "postal_code": "62701",
+        "country": "USA"
+      }
+    }
+  },
+  {
+    "ac_id": "AC-024",
+    "title": "Error Handling for Unverifiable Address",
+    "module": "Legal Address Form",
+    "precondition": "User is on the 'Complete legal address' screen.",
+    "steps": [
+      "Enter an address that is syntactically valid but known to be unverifiable by the Melissa Global Address Verification API (e.g., a fictitious address).",
+      "Tap the 'Save' or 'Continue' button."
+    ],
+    "expected_result": "An error message is displayed indicating that the address could not be verified, and the user is prompted to correct or re-enter the address. The user remains on the 'Complete legal address' screen.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Street field",
+        "selector_type": "accessibility_id",
+        "selector_value": "street_input_field",
+        "confidence": "high"
+      },
+      {
+        "name": "Save/Continue button",
+        "selector_type": "accessibility_id",
+        "selector_value": "save_continue_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Error message text",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_verification_error_message",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "unverifiable_address": {
+        "street": "999 Fictional Lane",
+        "city": "Imaginary",
+        "state": "ZZ",
+        "postal_code": "00000",
+        "country": "USA"
+      }
+    }
+  },
+  {
+    "ac_id": "AC-025",
+    "title": "Successful OTP Verification and Navigation",
+    "module": "Onboarding Flow",
+    "precondition": "User has entered a valid phone number on the 'New phone no.' screen and received an OTP.",
+    "steps": [
+      "Navigate to the 'OTP' screen.",
+      "Enter the correct 6-digit OTP into the input fields.",
+      "Tap the 'Verify' button."
+    ],
+    "expected_result": "The user is successfully authenticated and navigated to the 'Personal info' screen.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "OTP Input Field 1",
+        "selector_type": "accessibility_id",
+        "selector_value": "otp_input_1",
+        "confidence": "medium"
+      },
+      {
+        "name": "Verify Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "verify_button",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "phone_number": "+919876543210",
+      "valid_otp": "123456"
+    }
+  },
+  {
+    "ac_id": "AC-026",
+    "title": "Personal Info and Address Entry with Melissa Data Integration",
+    "module": "Onboarding Flow",
+    "precondition": "User has successfully completed OTP verification and is on the 'Personal info' screen.",
+    "steps": [
+      "Enter a valid 'Full Name' in the designated field.",
+      "Select a valid 'Date of Birth' using the date picker.",
+      "Tap the 'Next' button.",
+      "On the 'Complete legal address' screen, start typing a valid address in the address search input field.",
+      "Select a suggested address from the dropdown list provided by Melissa Global Express Entry API.",
+      "Verify that individual address fields are pre-populated correctly.",
+      "Tap the 'Confirm Address' button."
+    ],
+    "expected_result": "All personal information (Name, DOB, Address) is successfully captured and validated, and the user is navigated to the 'Terms and Conditions' screen.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Full Name Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "full_name_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Date of Birth Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "dob_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Next Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "next_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Search Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_search_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Address Suggestions List",
+        "selector_type": "accessibility_id",
+        "selector_value": "address_suggestions_list",
+        "confidence": "medium"
+      },
+      {
+        "name": "Confirm Address Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "confirm_address_button",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "full_name": "John Doe",
+      "date_of_birth": "01/01/1990",
+      "address_string": "1600 Amphitheatre Pkwy, Mountain View, CA"
+    }
+  },
+  {
+    "ac_id": "AC-027",
+    "title": "Terms and Conditions Acceptance and Onboarding Completion",
+    "module": "Onboarding Flow",
+    "precondition": "User has successfully entered personal information and is on the 'Terms and Conditions' screen.",
+    "steps": [
+      "Scroll through and review the Terms and Conditions content.",
+      "Tap the 'Accept' checkbox or button to indicate agreement.",
+      "Tap the 'Continue' button."
+    ],
+    "expected_result": "The Terms and Conditions are accepted, and the user is navigated to the 'Saving info' screen, followed by the 'Welcome to your new walit!' or 'Create Walit PIN' screen, indicating successful onboarding completion.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "Terms and Conditions Content",
+        "selector_type": "accessibility_id",
+        "selector_value": "tnc_content_view",
+        "confidence": "medium"
+      },
+      {
+        "name": "Accept Checkbox/Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "accept_tnc_checkbox",
+        "confidence": "high"
+      },
+      {
+        "name": "Continue Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "continue_button",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {}
+  },
+  {
+    "ac_id": "AC-028",
+    "title": "Back Button Navigation and Data Persistence",
+    "module": "Onboarding Flow",
+    "precondition": "User has completed the 'Personal info' screen and is currently on the 'Complete legal address' screen.",
+    "steps": [
+      "Tap the 'Back' button (system or in-app) on the 'Complete legal address' screen."
+    ],
+    "expected_result": "The user is navigated back to the 'Personal info' screen, and all previously entered data (Full Name, Date of Birth) is retained and displayed correctly in their respective input fields.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Back Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "back_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Full Name Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "full_name_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Date of Birth Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "dob_input",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "full_name": "John Doe",
+      "date_of_birth": "01/01/1990"
+    }
+  },
+  {
+    "ac_id": "AC-029",
+    "title": "Invalid OTP Error Handling and Alert Display",
+    "module": "Onboarding Flow",
+    "precondition": "User has entered a valid phone number and is on the 'OTP' screen awaiting OTP entry.",
+    "steps": [
+      "Enter an incorrect 6-digit OTP into the input fields.",
+      "Tap the 'Verify' button."
+    ],
+    "expected_result": "An 'Alert' dialog is displayed with an appropriate error message (e.g., 'Invalid OTP. Please try again.'), and the user remains on the 'OTP' screen with the option to re-enter or resend OTP.",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "OTP Input Field 1",
+        "selector_type": "accessibility_id",
+        "selector_value": "otp_input_1",
+        "confidence": "medium"
+      },
+      {
+        "name": "Verify Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "verify_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Alert Dialog Title",
+        "selector_type": "accessibility_id",
+        "selector_value": "alert_title",
+        "confidence": "high"
+      },
+      {
+        "name": "Alert Message",
+        "selector_type": "accessibility_id",
+        "selector_value": "alert_message",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "phone_number": "+919876543210",
+      "invalid_otp": "999999"
+    }
+  },
+  {
+    "ac_id": "AC-030",
+    "title": "Mandatory Personal Information Field Validation and Alerts",
+    "module": "Onboarding Flow",
+    "precondition": "User has successfully completed OTP verification and is on the 'Personal info' screen.",
+    "steps": [
+      "Leave the 'Full Name' field empty.",
+      "Enter a valid 'Date of Birth'.",
+      "Tap the 'Next' button."
+    ],
+    "expected_result": "An 'Alert' dialog or an inline error message is displayed, clearly indicating that 'Full Name' is a mandatory field, and the user remains on the 'Personal info' screen.",
+    "priority": "P1",
+    "test_objects": [
+      {
+        "name": "Full Name Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "full_name_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Date of Birth Input",
+        "selector_type": "accessibility_id",
+        "selector_value": "dob_input",
+        "confidence": "high"
+      },
+      {
+        "name": "Next Button",
+        "selector_type": "accessibility_id",
+        "selector_value": "next_button",
+        "confidence": "high"
+      },
+      {
+        "name": "Error Message/Alert",
+        "selector_type": "accessibility_id",
+        "selector_value": "error_message_full_name",
+        "confidence": "high"
+      }
+    ],
+    "test_data": {
+      "full_name": "",
+      "date_of_birth": "01/01/1990"
+    }
+  }
+]

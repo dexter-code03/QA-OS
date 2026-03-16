@@ -1,0 +1,28 @@
+[
+  {
+    "ac_id": "AC-001",
+    "title": "Address Search - Valid Partial Input Returns Suggestions",
+    "module": "Address Verification",
+    "precondition": "User has completed phone verification and personal info (Full Name, DOB) and is on the 'Complete legal address' screen.",
+    "steps": [
+      "Locate the address search input field.",
+      "Type '1600 Pennsyl' into the address search field.",
+      "Pause typing to trigger debounce logic and API call."
+    ],
+    "expected_result": "A dropdown list of address suggestions appears below the input field, containing at least one relevant address (e.g., '1600 Pennsylvania Avenue NW, Washington, DC').",
+    "priority": "P0",
+    "test_objects": [
+      {
+        "name": "txt_addressSearch",
+        "selector_type": "accessibility_id",
+        "selector_value": "Address Search Input Field",
+        "confidence": "high"
+      },
+      {
+        "name": "lst_suggestions",
+        "selector_type": "xpath",
+        "selector_value": "//android.widget.ListView[@resource-id='com.paytm.superapp:id/address_suggestions_list'] | //XCUIElementTypeOther[@name='Address Suggestions List']",
+        "confidence": "medium"
+      }
+    ],
+    "test_

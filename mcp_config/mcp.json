@@ -1,0 +1,40 @@
+{
+  "mcpServers": {
+    "jira": {
+      "url": "https://mcp.atlassian.com/jira",
+      "env": {
+        "JIRA_URL": "https://yourcompany.atlassian.net",
+        "JIRA_TOKEN": "your-jira-api-token"
+      }
+    },
+    "confluence": {
+      "url": "https://mcp.atlassian.com/confluence",
+      "env": {
+        "CONFLUENCE_URL": "https://yourcompany.atlassian.net",
+        "CONFLUENCE_TOKEN": "your-confluence-api-token"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "your-github-token"
+      }
+    },
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "figma-mcp"],
+      "env": {
+        "FIGMA_TOKEN": "your-figma-personal-access-token"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/path/to/your/katalon/project"
+      ]
+    }
+  }
+}

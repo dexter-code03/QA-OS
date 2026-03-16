@@ -1,0 +1,22 @@
+[
+  {
+    "name": "\ud83d\udfe0 Sprint 5: Debit/credit card or Bank account deletion SAPP delete journey | Walit delete journey",
+    "type": "TEXT",
+    "path": "Document/    \ud83d\udfe0 User journey/\ud83d\udfe0 Sprint 5: Debit/credit card or Bank account deletion SAPP delete journey | Walit delete journey"
+  },
+  {
+    "name": "Cashback Filter Added (See \u201cActivity\u201d section in \u201cSprint 2\u201d) 3DS-enabled authentication flow added (See \u201c3DS-enabled authentication flow\u201d section in \u201cSprint 2\u201d)",
+    "type": "TEXT",
+    "path": "Document/    \ud83d\udfe0 User journey/Cashback Filter Added (See \u201cActivity\u201d section in \u201cSprint 2\u201d) 3DS-enabled authentication flow added (See \u201c3DS-enabled authentication flow\u201d section in \u201cSprint 2\u201d)"
+  },
+  {
+    "name": "Melissa search implemented",
+    "type": "TEXT",
+    "path": "Document/    \ud83d\udfe0 User journey/Melissa search implemented"
+  },
+  {
+    "name": "Field",
+    "type": "INSTANCE",
+    "path": "Document/Archive/mobile money home section/Field"
+  }
+]
