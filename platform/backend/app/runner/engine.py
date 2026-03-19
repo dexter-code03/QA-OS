@@ -29,6 +29,16 @@ class RunEngine:
     def __init__(self) -> None:
         self._q: asyncio.Queue[EnqueuedRun] = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
+        self._cancel_requested: set[int] = set()
+
+    def request_cancel(self, run_id: int) -> None:
+        self._cancel_requested.add(run_id)
+
+    def is_cancelled(self, run_id: int) -> bool:
+        return run_id in self._cancel_requested
+
+    def clear_cancel(self, run_id: int) -> None:
+        self._cancel_requested.discard(run_id)
 
     def start(self) -> None:
         if self._task:
@@ -50,6 +60,16 @@ class RunEngine:
                 await event_bus.publish(RunEvent(run_id=item.run_id, type="engine_error", payload={"error": str(e)}))
 
     async def _execute(self, run_id: int) -> None:
+        if self.is_cancelled(run_id):
+            with SessionLocal() as db:
+                r = db.query(Run).filter(Run.id == run_id).first()
+                if r:
+                    r.status = "cancelled"
+                    r.finished_at = datetime.utcnow()
+                    db.commit()
+            self.clear_cancel(run_id)
+            await event_bus.publish(RunEvent(run_id=run_id, type="finished", payload={"status": "cancelled"}))
+            return
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             if not r:
@@ -93,6 +113,9 @@ class RunEngine:
             raw_steps = self._steps_for_run(run_id)
             steps = parse_steps(raw_steps)
 
+            def cancel_check() -> bool:
+                return self.is_cancelled(run_id)
+
             def on_step(idx, step, status, details):
                 shot = save_screenshot(driver, run_dir, f"step_{idx:03d}_{status}.png")
                 src = save_page_source(driver, run_dir, f"step_{idx:03d}.xml")
@@ -115,7 +138,7 @@ class RunEngine:
                     )
                 )
 
-            summary = run_steps(driver, steps, on_step=on_step)
+            summary = run_steps(driver, steps, on_step=on_step, cancel_check=cancel_check)
 
             # stop recording
             if rec:
@@ -128,7 +151,9 @@ class RunEngine:
                 if ok:
                     artifacts["video"] = ios_rec.out_path.name
 
-            verdict = "passed" if summary.get("failedSteps", 0) == 0 else "failed"
+            cancelled = self.is_cancelled(run_id)
+            self.clear_cancel(run_id)
+            verdict = "cancelled" if cancelled else ("passed" if summary.get("failedSteps", 0) == 0 else "failed")
             summary["stepDefinitions"] = raw_steps
             with SessionLocal() as db:
                 r = db.query(Run).filter(Run.id == run_id).first()
@@ -152,6 +177,7 @@ class RunEngine:
                     db.commit()
             await event_bus.publish(RunEvent(run_id=run_id, type="finished", payload={"status": "error", "error": str(e), "artifacts": artifacts}))
         finally:
+            self.clear_cancel(run_id)
             try:
                 if driver:
                     driver.quit()

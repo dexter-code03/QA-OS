@@ -38,3 +38,7 @@ platform/frontend/tsconfig.tsbuildinfo
 *.swp
 *.swo
 .DS_Store
+
+# GitHub CLI (local install)
+gh.zip
+gh_2.*/

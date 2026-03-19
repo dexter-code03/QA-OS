@@ -95,6 +95,7 @@ function XmlTreeNode({
   expanded,
   onToggle,
   onCopy,
+  onNodeClick,
 }: {
   node: XmlNode;
   depth: number;
@@ -102,6 +103,7 @@ function XmlTreeNode({
   expanded: Set<string>;
   onToggle: (p: string) => void;
   onCopy: (s: string, v: string) => void;
+  onNodeClick?: (selector: { using: string; value: string }) => void;
 }) {
   const hasChildren = node.children.length > 0;
   const isExpanded = expanded.has(path);
@@ -123,10 +125,17 @@ function XmlTreeNode({
           padding: "2px 0",
           borderLeft: hasIdentifiers ? "2px solid rgba(99,102,241,.5)" : "2px solid transparent",
           paddingLeft: 4,
+          cursor: onNodeClick && hasIdentifiers ? "pointer" : "default",
+        }}
+        onClick={() => {
+          if (onNodeClick && hasIdentifiers && locators.length > 0) {
+            const best = locators[0];
+            onNodeClick({ using: best.strategy === "id" ? "id" : "accessibilityId", value: best.value });
+          }
         }}
       >
         <span
-          onClick={() => hasChildren && onToggle(path)}
+          onClick={(e) => { e.stopPropagation(); hasChildren && onToggle(path); }}
           style={{
             cursor: hasChildren ? "pointer" : "default",
             color: "var(--muted)",
@@ -157,7 +166,7 @@ function XmlTreeNode({
             <span style={{ color: "var(--muted)", marginLeft: 6, fontSize: 10 }}>{bounds}</span>
           )}
           {locators.length > 0 && (
-            <span style={{ marginLeft: 8, display: "inline-flex", gap: 4, flexWrap: "wrap" }}>
+            <span style={{ marginLeft: 8, display: "inline-flex", gap: 4, flexWrap: "wrap" }} onClick={e => e.stopPropagation()}>
               {locators.map((l, i) => (
                 <button
                   key={i}
@@ -183,6 +192,7 @@ function XmlTreeNode({
             expanded={expanded}
             onToggle={onToggle}
             onCopy={onCopy}
+            onNodeClick={onNodeClick}
           />
         ))}
     </div>
@@ -192,9 +202,11 @@ function XmlTreeNode({
 export function XmlElementTree({
   xml,
   onCopy,
+  onNodeClick,
 }: {
   xml: string;
   onCopy?: (msg: string) => void;
+  onNodeClick?: (selector: { using: string; value: string }) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set(["0"]));
   const [viewMode, setViewMode] = useState<"tree" | "raw">("tree");
@@ -296,7 +308,7 @@ export function XmlElementTree({
         </label>
       </div>
       <div style={{ maxHeight: 320, overflow: "auto" }}>
-        <XmlTreeNode node={filteredTree} depth={0} path="0" expanded={expanded} onToggle={toggle} onCopy={handleCopy} />
+        <XmlTreeNode node={filteredTree} depth={0} path="0" expanded={expanded} onToggle={toggle} onCopy={handleCopy} onNodeClick={onNodeClick} />
       </div>
     </div>
   );

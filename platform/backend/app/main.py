@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import subprocess
 import uuid
 import zipfile
@@ -15,7 +16,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .db import SessionLocal, init_db, Project, Module, TestSuite, Build, TestDefinition, Run
 from .events import event_bus, RunEvent
@@ -33,16 +34,20 @@ from .schemas import (
     RunCreate,
     RunOut,
 )
-from .settings import settings, ensure_dirs
+from .settings import ensure_dirs, load_encrypted_json, save_encrypted_json, settings
 from .runner.engine import run_engine
 from pydantic import BaseModel
 
 
 app = FastAPI(title="QA Platform (Local Appium TestOps)", version="0.1.0")
 
+ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+AUTH_COOKIE_NAME = "qa_os_token"
+AUTH_TOKEN_FILE = settings.data_dir / "token.txt"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,9 +58,7 @@ ONBOARDING_FILE = settings.data_dir / "onboarding.json"
 
 
 def _load_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        return json.loads(SETTINGS_FILE.read_text())
-    return {}
+    return load_encrypted_json(SETTINGS_FILE)
 
 
 def _ai_creds(s: dict | None = None) -> tuple[str, str]:
@@ -67,15 +70,75 @@ def _ai_creds(s: dict | None = None) -> tuple[str, str]:
 
 
 def _save_settings(data: dict) -> None:
+    save_encrypted_json(SETTINGS_FILE, data)
+
+
+def _write_private_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value)
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _get_auth_token() -> str:
     ensure_dirs()
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    if AUTH_TOKEN_FILE.exists():
+        token = AUTH_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    _write_private_text(AUTH_TOKEN_FILE, f"{token}\n")
+    return token
+
+
+def _extract_bearer_token(value: str | None) -> str:
+    if not value:
+        return ""
+    scheme, _, token = value.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return token.strip()
+
+
+def _extract_request_token(request: Request) -> str:
+    return (
+        _extract_bearer_token(request.headers.get("Authorization"))
+        or request.cookies.get(AUTH_COOKIE_NAME, "")
+        or request.query_params.get("token", "")
+    )
+
+
+def _extract_websocket_token(websocket: WebSocket) -> str:
+    return (
+        _extract_bearer_token(websocket.headers.get("authorization"))
+        or websocket.cookies.get(AUTH_COOKIE_NAME, "")
+        or websocket.query_params.get("token", "")
+    )
 
 
 @app.on_event("startup")
 async def _startup() -> None:
     ensure_dirs()
     init_db()
+    _get_auth_token()
     run_engine.start()
+
+
+@app.middleware("http")
+async def require_local_token(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in {"/api/health", "/api/auth/token"}:
+        return await call_next(request)
+
+    if _extract_request_token(request) != _get_auth_token():
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
 
 
 def _run_to_out(r: Run) -> RunOut:
@@ -100,6 +163,23 @@ def _run_to_out(r: Run) -> RunOut:
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+
+@app.get("/api/auth/token")
+def get_auth_token(request: Request) -> JSONResponse:
+    if request.headers.get("origin") not in (None, "", *ALLOWED_ORIGINS):
+        raise HTTPException(status_code=403, detail="Origin not allowed")
+    token = _get_auth_token()
+    response = JSONResponse({"token": token})
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        path="/",
+    )
+    return response
 
 
 # ── Settings & Onboarding ──────────────────────────────────────────────
@@ -892,23 +972,50 @@ def _parse_apk_manifest(apk_path: str) -> dict:
 
 # ── Builds ────────────────────────────────────────────────────────────
 
+_BUILD_ALLOWED_EXTENSIONS = {".apk", ".ipa", ".app", ".zip"}
+_BUILD_MAX_SIZE_BYTES = 500 * 1024 * 1024  # 500MB
+
+
+def _sanitize_build_filename(name: str) -> str:
+    """Sanitize filename: strip path, remove dangerous chars."""
+    p = Path(name or "build")
+    safe = p.name
+    safe = re.sub(r"[^\w\-\.]", "_", safe)
+    return safe or "build"
+
+
 @app.post("/api/projects/{project_id}/builds", response_model=BuildOut)
 async def upload_build(project_id: int, platform: str, file: UploadFile = File(...)) -> BuildOut:
     if platform not in ("android", "ios_sim"):
         raise HTTPException(status_code=400, detail="platform must be android|ios_sim")
 
     fname_lower = (file.filename or "").lower()
+    ext_ok = any(fname_lower.endswith(ext) for ext in _BUILD_ALLOWED_EXTENSIONS) or fname_lower.endswith(".app.zip")
+    if not ext_ok:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(sorted(_BUILD_ALLOWED_EXTENSIONS))}, .app.zip",
+        )
+
     if fname_lower.endswith((".app", ".app.zip", ".ipa")):
         platform = "ios_sim"
     elif fname_lower.endswith(".apk"):
         platform = "android"
 
+    content = b""
+    size = 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > _BUILD_MAX_SIZE_BYTES:
+            raise HTTPException(status_code=413, detail="File exceeds 500MB limit")
+        content += chunk
+
+    safe_fname = _sanitize_build_filename(file.filename)
     ensure_dirs()
     out_dir = settings.uploads_dir / str(project_id) / platform
     out_dir.mkdir(parents=True, exist_ok=True)
-    dest = out_dir / file.filename
+    dest = out_dir / safe_fname
 
-    content = await file.read()
     dest.write_bytes(content)
 
     meta: dict = {}
@@ -916,7 +1023,7 @@ async def upload_build(project_id: int, platform: str, file: UploadFile = File(.
         meta = _parse_apk_manifest(str(dest))
     elif platform == "ios_sim":
         meta["bundle_id"] = ""
-        meta["display_name"] = Path(file.filename or "app").stem
+        meta["display_name"] = Path(safe_fname).stem
 
     with SessionLocal() as db:
         p = db.query(Project).filter(Project.id == project_id).first()
@@ -925,7 +1032,7 @@ async def upload_build(project_id: int, platform: str, file: UploadFile = File(.
         b = Build(
             project_id=project_id,
             platform=platform,
-            file_name=file.filename,
+            file_name=safe_fname,
             file_path=str(dest),
             build_metadata=meta,
         )
@@ -1241,6 +1348,18 @@ def list_runs(project_id: int) -> list[RunOut]:
         return [_run_to_out(r) for r in runs]
 
 
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        r = db.query(Run).filter(Run.id == run_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if r.status not in ("queued", "running"):
+            return {"ok": True, "status": r.status, "message": f"Run already {r.status}"}
+    run_engine.request_cancel(run_id)
+    return {"ok": True, "message": "Cancel requested"}
+
+
 @app.delete("/api/runs/{run_id}")
 def delete_run(run_id: int) -> dict[str, Any]:
     with SessionLocal() as db:
@@ -1415,6 +1534,9 @@ def export_katalon(run_id: int):
 
 @app.websocket("/ws/runs/{run_id}")
 async def ws_run_events(websocket: WebSocket, run_id: int):
+    if _extract_websocket_token(websocket) != _get_auth_token():
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     q = event_bus.subscribe(run_id)
     try:

@@ -1,4 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DndContext, closestCenter, DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TestDef } from "./api";
 import { XmlElementTree, simplifyXmlForAI } from "./XmlElementTree";
 
@@ -603,7 +606,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       }
       if (ev.type === "finished") { loadRun(activeRunId); onRefresh(); }
     };
-    pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
+    pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
     return () => { ws.close(); if (pollRef.current) clearInterval(pollRef.current); };
   }, [activeRunId, loadRun, onRefresh]);
 
@@ -1177,7 +1180,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
         <div style={{ display: "flex", gap: 10 }}>
           {agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "#a78bfa", borderColor: "rgba(167,139,250,.4)" }} onClick={pauseAgent}>⏸ Pause Agent</button>}
           {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }}>⏸ Pause</button>}
-          {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }}>⏹ Stop</button>}
+          {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }} onClick={async () => { try { await api.cancelRun(run!.id); toast("Stop requested", "info"); } catch (e: any) { toast(e.message, "error"); } }}>⏹ Stop</button>}
           {run && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={() => api.exportKatalon(run.id)}>⬇ Katalon</button>}
           {run && screenshots.length > 0 && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={downloadVideo}>🎬 Video</button>}
           {isFailed && <button className="btn-primary" style={{ fontSize: 11, padding: "7px 14px", background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiFixRun} disabled={fixBusy}>{fixBusy ? "⏳ AI Analyzing..." : "🤖 AI Fix"}</button>}
@@ -1558,42 +1561,68 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
 const STEP_TYPES = ["tap", "type", "wait", "waitForVisible", "assertText", "assertVisible", "takeScreenshot", "swipe", "keyboardAction", "hideKeyboard"];
 const NO_SELECTOR_TYPES = new Set(["wait", "hideKeyboard", "takeScreenshot"]);
 
-function StepBuilder({ steps, setSteps, stepStatuses }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[] }) {
+function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: `step-${i}` });
+  const st = stepStatuses?.[i];
+  const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 };
+  const update = (fn: (n: any[]) => void) => { const n = [...steps]; fn(n); setSteps(n); };
+  const hasSelector = !NO_SELECTOR_TYPES.has(s.type) && s.type !== "keyboardAction";
+  const isPicking = selectorPickStepIndex === i;
+  return (
+    <div ref={setNodeRef} style={style} className="step-builder-row">
+      <span {...attributes} {...listeners} style={{ fontSize: 12, color: "var(--muted)", cursor: "grab", minWidth: 20, userSelect: "none" }} title="Drag to reorder">⋮⋮</span>
+      <span style={{ fontSize: 10, color: "var(--muted)", minWidth: 20 }}>{i + 1}</span>
+      {st && <span style={{ fontSize: 9, fontWeight: 700, minWidth: 42, color: st === "passed" ? "#00e5a0" : st === "failed" ? "#ff3b5c" : "#8a8f98" }}>{st.toUpperCase()}</span>}
+      <select value={s.type} onChange={e => update(n => { n[i] = { ...n[i], type: e.target.value }; })}>
+        {STEP_TYPES.map(t => <option key={t}>{t}</option>)}
+      </select>
+      {hasSelector && (
+        <>
+          <select value={s.selector?.using || "accessibilityId"} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; })} style={{ width: 110 }}>
+            {["accessibilityId", "id", "xpath", "className"].map(u => <option key={u}>{u}</option>)}
+          </select>
+          <input value={s.selector?.value || ""} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, value: e.target.value } }; })} placeholder="selector value" style={{ flex: 1 }} />
+          {onPickStep && (
+            <button className="btn-ghost btn-sm" style={{ fontSize: 9, padding: "2px 6px", borderColor: isPicking ? "var(--accent)" : undefined }} onClick={() => onPickStep(i)} title="Pick selector from XML tree">
+              {isPicking ? "⏳ Pick…" : "📋 Pick"}
+            </button>
+          )}
+        </>
+      )}
+      {s.type === "keyboardAction" && (
+        <select value={s.text || "return"} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} style={{ width: 100 }}>
+          {["return", "done", "go", "next", "search", "send"].map(k => <option key={k}>{k}</option>)}
+        </select>
+      )}
+      {s.type === "type" && <input value={s.text || ""} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} placeholder="text to type" style={{ flex: 1 }} />}
+      {s.type === "assertText" && <input value={s.expect || ""} onChange={e => update(n => { n[i] = { ...n[i], expect: e.target.value }; })} placeholder="expected text" style={{ flex: 1 }} />}
+      {s.type === "swipe" && (
+        <select value={s.text || "up"} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })}>
+          {["up", "down", "left", "right"].map(d => <option key={d}>{d}</option>)}
+        </select>
+      )}
+      {(s.type === "wait" || s.type === "waitForVisible") && <input type="number" value={s.ms || 1000} onChange={e => update(n => { n[i] = { ...n[i], ms: Number(e.target.value) }; })} placeholder="ms" style={{ width: 70 }} />}
+      <button className="btn-ghost btn-sm" onClick={() => setSteps(steps.filter((_, j) => j !== i))} title="Remove step">✕</button>
+    </div>
+  );
+}
+
+function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void }) {
+  const ids = useMemo(() => steps.map((_, i) => `step-${i}`), [steps.length]);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
+  const handleDragEnd = useCallback((event: DragEndEvent) => {
+    if (!event.over || event.active.id === event.over.id) return;
+    const oldIdx = ids.indexOf(String(event.active.id));
+    const newIdx = ids.indexOf(String(event.over.id));
+    if (oldIdx >= 0 && newIdx >= 0) setSteps(arrayMove(steps, oldIdx, newIdx));
+  }, [steps, ids, setSteps]);
   return (
     <div className="step-builder">
-      {steps.map((s, i) => {
-        const st = stepStatuses?.[i];
-        return (
-        <div key={i} className="step-builder-row">
-          <span style={{ fontSize: 10, color: "var(--muted)", minWidth: 20 }}>{i + 1}</span>
-          {st && <span style={{ fontSize: 9, fontWeight: 700, minWidth: 42, color: st === "passed" ? "#00e5a0" : st === "failed" ? "#ff3b5c" : "#8a8f98" }}>{st.toUpperCase()}</span>}
-          <select value={s.type} onChange={e => { const n = [...steps]; n[i] = { ...n[i], type: e.target.value }; setSteps(n); }}>
-            {STEP_TYPES.map(t => <option key={t}>{t}</option>)}
-          </select>
-          {!NO_SELECTOR_TYPES.has(s.type) && s.type !== "keyboardAction" && (
-            <>
-              <select value={s.selector?.using || "accessibilityId"} onChange={e => { const n = [...steps]; n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; setSteps(n); }} style={{ width: 110 }}>
-                {["accessibilityId", "id", "xpath", "className"].map(u => <option key={u}>{u}</option>)}
-              </select>
-              <input value={s.selector?.value || ""} onChange={e => { const n = [...steps]; n[i] = { ...n[i], selector: { ...n[i].selector, value: e.target.value } }; setSteps(n); }} placeholder="selector value" style={{ flex: 1 }} />
-            </>
-          )}
-          {s.type === "keyboardAction" && (
-            <select value={s.text || "return"} onChange={e => { const n = [...steps]; n[i] = { ...n[i], text: e.target.value }; setSteps(n); }} style={{ width: 100 }}>
-              {["return", "done", "go", "next", "search", "send"].map(k => <option key={k}>{k}</option>)}
-            </select>
-          )}
-          {s.type === "type" && <input value={s.text || ""} onChange={e => { const n = [...steps]; n[i] = { ...n[i], text: e.target.value }; setSteps(n); }} placeholder="text to type" style={{ flex: 1 }} />}
-          {s.type === "assertText" && <input value={s.expect || ""} onChange={e => { const n = [...steps]; n[i] = { ...n[i], expect: e.target.value }; setSteps(n); }} placeholder="expected text" style={{ flex: 1 }} />}
-          {s.type === "swipe" && (
-            <select value={s.text || "up"} onChange={e => { const n = [...steps]; n[i] = { ...n[i], text: e.target.value }; setSteps(n); }}>
-              {["up", "down", "left", "right"].map(d => <option key={d}>{d}</option>)}
-            </select>
-          )}
-          {(s.type === "wait" || s.type === "waitForVisible") && <input type="number" value={s.ms || 1000} onChange={e => { const n = [...steps]; n[i] = { ...n[i], ms: Number(e.target.value) }; setSteps(n); }} placeholder="ms" style={{ width: 70 }} />}
-          <button className="btn-ghost btn-sm" onClick={() => setSteps(steps.filter((_, j) => j !== i))} title="Remove step">✕</button>
-        </div>
-      );})}
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+          {steps.map((s, i) => <SortableStepRow key={ids[i]} s={s} i={i} steps={steps} setSteps={setSteps} stepStatuses={stepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={onPickStep} />)}
+        </SortableContext>
+      </DndContext>
       <button className="btn-ghost btn-sm" style={{ marginTop: 6 }} onClick={() => setSteps([...steps, { type: "tap", selector: { using: "accessibilityId", value: "" } }])}>+ Add Step</button>
     </div>
   );
@@ -1641,6 +1670,12 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   // Related tests when editing (for suggestion banner)
   const [editRelated, setEditRelated] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
 
+  // XML click-to-fill: captured page source when editing/creating, and which step to fill
+  const [editXml, setEditXml] = useState<string | null>(null);
+  const [selectorPickStepIndex, setSelectorPickStepIndex] = useState<number | null>(null);
+  const [newXml, setNewXml] = useState<string | null>(null);
+  const [newSelectorPickStepIndex, setNewSelectorPickStepIndex] = useState<number | null>(null);
+
   const aiGenerate = async () => {
     if (!aiPrompt.trim()) { toast("Describe the test", "error"); return; }
     setBusy(true); setAiStatus("Generating...");
@@ -1655,17 +1690,17 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
     if (!newName.trim()) { toast("Enter test name", "error"); return; }
     if (!newSteps.length) { toast("Add steps", "error"); return; }
     setBusy(true);
-    try { await api.createTest(project.id, { name: newName.trim(), steps: newSteps, suite_id: newSuiteId, prerequisite_test_id: newPrerequisiteId, acceptance_criteria: newAcceptanceCriteria.trim() || null }); toast("Test saved", "success"); setNewName(""); setNewSteps([]); setNewPrerequisiteId(null); setNewAcceptanceCriteria(""); setShowCreate(false); onRefresh(); }
+    try { await api.createTest(project.id, { name: newName.trim(), steps: newSteps, suite_id: newSuiteId, prerequisite_test_id: newPrerequisiteId, acceptance_criteria: newAcceptanceCriteria.trim() || null }); toast("Test saved", "success"); setNewName(""); setNewSteps([]); setNewPrerequisiteId(null); setNewAcceptanceCriteria(""); setNewXml(null); setNewSelectorPickStepIndex(null); setShowCreate(false); onRefresh(); }
     catch (e: any) { toast(e.message, "error"); }
     finally { setBusy(false); }
   };
 
   const openEdit = (t: TestDef) => {
     setEditId(t.id); setEditName(t.name); setEditSteps([...t.steps]); setEditSuiteId(t.suite_id); setEditPrerequisiteId(t.prerequisite_test_id ?? null); setEditAcceptanceCriteria(t.acceptance_criteria ?? ""); setAiEditPrompt(""); setAiEditStatus("");
-    setEditRelated(null);
+    setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null);
     api.getRelatedTests(t.id).then(setEditRelated).catch(() => {});
   };
-  const cancelEdit = () => { setEditId(null); setEditRelated(null); };
+  const cancelEdit = () => { setEditId(null); setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null); };
 
   const saveEdit = async () => {
     if (!editId || !editName.trim()) return;
@@ -1816,6 +1851,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             </select>
             <textarea value={aiPrompt} onChange={e => setAiPrompt(e.target.value)} placeholder="Describe test for AI generation..." rows={2} style={{ flex: 1, minWidth: 200 }} />
             <button className="btn-primary btn-sm" onClick={aiGenerate} disabled={busy}>AI Generate</button>
+            <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setNewXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium">📄 Capture XML</button>
           </div>
           {aiStatus && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>{aiStatus}</div>}
           <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Test name" className="form-input" style={{ width: "100%", marginBottom: 10 }} />
@@ -1823,7 +1859,20 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: "var(--muted)" }}>Acceptance criteria (source of truth for AI Fix)</div>
             <textarea value={newAcceptanceCriteria} onChange={e => setNewAcceptanceCriteria(e.target.value)} placeholder="What this test must validate. e.g. Login: Email+Password must appear; fail if password field absent" rows={2} className="form-input" style={{ width: "100%", fontSize: 11 }} />
           </div>
-          <StepBuilder steps={newSteps} setSteps={setNewSteps} />
+          {newSelectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {newSelectorPickStepIndex + 1} selector</div>}
+          <StepBuilder steps={newSteps} setSteps={setNewSteps} selectorPickStepIndex={newSelectorPickStepIndex} onPickStep={(i) => setNewSelectorPickStepIndex(prev => prev === i ? null : i)} />
+          {newXml && (
+            <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
+              <XmlElementTree xml={newXml} onCopy={(msg) => toast(msg, "success")} onNodeClick={(sel) => {
+                if (newSelectorPickStepIndex !== null && newSelectorPickStepIndex < newSteps.length) {
+                  setNewSteps(prev => { const n = [...prev]; n[newSelectorPickStepIndex] = { ...n[newSelectorPickStepIndex], selector: { using: sel.using, value: sel.value } }; return n; });
+                  setNewSelectorPickStepIndex(null);
+                  toast(`Filled step ${newSelectorPickStepIndex + 1} selector`, "success");
+                }
+              }} />
+            </div>
+          )}
           <div style={{ marginTop: 10 }}><button className="btn-primary btn-sm" onClick={saveNew} disabled={busy || !newSteps.length}>Save Test</button></div>
         </div>
       )}
@@ -1861,9 +1910,23 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             <select value={platform} onChange={e => setPlatform(e.target.value as any)} style={{ fontSize: 11 }}><option value="android">Android</option><option value="ios_sim">iOS</option></select>
             <input value={aiEditPrompt} onChange={e => setAiEditPrompt(e.target.value)} className="form-input" placeholder="AI instruction: e.g. 'add login step before step 3'" style={{ flex: 1 }} />
             <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiEditRun} disabled={busy}>🤖 AI Edit</button>
+            <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setEditXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium (device must be connected)">📄 Capture XML</button>
           </div>
           {aiEditStatus && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>{aiEditStatus}</div>}
-          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} />
+          {selectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {selectorPickStepIndex + 1} selector</div>}
+          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={(i) => setSelectorPickStepIndex(prev => prev === i ? null : i)} />
+          {editXml && (
+            <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
+              <XmlElementTree xml={editXml} onCopy={(msg) => toast(msg, "success")} onNodeClick={(sel) => {
+                if (selectorPickStepIndex !== null && selectorPickStepIndex < editSteps.length) {
+                  setEditSteps(prev => { const n = [...prev]; n[selectorPickStepIndex] = { ...n[selectorPickStepIndex], selector: { using: sel.using, value: sel.value } }; return n; });
+                  setSelectorPickStepIndex(null);
+                  toast(`Filled step ${selectorPickStepIndex + 1} selector`, "success");
+                }
+              }} />
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
             <button className="btn-primary btn-sm" onClick={saveEdit} disabled={busy}>Save Changes</button>
             <button className="btn-ghost btn-sm" onClick={cancelEdit}>Cancel</button>

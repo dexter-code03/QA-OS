@@ -31,13 +31,15 @@ def _is_keyboard_target(step: Step) -> bool:
     return False
 
 
-def run_steps(driver: WebDriver, steps: list[Step], on_step: callable) -> dict[str, Any]:
+def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_check: callable | None = None) -> dict[str, Any]:
     passed = 0
     failed = 0
     step_results: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
 
     for idx, step in enumerate(steps):
+        if cancel_check and cancel_check():
+            break
         t0 = time.time()
         try:
             if step.type == "wait":

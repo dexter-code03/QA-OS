@@ -1,4 +1,4 @@
-# QA TestOps Platform
+# QA OS
 
 Mobile testing platform with Appium, AI step generation, and Katalon export.
 

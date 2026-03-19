@@ -39,16 +39,56 @@ export type DeviceList = {
   ios_simulators: Array<{ udid: string; name: string; state: string; runtime: string }>;
 };
 
+let authBootstrapped = false;
+let authBootstrapPromise: Promise<string> | null = null;
+
+async function bootstrapAuth(force = false): Promise<string> {
+  if (authBootstrapped && !force) return "";
+  if (authBootstrapPromise && !force) return authBootstrapPromise;
+
+  authBootstrapPromise = fetch("/api/auth/token", { credentials: "same-origin" })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(await res.text());
+      const data = (await res.json()) as { token?: string };
+      authBootstrapped = true;
+      return data.token || "";
+    })
+    .finally(() => {
+      authBootstrapPromise = null;
+    });
+
+  return authBootstrapPromise;
+}
+
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  if (path !== "/api/auth/token") {
+    await bootstrapAuth();
+  }
+
+  const headers = new Headers(init?.headers || {});
+  if (!headers.has("Content-Type") && init?.body && !(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  let res = await fetch(path, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    headers,
+    credentials: "same-origin",
   });
+  if (res.status === 401 && path !== "/api/auth/token") {
+    await bootstrapAuth(true);
+    res = await fetch(path, {
+      ...init,
+      headers,
+      credentials: "same-origin",
+    });
+  }
   if (!res.ok) throw new Error(await res.text());
   return (await res.json()) as T;
 }
 
 export const api = {
+  bootstrapAuth,
   health: () => http<{ status: string }>("/api/health"),
 
   // Projects
@@ -77,9 +117,22 @@ export const api = {
   // Builds
   listBuilds: (projectId: number) => http<Build[]>(`/api/projects/${projectId}/builds`),
   uploadBuild: async (projectId: number, platform: Build["platform"], file: File) => {
+    await bootstrapAuth();
     const fd = new FormData();
     fd.append("file", file);
-    const res = await fetch(`/api/projects/${projectId}/builds?platform=${platform}`, { method: "POST", body: fd });
+    let res = await fetch(`/api/projects/${projectId}/builds?platform=${platform}`, {
+      method: "POST",
+      body: fd,
+      credentials: "same-origin",
+    });
+    if (res.status === 401) {
+      await bootstrapAuth(true);
+      res = await fetch(`/api/projects/${projectId}/builds?platform=${platform}`, {
+        method: "POST",
+        body: fd,
+        credentials: "same-origin",
+      });
+    }
     if (!res.ok) throw new Error(await res.text());
     return (await res.json()) as Build;
   },
@@ -111,6 +164,7 @@ export const api = {
     device_target?: string;
   }) => http<Run>("/api/runs", { method: "POST", body: JSON.stringify(payload) }),
   getRun: (runId: number) => http<Run>(`/api/runs/${runId}`),
+  cancelRun: (runId: number) => http<{ ok: boolean; message?: string }>(`/api/runs/${runId}/cancel`, { method: "POST" }),
   deleteRun: (runId: number) => http<{ ok: boolean }>(`/api/runs/${runId}`, { method: "DELETE" }),
 
   // Devices
