@@ -16,6 +16,20 @@ venv/
 # Generated outputs
 generated_scripts/
 reports/
+output/
+
+# Platform (local TestOps UI)
+platform/.data/
+platform/artifacts/
+platform/uploads/
+platform/backend/.data/
+platform/backend/.artifacts/
+platform/backend/*.db
+platform/backend/*.sqlite*
+platform/backend/uploads/
+platform/backend/artifacts/
+platform/frontend/node_modules/
+platform/frontend/dist/
 
 # IDE
 .idea/

@@ -74,7 +74,7 @@ python tools/frd_extractor.py --page-id YOUR_CONFLUENCE_PAGE_ID --epic-key QA-10
 python tools/figma_analyzer.py --file-key YOUR_FIGMA_FILE_KEY --frame-id FRAME_NODE_ID --feature Login
 
 # Stage 4: Generate Katalon Scripts
-python tools/katalon_generator.py --ac-file test_plan_acs.json --feature Login --output ./generated_scripts
+python tools/katalon_generator.py --ac-file test_plan_acs.json --feature Login --katalon-project /path/to/YourKatalonProject --suite smoke
 
 # Stage 6: Bug Triage (on existing results)
 python tools/bug_triage.py --results path/to/katalon_results.json --environment staging
