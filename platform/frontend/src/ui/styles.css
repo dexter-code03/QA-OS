@@ -333,6 +333,13 @@ body {
   font-size: 11px; color: #4ade80; overflow-x: auto;
   max-height: 120px; overflow-y: auto;
 }
+.xml-tree-panel {
+  max-height: none;
+}
+.xml-tree-panel .btn-ghost:hover {
+  background: rgba(99,102,241,.2);
+  color: #a78bfa;
+}
 
 /* ── Test library table ── */
 .tc-table { width: 100%; border-collapse: collapse; }

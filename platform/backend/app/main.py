@@ -10,7 +10,7 @@ import zipfile
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -154,8 +154,10 @@ def list_devices() -> dict[str, Any]:
         pass
 
     try:
+        # Use full path to xcrun for reliability when backend runs from different env (e.g. IDE)
+        xcrun = "/usr/bin/xcrun" if os.path.exists("/usr/bin/xcrun") else "xcrun"
         out = subprocess.check_output(
-            ["xcrun", "simctl", "list", "devices", "--json"], text=True, timeout=10
+            [xcrun, "simctl", "list", "devices", "--json"], text=True, timeout=15
         )
         data = json.loads(out)
         for runtime, devs in data.get("devices", {}).items():
@@ -167,8 +169,9 @@ def list_devices() -> dict[str, Any]:
                         "state": d.get("state", ""),
                         "runtime": runtime.split(".")[-1] if "." in runtime else runtime,
                     })
-    except Exception:
-        pass
+    except Exception as e:
+        import logging
+        logging.getLogger("uvicorn.error").warning(f"iOS device detection failed: {e}")
 
     return {"android": android_devices, "ios_simulators": ios_simulators}
 
@@ -285,7 +288,87 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"AI call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"AI generate steps failed: {e}")
+
+
+# ── AI Generate Test Suite (bulk) ─────────────────────────────────────
+
+class GenerateSuiteRequest(BaseModel):
+    platform: str
+    prompt: str
+    page_source_xml: str = ""
+    project_id: int
+    suite_id: int
+
+
+@app.post("/api/ai/generate-suite")
+async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
+    if payload.platform not in ("android", "ios_sim"):
+        raise HTTPException(status_code=400, detail="platform must be android|ios_sim")
+
+    s = _load_settings()
+    api_key, model = _ai_creds(s)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
+
+    system_prompt = (
+        "You are a senior mobile QA automation engineer.\n"
+        "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
+        "Return ONLY valid JSON with this shape:\n"
+        '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+        ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
+        "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+        "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
+        "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
+        "No markdown, no explanation, only JSON."
+    )
+    user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
+    if payload.page_source_xml:
+        user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body = {
+        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_msg}"}]}],
+        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=body)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+            raw_cases = parsed.get("test_cases")
+            if not isinstance(raw_cases, list):
+                raise HTTPException(status_code=502, detail="AI did not return test_cases[]")
+
+        created: list[dict] = []
+        with SessionLocal() as db:
+            p = db.query(Project).filter(Project.id == payload.project_id).first()
+            if not p:
+                raise HTTPException(status_code=404, detail="Project not found")
+            s = db.query(TestSuite).filter(TestSuite.id == payload.suite_id).first()
+            if not s:
+                raise HTTPException(status_code=404, detail="Suite not found")
+            for tc in raw_cases:
+                name = tc.get("name") or f"Generated {len(created) + 1}"
+                steps = tc.get("steps")
+                if not isinstance(steps, list):
+                    continue
+                ac = tc.get("acceptance_criteria") or payload.prompt[:2000]
+                t = TestDefinition(project_id=payload.project_id, suite_id=payload.suite_id, name=name, steps=steps, acceptance_criteria=ac)
+                db.add(t)
+                db.commit()
+                db.refresh(t)
+                created.append({"id": t.id, "name": t.name, "steps_count": len(steps)})
+
+        return {"created": len(created), "test_cases": created}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI generate suite failed: {e}")
 
 
 # ── AI Fix Failed Steps ───────────────────────────────────────────────
@@ -299,6 +382,9 @@ class FixStepsRequest(BaseModel):
     page_source_xml: str = ""
     test_name: str = ""
     screenshot_base64: str = ""
+    already_tried_fixes: list[dict[str, Any]] = []  # [{analysis, fixed_steps}, ...] from test.fix_history
+    acceptance_criteria: str = ""  # Source of truth: what this test must validate (from test definition)
+    app_context: str = ""  # App name, package, etc. from build metadata for correct context
 
 
 @app.post("/api/ai/fix-steps")
@@ -330,6 +416,12 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         "3. Cross-reference the screenshot with the page source XML to find the CORRECT selector\n"
         "4. Return FIXED steps that will work based on the actual screen state\n"
         "5. Keep steps that passed unchanged. Only fix the failed step and any subsequent steps that need updating.\n\n"
+        "SOURCE OF TRUTH (when provided): If acceptance_criteria is given, your fix MUST preserve the intended behavior. "
+        "Do NOT change what the test validates. If the failure is because the app is on the WRONG screen (e.g., Sign Up instead of Login), "
+        "do NOT change the test to validate the wrong screen. The fix should either navigate back to the correct flow, or add an assertion that fails when on the wrong screen. "
+        "Never invert or alter the expected outcome.\n\n"
+        "UNFAMILIAR = FAIL: If the screen or flow does not match the test's intended purpose (from acceptance_criteria), the test SHOULD fail and report. "
+        "Do not make the test pass by validating whatever is on screen. Stay aligned with the test case motive.\n\n"
         "CRITICAL RULES FOR KEYBOARD / SYSTEM UI ELEMENTS:\n"
         "- Keyboard buttons (return, done, go, next, search, send) are NOT normal UI elements.\n"
         "- NEVER use 'tap' on keyboard keys. They belong to iOS/Android system UI.\n"
@@ -355,8 +447,12 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
 
     user_msg = (
         f"Platform: {payload.platform}\n"
-        f"Test: {payload.test_name}\n\n"
-        f"=== ORIGINAL STEPS ===\n{json.dumps(payload.original_steps, indent=2)}\n\n"
+        f"Test: {payload.test_name}\n"
+    )
+    if payload.app_context:
+        user_msg += f"App context: {payload.app_context}\n"
+    user_msg += (
+        f"\n=== ORIGINAL STEPS ===\n{json.dumps(payload.original_steps, indent=2)}\n\n"
         f"=== STEP RESULTS ===\n"
     )
     for i, r in enumerate(payload.step_results):
@@ -374,6 +470,17 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         f"Step definition: {json.dumps(failed_step, indent=2)}\n"
         f"Error: {payload.error_message}\n"
     )
+
+    if payload.acceptance_criteria:
+        user_msg += f"\n=== SOURCE OF TRUTH / ACCEPTANCE CRITERIA (DO NOT VIOLATE) ===\n{payload.acceptance_criteria}\n\n"
+
+    if payload.already_tried_fixes:
+        user_msg += "\n=== ALREADY TRIED (do NOT repeat these approaches) ===\n"
+        for i, prev in enumerate(payload.already_tried_fixes[:5], 1):
+            analysis = prev.get("analysis", "")[:200]
+            steps_preview = json.dumps(prev.get("fixed_steps", [])[:3])[:300]
+            user_msg += f"Attempt {i}: {analysis}... | steps: {steps_preview}...\n"
+        user_msg += "Try a DIFFERENT approach. Do not suggest the same or similar fix.\n\n"
 
     if payload.page_source_xml:
         user_msg += f"\n=== PAGE SOURCE XML (current screen) ===\n{payload.page_source_xml[:12000]}\n"
@@ -412,6 +519,120 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI fix call failed: {e}")
+
+
+class RefineFixRequest(BaseModel):
+    """Same context as FixStepsRequest, plus previous fix, user suggestion, and test's fix history."""
+    platform: str
+    original_steps: list[dict[str, Any]]
+    step_results: list[dict[str, Any]]
+    failed_step_index: int
+    error_message: str = ""
+    page_source_xml: str = ""
+    test_name: str = ""
+    screenshot_base64: str = ""
+    acceptance_criteria: str = ""  # Source of truth
+    app_context: str = ""  # App name, package from build metadata
+    fix_history: list[dict[str, Any]] = []  # test's stored history from previous runs
+    previous_analysis: str = ""
+    previous_fixed_steps: list[dict[str, Any]] = []
+    previous_changes: list[dict[str, Any]] = []
+    user_suggestion: str = ""
+
+
+@app.post("/api/ai/refine-fix")
+async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
+    """Refine the AI fix based on user suggestion, with full context (original steps, step results, error, page source, screenshot, previous fix)."""
+    s = _load_settings()
+    api_key, model = _ai_creds(s)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
+
+    failed_step = payload.original_steps[payload.failed_step_index] if payload.failed_step_index < len(payload.original_steps) else {}
+
+    system_prompt = (
+        "You are a senior mobile QA automation engineer. The user has already received an AI-generated fix for a failed Appium test, "
+        "but they want to refine it with their own suggestion.\n\n"
+        "You have the FULL context:\n"
+        "- Original test steps and which passed/failed\n"
+        "- Error message and failed step\n"
+        "- Page source XML (current screen)\n"
+        "- Screenshot of the failure\n"
+        "- The PREVIOUS fix (analysis, fixed_steps, changes)\n"
+        "- The USER'S SUGGESTION for how to change the fix\n\n"
+        "Apply the user's suggestion to refine the fixed_steps. Return the COMPLETE updated fixed_steps list and updated analysis/changes.\n"
+        "If acceptance_criteria is provided, your refinement MUST preserve the intended behavior. Do NOT change what the test validates.\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"analysis": "Updated explanation reflecting the refinement",'
+        ' "fixed_steps": [...],'
+        ' "changes": [{"step_index": N, "was": "...", "now": "...", "reason": "..."}]}\n\n'
+        "fixed_steps must be the COMPLETE list. No markdown."
+    )
+
+    user_msg = f"Platform: {payload.platform}\nTest: {payload.test_name}\n"
+    if payload.app_context:
+        user_msg += f"App context: {payload.app_context}\n"
+    user_msg += (
+        f"\n=== ORIGINAL STEPS ===\n{json.dumps(payload.original_steps, indent=2)}\n\n"
+        f"=== STEP RESULTS ===\n"
+    )
+    for i, r in enumerate(payload.step_results):
+        status = r.get("status", "pending")
+        details = r.get("details", "")
+        if isinstance(details, dict):
+            details = details.get("error", str(details))
+        user_msg += f"Step {i}: {status}" + (f" — {details}" if details else "") + "\n"
+
+    user_msg += (
+        f"\n=== FAILED AT STEP {payload.failed_step_index} ===\n"
+        f"Error: {payload.error_message}\n\n"
+    )
+    if payload.acceptance_criteria:
+        user_msg += f"=== SOURCE OF TRUTH / ACCEPTANCE CRITERIA (DO NOT VIOLATE) ===\n{payload.acceptance_criteria}\n\n"
+    if payload.fix_history:
+        user_msg += "=== ALREADY TRIED FOR THIS TEST (do NOT repeat) ===\n"
+        for i, prev in enumerate(payload.fix_history[:5], 1):
+            analysis = prev.get("analysis", "")[:150]
+            user_msg += f"Attempt {i}: {analysis}...\n"
+        user_msg += "\n"
+    user_msg += (
+        f"=== CURRENT FIX TO REFINE ===\nAnalysis: {payload.previous_analysis}\n\n"
+        f"Previous fixed_steps:\n{json.dumps(payload.previous_fixed_steps, indent=2)}\n\n"
+        f"=== USER'S SUGGESTION ===\n{payload.user_suggestion}\n\n"
+    )
+    if payload.page_source_xml:
+        user_msg += f"=== PAGE SOURCE XML ===\n{payload.page_source_xml[:10000]}\n"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
+    if payload.screenshot_base64:
+        raw = payload.screenshot_base64
+        if "," in raw:
+            raw = raw.split(",", 1)[1]
+        parts.append({"inlineData": {"mimeType": "image/png", "data": raw}})
+
+    body = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=body)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+            fixed = parsed.get("fixed_steps")
+            if not isinstance(fixed, list):
+                raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
+            return {
+                "analysis": parsed.get("analysis", ""),
+                "fixed_steps": fixed,
+                "changes": parsed.get("changes", []),
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI refine fix failed: {e}")
 
 
 # ── AI Edit Steps ─────────────────────────────────────────────────────
@@ -741,7 +962,17 @@ def list_builds(project_id: int) -> list[BuildOut]:
 # ── Tests ─────────────────────────────────────────────────────────────
 
 def _test_out(t: TestDefinition) -> TestOut:
-    return TestOut(id=t.id, project_id=t.project_id, suite_id=t.suite_id, name=t.name, steps=t.steps, created_at=t.created_at)
+    return TestOut(
+        id=t.id,
+        project_id=t.project_id,
+        suite_id=t.suite_id,
+        prerequisite_test_id=t.prerequisite_test_id,
+        name=t.name,
+        steps=t.steps,
+        acceptance_criteria=getattr(t, "acceptance_criteria", None),
+        fix_history=getattr(t, "fix_history", None) or [],
+        created_at=t.created_at,
+    )
 
 
 @app.post("/api/projects/{project_id}/tests", response_model=TestOut)
@@ -750,7 +981,14 @@ def create_test(project_id: int, payload: TestCreate) -> TestOut:
         p = db.query(Project).filter(Project.id == project_id).first()
         if not p:
             raise HTTPException(status_code=404, detail="Project not found")
-        t = TestDefinition(project_id=project_id, suite_id=payload.suite_id, name=payload.name, steps=payload.steps)
+        t = TestDefinition(
+            project_id=project_id,
+            suite_id=payload.suite_id,
+            prerequisite_test_id=payload.prerequisite_test_id,
+            name=payload.name,
+            steps=payload.steps,
+            acceptance_criteria=payload.acceptance_criteria,
+        )
         db.add(t)
         db.commit()
         db.refresh(t)
@@ -777,9 +1015,64 @@ def update_test(test_id: int, payload: TestUpdate, request: Request) -> TestOut:
             t.steps = payload.steps
         if "suite_id" in provided:
             t.suite_id = payload.suite_id
+        if "prerequisite_test_id" in provided:
+            t.prerequisite_test_id = payload.prerequisite_test_id
+        if "acceptance_criteria" in provided:
+            t.acceptance_criteria = payload.acceptance_criteria
         db.commit()
         db.refresh(t)
         return _test_out(t)
+
+
+class AppendFixHistoryRequest(BaseModel):
+    analysis: str = ""
+    fixed_steps: list[dict[str, Any]]
+    changes: list[dict[str, Any]] = []
+    run_id: Optional[int] = None
+    steps_before_fix: Optional[list[dict[str, Any]]] = None
+
+
+@app.post("/api/tests/{test_id}/append-fix-history")
+def append_fix_history(test_id: int, payload: AppendFixHistoryRequest) -> dict[str, Any]:
+    """Append a fix to the test's history when user applies it. Keeps last 10 entries."""
+    with SessionLocal() as db:
+        t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Test not found")
+        history = list(getattr(t, "fix_history", None) or [])
+        entry = {
+            "analysis": payload.analysis[:500],
+            "fixed_steps": payload.fixed_steps,
+            "changes": payload.changes,
+            "run_id": payload.run_id,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        if payload.steps_before_fix is not None:
+            entry["steps_before_fix"] = payload.steps_before_fix
+        history.append(entry)
+        t.fix_history = history[-10:]
+        db.commit()
+        return {"ok": True, "history_length": len(t.fix_history)}
+
+
+@app.post("/api/tests/{test_id}/undo-last-fix")
+def undo_last_fix(test_id: int) -> dict[str, Any]:
+    """Revert test steps to before the last AI fix. Removes last fix_history entry."""
+    with SessionLocal() as db:
+        t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Test not found")
+        history = list(getattr(t, "fix_history", None) or [])
+        if not history:
+            raise HTTPException(status_code=400, detail="No fix history to undo")
+        last = history[-1]
+        steps_before = last.get("steps_before_fix")
+        if steps_before is None:
+            raise HTTPException(status_code=400, detail="Cannot undo: previous steps not stored")
+        t.steps = steps_before
+        t.fix_history = history[:-1]
+        db.commit()
+        return {"ok": True, "steps": t.steps}
 
 
 @app.delete("/api/tests/{test_id}")
@@ -791,6 +1084,107 @@ def delete_test(test_id: int) -> dict[str, Any]:
         db.delete(t)
         db.commit()
         return {"ok": True}
+
+
+def _steps_equal(a: dict, b: dict) -> bool:
+    """Compare two step dicts for equality (type, selector, text, etc.)."""
+    if a.get("type") != b.get("type"):
+        return False
+    if json.dumps(a.get("selector") or {}, sort_keys=True) != json.dumps(b.get("selector") or {}, sort_keys=True):
+        return False
+    if a.get("text") != b.get("text"):
+        return False
+    if a.get("expect") != b.get("expect"):
+        return False
+    return True
+
+
+def _shared_prefix_length(steps_a: list[dict], steps_b: list[dict]) -> int:
+    """Return number of leading steps that match between two step lists."""
+    n = 0
+    for i in range(min(len(steps_a), len(steps_b))):
+        if _steps_equal(steps_a[i], steps_b[i]):
+            n += 1
+        else:
+            break
+    return n
+
+
+@app.get("/api/tests/{test_id}/related")
+def get_related_tests(test_id: int) -> dict[str, Any]:
+    """Return tests related to this one: dependents (use as prerequisite) and similar (share step prefix)."""
+    with SessionLocal() as db:
+        t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Test not found")
+        project_id = t.project_id
+        my_steps = list(t.steps or [])
+
+        dependents = db.query(TestDefinition).filter(
+            TestDefinition.project_id == project_id,
+            TestDefinition.prerequisite_test_id == test_id,
+        ).all()
+
+        similar: list[dict] = []
+        others = db.query(TestDefinition).filter(
+            TestDefinition.project_id == project_id,
+            TestDefinition.id != test_id,
+        ).all()
+        dep_ids = {d.id for d in dependents}
+        for o in others:
+            if o.id in dep_ids:
+                continue
+            other_steps = list(o.steps or [])
+            prefix_len = _shared_prefix_length(my_steps, other_steps)
+            if prefix_len >= 2:
+                similar.append({"test": _test_out(o), "shared_prefix_length": prefix_len})
+
+        return {
+            "dependents": [_test_out(d) for d in dependents],
+            "similar": similar,
+        }
+
+
+class ApplyFixToRelatedRequest(BaseModel):
+    fixed_steps: list[dict[str, Any]]
+    prefix_length: int
+    original_steps: list[dict[str, Any]]  # steps before fix, for finding similar tests
+    test_ids: list[int] = []
+
+
+@app.post("/api/tests/{test_id}/apply-fix-to-related")
+def apply_fix_to_related(test_id: int, payload: ApplyFixToRelatedRequest) -> dict[str, Any]:
+    """Apply the same step fix to related tests that share the step prefix."""
+    with SessionLocal() as db:
+        t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Test not found")
+        project_id = t.project_id
+        original = list(payload.original_steps or [])
+
+        related = db.query(TestDefinition).filter(
+            TestDefinition.project_id == project_id,
+            TestDefinition.id != test_id,
+            TestDefinition.prerequisite_test_id != test_id,
+        ).all()
+
+        updated: list[int] = []
+        prefix_len = min(payload.prefix_length, len(original), len(payload.fixed_steps))
+        target_ids = set(payload.test_ids) if payload.test_ids else None
+
+        for o in related:
+            if target_ids is not None and o.id not in target_ids:
+                continue
+            other_steps = list(o.steps or [])
+            shared = _shared_prefix_length(original, other_steps)
+            if shared < prefix_len:
+                continue
+            new_steps = list(payload.fixed_steps[:prefix_len]) + other_steps[prefix_len:]
+            o.steps = new_steps
+            updated.append(o.id)
+
+        db.commit()
+        return {"updated_test_ids": updated}
 
 
 # ── Runs ──────────────────────────────────────────────────────────────
@@ -865,7 +1259,7 @@ def get_artifact(project_id: int, run_id: int, name: str) -> FileResponse:
     path = settings.artifacts_dir / str(project_id) / str(run_id) / name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact not found")
-    return FileResponse(str(path))
+    return FileResponse(str(path), headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
 
 # ── Katalon Export (Studio 9.x compatible) ───────────────────────────

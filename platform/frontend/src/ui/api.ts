@@ -13,8 +13,11 @@ export type TestDef = {
   id: number;
   project_id: number;
   suite_id: number | null;
+  prerequisite_test_id?: number | null;
   name: string;
   steps: Array<Record<string, unknown>>;
+  acceptance_criteria?: string | null;
+  fix_history?: Array<Record<string, unknown>>;
   created_at: string;
 };
 export type Run = {
@@ -83,12 +86,20 @@ export const api = {
 
   // Tests
   listTests: (projectId: number) => http<TestDef[]>(`/api/projects/${projectId}/tests`),
-  createTest: (projectId: number, payload: { name: string; steps: any[]; suite_id?: number | null }) =>
+  createTest: (projectId: number, payload: { name: string; steps: any[]; suite_id?: number | null; prerequisite_test_id?: number | null; acceptance_criteria?: string | null }) =>
     http<TestDef>(`/api/projects/${projectId}/tests`, { method: "POST", body: JSON.stringify(payload) }),
-  updateTest: (testId: number, payload: { name?: string; steps?: any[]; suite_id?: number | null }) =>
+  updateTest: (testId: number, payload: { name?: string; steps?: any[]; suite_id?: number | null; prerequisite_test_id?: number | null; acceptance_criteria?: string | null }) =>
     http<TestDef>(`/api/tests/${testId}`, { method: "PUT", body: JSON.stringify(payload) }),
   deleteTest: (testId: number) =>
     http<{ ok: boolean }>(`/api/tests/${testId}`, { method: "DELETE" }),
+  getRelatedTests: (testId: number) =>
+    http<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] }>(`/api/tests/${testId}/related`),
+  applyFixToRelated: (testId: number, payload: { fixed_steps: any[]; prefix_length: number; original_steps: any[]; test_ids?: number[] }) =>
+    http<{ updated_test_ids: number[] }>(`/api/tests/${testId}/apply-fix-to-related`, { method: "POST", body: JSON.stringify(payload) }),
+  appendFixHistory: (testId: number, payload: { analysis: string; fixed_steps: any[]; changes: any[]; run_id?: number; steps_before_fix?: any[] }) =>
+    http<{ ok: boolean }>(`/api/tests/${testId}/append-fix-history`, { method: "POST", body: JSON.stringify(payload) }),
+  undoLastFix: (testId: number) =>
+    http<{ ok: boolean; steps: any[] }>(`/api/tests/${testId}/undo-last-fix`, { method: "POST" }),
 
   // Runs
   listRuns: (projectId: number) => http<Run[]>(`/api/projects/${projectId}/runs`),
@@ -121,6 +132,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ platform, prompt, page_source_xml: pageSourceXml || "" }),
     }),
+  generateSuite: (platform: string, prompt: string, projectId: number, suiteId: number, pageSourceXml?: string) =>
+    http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[] }>("/api/ai/generate-suite", {
+      method: "POST",
+      body: JSON.stringify({ platform, prompt, project_id: projectId, suite_id: suiteId, page_source_xml: pageSourceXml || "" }),
+    }),
   editSteps: (platform: string, currentSteps: any[], instruction: string) =>
     http<{ steps: any[]; summary: string }>("/api/ai/edit-steps", {
       method: "POST",
@@ -139,8 +155,32 @@ export const api = {
     page_source_xml: string;
     test_name: string;
     screenshot_base64: string;
+    already_tried_fixes?: any[];
+    acceptance_criteria?: string;
+    app_context?: string;
   }) =>
     http<{ analysis: string; fixed_steps: any[]; changes: any[] }>("/api/ai/fix-steps", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  refineFix: (payload: {
+    platform: string;
+    original_steps: any[];
+    step_results: any[];
+    failed_step_index: number;
+    error_message: string;
+    page_source_xml: string;
+    test_name: string;
+    screenshot_base64: string;
+    acceptance_criteria?: string;
+    app_context?: string;
+    fix_history?: any[];
+    previous_analysis: string;
+    previous_fixed_steps: any[];
+    previous_changes: any[];
+    user_suggestion: string;
+  }) =>
+    http<{ analysis: string; fixed_steps: any[]; changes: any[] }>("/api/ai/refine-fix", {
       method: "POST",
       body: JSON.stringify(payload),
     }),

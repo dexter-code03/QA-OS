@@ -129,6 +129,7 @@ class RunEngine:
                     artifacts["video"] = ios_rec.out_path.name
 
             verdict = "passed" if summary.get("failedSteps", 0) == 0 else "failed"
+            summary["stepDefinitions"] = raw_steps
             with SessionLocal() as db:
                 r = db.query(Run).filter(Run.id == run_id).first()
                 if r:
@@ -178,7 +179,14 @@ class RunEngine:
             if not r or not r.test_id:
                 return []
             t = db.query(TestDefinition).filter(TestDefinition.id == r.test_id).first()
-            return list(t.steps or []) if t else []
+            if not t:
+                return []
+            steps = list(t.steps or [])
+            if t.prerequisite_test_id and t.prerequisite_test_id != t.id:
+                prereq = db.query(TestDefinition).filter(TestDefinition.id == t.prerequisite_test_id).first()
+                if prereq and prereq.steps:
+                    steps = list(prereq.steps) + steps
+            return steps
 
 
 run_engine = RunEngine()

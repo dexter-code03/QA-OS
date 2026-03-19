@@ -57,20 +57,27 @@ class TestCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     steps: list[dict[str, Any]]
     suite_id: Optional[int] = None
+    prerequisite_test_id: Optional[int] = None
+    acceptance_criteria: Optional[str] = None
 
 
 class TestUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     steps: Optional[list[dict[str, Any]]] = None
     suite_id: Optional[int] = None
+    prerequisite_test_id: Optional[int] = None
+    acceptance_criteria: Optional[str] = None
 
 
 class TestOut(BaseModel):
     id: int
     project_id: int
     suite_id: Optional[int] = None
+    prerequisite_test_id: Optional[int] = None
     name: str
     steps: list[dict[str, Any]]
+    acceptance_criteria: Optional[str] = None
+    fix_history: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime
 
 

@@ -79,8 +79,11 @@ class TestDefinition(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     suite_id: Mapped[Optional[int]] = mapped_column(ForeignKey("test_suites.id", ondelete="SET NULL"), nullable=True)
+    prerequisite_test_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tests.id", ondelete="SET NULL"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     steps: Mapped[list[dict]] = mapped_column(JSON)
+    acceptance_criteria: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Source of truth: what this test must validate
+    fix_history: Mapped[list[dict]] = mapped_column(JSON, default=list)  # [{analysis, fixed_steps, changes, run_id?, created_at}]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     project: Mapped["Project"] = relationship(back_populates="tests")
@@ -127,6 +130,15 @@ def init_db() -> None:
     cols = [row[1] for row in cur.execute("PRAGMA table_info(tests)").fetchall()]
     if "suite_id" not in cols:
         cur.execute("ALTER TABLE tests ADD COLUMN suite_id INTEGER REFERENCES test_suites(id) ON DELETE SET NULL")
+        con.commit()
+    if "prerequisite_test_id" not in cols:
+        cur.execute("ALTER TABLE tests ADD COLUMN prerequisite_test_id INTEGER REFERENCES tests(id) ON DELETE SET NULL")
+        con.commit()
+    if "fix_history" not in cols:
+        cur.execute("ALTER TABLE tests ADD COLUMN fix_history JSON DEFAULT '[]'")
+        con.commit()
+    if "acceptance_criteria" not in cols:
+        cur.execute("ALTER TABLE tests ADD COLUMN acceptance_criteria TEXT")
         con.commit()
     con.close()
 
