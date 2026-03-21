@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Optional
 
 from appium.webdriver.webdriver import WebDriver
 
-from ..db import SessionLocal, Run, TestDefinition, Build
+from ..db import SessionLocal, Run, TestDefinition, Build, _classify_error
 from ..events import RunEvent, event_bus
 from ..settings import settings
 from .appium_service import ensure_appium_running
@@ -30,16 +31,25 @@ class RunEngine:
     def __init__(self) -> None:
         self._q: asyncio.Queue[EnqueuedRun] = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
-        self._cancel_requested: set[int] = set()
+        self._pending_cancel: set[int] = set()
+        self._cancel_events: dict[int, threading.Event] = {}
 
     def request_cancel(self, run_id: int) -> None:
-        self._cancel_requested.add(run_id)
+        ev = self._cancel_events.get(run_id)
+        if ev is not None:
+            ev.set()
+        else:
+            self._pending_cancel.add(run_id)
 
     def is_cancelled(self, run_id: int) -> bool:
-        return run_id in self._cancel_requested
+        ev = self._cancel_events.get(run_id)
+        if ev is not None:
+            return ev.is_set()
+        return run_id in self._pending_cancel
 
     def clear_cancel(self, run_id: int) -> None:
-        self._cancel_requested.discard(run_id)
+        self._pending_cancel.discard(run_id)
+        self._cancel_events.pop(run_id, None)
 
     def start(self) -> None:
         if self._task:
@@ -61,7 +71,13 @@ class RunEngine:
                 await event_bus.publish(RunEvent(run_id=item.run_id, type="engine_error", payload={"error": str(e)}))
 
     async def _execute(self, run_id: int) -> None:
-        if self.is_cancelled(run_id):
+        cancel_ev = threading.Event()
+        if run_id in self._pending_cancel:
+            cancel_ev.set()
+            self._pending_cancel.discard(run_id)
+        self._cancel_events[run_id] = cancel_ev
+
+        if cancel_ev.is_set():
             with SessionLocal() as db:
                 r = db.query(Run).filter(Run.id == run_id).first()
                 if r:
@@ -74,6 +90,7 @@ class RunEngine:
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             if not r:
+                self.clear_cancel(run_id)
                 return
             t = db.query(TestDefinition).filter(TestDefinition.id == r.test_id).first() if r.test_id else None
             b = db.query(Build).filter(Build.id == r.build_id).first() if r.build_id else None
@@ -82,6 +99,7 @@ class RunEngine:
                 r.error_message = "Test definition not found"
                 r.finished_at = datetime.utcnow()
                 db.commit()
+                self.clear_cancel(run_id)
                 return
 
             r.status = "running"
@@ -165,6 +183,8 @@ class RunEngine:
                     r.summary = summary
                     r.artifacts = artifacts
                     r.finished_at = datetime.utcnow()
+                    if verdict == "failed":
+                        r.failure_category = _classify_error(r.error_message or "")
                     db.commit()
 
             await event_bus.publish(RunEvent(run_id=run_id, type="finished", payload={"status": verdict, "summary": summary, "artifacts": artifacts}))
@@ -175,6 +195,7 @@ class RunEngine:
                 if r:
                     r.status = "error"
                     r.error_message = str(e)
+                    r.failure_category = _classify_error(str(e))
                     r.artifacts = artifacts
                     r.finished_at = datetime.utcnow()
                     db.commit()

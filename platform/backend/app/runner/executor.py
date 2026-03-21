@@ -6,11 +6,43 @@ from typing import Any
 
 from appium.webdriver.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from ..events import RunEvent, event_bus
 from .steps import Step
+
+
+def _sleep_cancellable(ms: float, cancel_check: callable | None) -> bool:
+    """Sleep in chunks; return False if cancelled."""
+    remaining = ms / 1000.0
+    while remaining > 0:
+        if cancel_check and cancel_check():
+            return False
+        chunk = min(0.25, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+    return True
+
+
+def _poll_until_visible(
+    driver: WebDriver,
+    by: str,
+    value: str,
+    timeout_sec: float,
+    cancel_check: callable | None,
+) -> Any:
+    """Poll for visible element; return 'cancelled' or raise TimeoutError."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if cancel_check and cancel_check():
+            return "cancelled"
+        try:
+            el = driver.find_element(by, value)
+            if el.is_displayed():
+                return el
+        except Exception:
+            pass
+        time.sleep(0.25)
+    raise TimeoutError(f"Element not visible within {timeout_sec}s")
 
 
 def _debug(run_id: int | None, name: str, category: str, **kwargs: Any) -> None:
@@ -48,6 +80,25 @@ def _is_keyboard_target(step: Step) -> bool:
     return False
 
 
+def _find_with_cancel(
+    driver: WebDriver,
+    by: str,
+    value: str,
+    cancel_check: callable | None,
+    timeout_sec: float = 15.0,
+) -> Any:
+    """Poll find_element; return element, or 'cancelled', or raise TimeoutError."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if cancel_check and cancel_check():
+            return "cancelled"
+        try:
+            return driver.find_element(by, value)
+        except Exception:
+            time.sleep(0.25)
+    raise TimeoutError(f"Element not found within {timeout_sec}s: {value}")
+
+
 def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_check: callable | None = None, run_id: int | None = None) -> dict[str, Any]:
     passed = 0
     failed = 0
@@ -60,7 +111,8 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
         t0 = time.time()
         try:
             if step.type == "wait":
-                time.sleep((step.ms or 500) / 1000.0)
+                if not _sleep_cancellable(float(step.ms or 500), cancel_check):
+                    break
 
             elif step.type == "tap":
                 if not step.selector:
@@ -73,16 +125,22 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
                         try:
                             driver.hide_keyboard()
                         except Exception:
-                            el = driver.find_element(_by(step.selector.using), step.selector.value)
+                            el = _find_with_cancel(driver, _by(step.selector.using), step.selector.value, cancel_check, 15.0)
+                            if el == "cancelled":
+                                break
                             el.click()
                 else:
-                    el = driver.find_element(_by(step.selector.using), step.selector.value)
+                    el = _find_with_cancel(driver, _by(step.selector.using), step.selector.value, cancel_check, 15.0)
+                    if el == "cancelled":
+                        break
                     el.click()
 
             elif step.type == "type":
                 if not step.selector:
                     raise ValueError("type requires selector")
-                el = driver.find_element(_by(step.selector.using), step.selector.value)
+                el = _find_with_cancel(driver, _by(step.selector.using), step.selector.value, cancel_check, 15.0)
+                if el == "cancelled":
+                    break
                 el.clear()
                 el.send_keys(step.text or "")
 
@@ -90,14 +148,16 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
                 if not step.selector:
                     raise ValueError("waitForVisible requires selector")
                 timeout = (step.ms or 10000) / 1000.0
-                WebDriverWait(driver, timeout).until(
-                    EC.visibility_of_element_located((_by(step.selector.using), step.selector.value))
-                )
+                vis = _poll_until_visible(driver, _by(step.selector.using), step.selector.value, timeout, cancel_check)
+                if vis == "cancelled":
+                    break
 
             elif step.type == "assertText":
                 if not step.selector:
                     raise ValueError("assertText requires selector")
-                el = driver.find_element(_by(step.selector.using), step.selector.value)
+                el = _find_with_cancel(driver, _by(step.selector.using), step.selector.value, cancel_check, 15.0)
+                if el == "cancelled":
+                    break
                 actual = el.text or ""
                 expected = step.expect or ""
                 if expected not in actual:
@@ -107,7 +167,9 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
             elif step.type == "assertVisible":
                 if not step.selector:
                     raise ValueError("assertVisible requires selector")
-                el = driver.find_element(_by(step.selector.using), step.selector.value)
+                el = _find_with_cancel(driver, _by(step.selector.using), step.selector.value, cancel_check, 15.0)
+                if el == "cancelled":
+                    break
                 if not el.is_displayed():
                     raise AssertionError(f"Element '{step.selector.value}' exists but is not visible")
                 events.append({"step": idx, "type": "assertVisible", "name": step.selector.value, "status": "passed", "ts": time.time()})

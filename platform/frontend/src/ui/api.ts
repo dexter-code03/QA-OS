@@ -426,15 +426,15 @@ export const api = {
     http<{ completed: boolean }>("/api/onboarding/complete", { method: "POST" }),
 
   // AI
-  generateSteps: (platform: string, prompt: string, pageSourceXml?: string) =>
-    http<{ steps: any[] }>("/api/ai/generate-steps", {
+  generateSteps: (platform: string, prompt: string, pageSourceXml?: string, opts?: { screen_names?: string[]; folder_id?: number | null; project_id?: number; build_id?: number | null }) =>
+    http<{ steps: any[]; grounded?: boolean; screens_used?: number }>("/api/ai/generate-steps", {
       method: "POST",
-      body: JSON.stringify({ platform, prompt, page_source_xml: pageSourceXml || "" }),
+      body: JSON.stringify({ platform, prompt, page_source_xml: pageSourceXml || "", ...(opts || {}) }),
     }),
-  generateSuite: (platform: string, prompt: string, projectId: number, suiteId: number, pageSourceXml?: string) =>
+  generateSuite: (platform: string, prompt: string, projectId: number, suiteId: number, pageSourceXml?: string, folderId?: number | null) =>
     http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[] }>("/api/ai/generate-suite", {
       method: "POST",
-      body: JSON.stringify({ platform, prompt, project_id: projectId, suite_id: suiteId, page_source_xml: pageSourceXml || "" }),
+      body: JSON.stringify({ platform, prompt, project_id: projectId, suite_id: suiteId, page_source_xml: pageSourceXml || "", ...(folderId ? { folder_id: folderId } : {}) }),
     }),
   editSteps: (platform: string, currentSteps: any[], instruction: string) =>
     http<{ steps: any[]; summary: string }>("/api/ai/edit-steps", {
@@ -490,9 +490,185 @@ export const api = {
   testAppium: () => http<{ ok: boolean; message: string }>("/api/test-connection/appium", { method: "POST" }),
   testConfluence: () => http<{ ok: boolean; message: string }>("/api/test-connection/confluence", { method: "POST" }),
   testAI: () => http<{ ok: boolean; message: string }>("/api/test-connection/ai", { method: "POST" }),
+  listFigmaComponents: () => http<{ names: string[] }>("/api/integrations/figma/components"),
+  syncConfluenceProject: (projectId: number) =>
+    http<{ ok: boolean; page_id?: string; page_url: string; space_key?: string; title: string }>(
+      `/api/projects/${projectId}/confluence/sync`,
+      { method: "POST" },
+    ),
 
   // Katalon export
   exportKatalon: (runId: number) => {
     window.open(`/api/runs/${runId}/katalon`, "_blank");
   },
+
+  // ── Screen Library ──────────────────────────────────
+  listScreenFolders: (projectId: number) =>
+    http<ScreenFolder[]>(`/api/screen-folders?project_id=${projectId}`),
+  createScreenFolder: (body: { project_id: number; name: string }) =>
+    http<ScreenFolder>("/api/screen-folders", { method: "POST", body: JSON.stringify(body) }),
+  deleteScreenFolder: (id: number) =>
+    http<{ ok: boolean }>(`/api/screen-folders/${id}`, { method: "DELETE" }),
+
+  captureScreen: (body: { project_id: number; build_id?: number | null; folder_id: number; name: string; platform: string; notes?: string }) =>
+    http<ScreenEntry>("/api/screens/capture", { method: "POST", body: JSON.stringify(body) }),
+  listScreens: (projectId: number, opts?: { buildId?: number | null; folderId?: number | null; platform?: string }) => {
+    const params = new URLSearchParams({ project_id: String(projectId) });
+    if (opts?.buildId != null) params.set("build_id", String(opts.buildId));
+    if (opts?.folderId != null) params.set("folder_id", String(opts.folderId));
+    if (opts?.platform) params.set("platform", opts.platform);
+    return http<ScreenEntry[]>(`/api/screens?${params}`);
+  },
+  getScreen: (id: number) => http<ScreenEntryFull>(`/api/screens/${id}`),
+  updateScreen: (id: number, body: { name?: string; notes?: string; folder_id?: number | null }) =>
+    http<ScreenEntry>(`/api/screens/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteScreen: (id: number) => http<{ ok: boolean }>(`/api/screens/${id}`, { method: "DELETE" }),
+  screenScreenshotUrl: (id: number) => `/api/screens/${id}/screenshot`,
+
+  // ── Reports v2 ──────────────────────────────────────
+  getSuiteHealth: (suiteId: number, days = 14, platform = "") =>
+    http<SuiteHealthResponse>(`/api/suites/${suiteId}/health?days=${days}&platform=${encodeURIComponent(platform)}`),
+  getSuiteTrend: (suiteId: number, days = 14, platform = "") =>
+    http<SuiteTrendItem[]>(`/api/suites/${suiteId}/trend?days=${days}&platform=${encodeURIComponent(platform)}`),
+  getSuiteStepCoverage: (suiteId: number, days = 14, platform = "") =>
+    http<StepCoverageItem[]>(`/api/suites/${suiteId}/step-coverage?days=${days}&platform=${encodeURIComponent(platform)}`),
+  getSuiteTriage: (suiteId: number, days = 14, platform = "") =>
+    http<TriageResponse>(`/api/suites/${suiteId}/triage?days=${days}&platform=${encodeURIComponent(platform)}`),
+  getCollectionHealth: (collectionId: number, days = 14, platform = "") =>
+    http<CollectionHealthResponse>(`/api/collections/${collectionId}/health?days=${days}&platform=${encodeURIComponent(platform)}`),
+  getCollectionBlockers: (collectionId: number, days = 14, platform = "") =>
+    http<BlockerItem[]>(`/api/collections/${collectionId}/blockers?days=${days}&platform=${encodeURIComponent(platform)}`),
+  downloadSuiteHtml: (suiteId: number, days = 14, platform = "") => {
+    window.open(`/api/suites/${suiteId}/export/html?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
+  },
+  downloadSuiteCsv: (suiteId: number, days = 14, platform = "") => {
+    window.open(`/api/suites/${suiteId}/export/csv?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
+  },
+  downloadSuiteScreenshots: (suiteId: number, days = 14, platform = "") => {
+    window.open(`/api/suites/${suiteId}/export/screenshots?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
+  },
+  downloadCollectionHtml: (collectionId: number, days = 14, platform = "") => {
+    window.open(`/api/collections/${collectionId}/export/html?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
+  },
 };
+
+// ── Report types ──────────────────────────────────────
+
+export interface TestHealthRow {
+  id: number;
+  name: string;
+  status: "passing" | "failing" | "flaky" | "not_run";
+  acceptance_criteria: string;
+  steps_ran: number;
+  steps_total: number;
+  platform: string;
+  pass_rate_pct: number;
+  fail_streak: number;
+  last_passed_at: string | null;
+  ai_fixes_count: number;
+  run_history: { id: number; status: string; platform: string }[];
+  last_failed_run: {
+    id: number;
+    error_message: string | null;
+    failure_category: string;
+    step_results: {
+      index: number;
+      type: string;
+      selector: any;
+      status: string;
+      duration_ms: number | null;
+      error: string | null;
+      screenshot: string | null;
+    }[];
+    ai_fix: { analysis: string; fixed_steps: any[]; changes: any[] } | null;
+    platform: string;
+    started_at: string | null;
+  } | null;
+}
+
+export interface SuiteHealthResponse {
+  suite: { id: number; name: string; module_name: string; last_run_at: string | null; pass_rate: number };
+  metrics: { total: number; passing: number; failing: number; flaky: number; never_run: number; avg_steps_pct: number };
+  tests: TestHealthRow[];
+}
+
+export interface SuiteTrendItem {
+  test_case_id: number;
+  test_name: string;
+  pass_count: number;
+  total_runs: number;
+  pass_rate_pct: number;
+}
+
+export interface StepCoverageItem {
+  test_case_id: number;
+  test_name: string;
+  avg_steps_ran: number;
+  avg_steps_total: number;
+  coverage_pct: number;
+}
+
+export interface TriageResponse {
+  categories: {
+    category: string;
+    count: number;
+    pct: number;
+    affected_tests: { id: number; name: string; error_message: string }[];
+  }[];
+  total_failures: number;
+}
+
+export interface CollectionHealthResponse {
+  collection: { id: number; name: string; pass_rate: number; verdict: string };
+  metrics: { total: number; passing: number; failing: number; blockers: number; flaky: number; never_run: number };
+  suites: {
+    id: number;
+    name: string;
+    pass_rate_pct: number;
+    pass_count: number;
+    fail_count: number;
+    blocker_count: number;
+    last_run_at: string | null;
+    total: number;
+  }[];
+  trend_30d: { date: string; pass_rate_pct: number }[];
+}
+
+export interface BlockerItem {
+  test_id: number;
+  test_name: string;
+  suite_name: string;
+  error_message: string;
+  fail_streak: number;
+  run_id: number;
+  screenshot_path: string | null;
+  ai_fix_available: boolean;
+}
+
+export interface ScreenFolder {
+  id: number;
+  project_id: number;
+  name: string;
+  screen_count: number;
+  created_at: string | null;
+}
+
+export interface ScreenEntry {
+  id: number;
+  project_id: number;
+  build_id: number | null;
+  folder_id: number | null;
+  name: string;
+  platform: string;
+  screenshot_path: string | null;
+  captured_at: string | null;
+  captured_by: string | null;
+  notes: string | null;
+  auto_captured: boolean;
+  xml_length: number;
+  stale?: boolean;
+}
+
+export interface ScreenEntryFull extends ScreenEntry {
+  xml_snapshot: string;
+}

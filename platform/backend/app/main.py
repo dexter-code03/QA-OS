@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import subprocess
+import time
 import uuid
 import zipfile
 from datetime import datetime
@@ -18,7 +19,7 @@ from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from .db import SessionLocal, init_db, Project, Module, TestSuite, Build, TestDefinition, Run
+from .db import SessionLocal, init_db, Project, Module, TestSuite, Build, TestDefinition, Run, ScreenLibrary, ScreenFolder, _classify_error
 from .events import event_bus, RunEvent
 from .schemas import (
     ProjectCreate,
@@ -67,6 +68,8 @@ app.add_middleware(
 
 SETTINGS_FILE = settings.data_dir / "settings.json"
 ONBOARDING_FILE = settings.data_dir / "onboarding.json"
+
+_figma_components_cache: dict[str, Any] = {"ts": 0.0, "names": []}
 
 
 def _load_settings() -> dict:
@@ -350,6 +353,131 @@ async def test_confluence() -> dict[str, Any]:
         return {"ok": False, "message": f"Cannot reach Confluence: {e}"}
 
 
+@app.get("/api/integrations/figma/components")
+def list_figma_components() -> dict[str, Any]:
+    """Return component names from the configured Figma file (cached 5 minutes)."""
+    s = _load_settings()
+    token = (s.get("figma_token") or "").strip()
+    file_key = (s.get("figma_file_key") or "").strip()
+    if not token or not file_key:
+        raise HTTPException(status_code=400, detail="Configure Figma token and file key in Settings")
+    now = time.time()
+    if now - float(_figma_components_cache["ts"]) < 300 and _figma_components_cache.get("names"):
+        return {"names": _figma_components_cache["names"]}
+    try:
+        r = httpx.get(
+            f"https://api.figma.com/v1/files/{file_key}/components",
+            headers={"X-Figma-Token": token},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Figma API error: HTTP {r.status_code}")
+        data = r.json()
+        meta = data.get("meta") or {}
+        components = meta.get("components") or {}
+        names = sorted({str(v.get("name") or "") for v in components.values() if v.get("name")})
+        _figma_components_cache["ts"] = now
+        _figma_components_cache["names"] = names
+        return {"names": names}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Figma request failed: {e}") from e
+
+
+@app.post("/api/projects/{project_id}/confluence/sync")
+async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
+    """Create a Confluence page with a table of tests and latest run status."""
+    import html as html_lib
+
+    s = _load_settings()
+    base = (s.get("confluence_url") or "").rstrip("/")
+    token = (s.get("confluence_token") or "").strip()
+    space_key = (s.get("confluence_space_key") or "").strip()
+    if not base or not token:
+        raise HTTPException(status_code=400, detail="Configure Confluence URL and API token in Settings")
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+    with SessionLocal() as db:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if not proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+        tests = db.query(TestDefinition).filter(TestDefinition.project_id == project_id).order_by(TestDefinition.name).all()
+        runs = db.query(Run).filter(Run.project_id == project_id).order_by(Run.id.desc()).all()
+        sid_list = list({t.suite_id for t in tests if t.suite_id})
+        suite_map: dict[int, str] = {}
+        if sid_list:
+            for su in db.query(TestSuite).filter(TestSuite.id.in_(sid_list)).all():
+                suite_map[su.id] = su.name
+
+    latest_by_test: dict[int, Run] = {}
+    for r in runs:
+        tid = r.test_id
+        if tid and tid not in latest_by_test:
+            latest_by_test[tid] = r
+
+    rows_html = []
+    for t in tests:
+        lr = latest_by_test.get(t.id)
+        st = lr.status if lr else "not_run"
+        plat = lr.platform if lr else "—"
+        finished = lr.finished_at.isoformat() if lr and lr.finished_at else "—"
+        suite = suite_map.get(t.suite_id, "") if t.suite_id else ""
+        rows_html.append(
+            "<tr>"
+            f"<td>{html_lib.escape(t.name)}</td>"
+            f"<td>{html_lib.escape(suite)}</td>"
+            f"<td>{html_lib.escape(str(st))}</td>"
+            f"<td>{html_lib.escape(str(plat))}</td>"
+            f"<td>{html_lib.escape(finished)}</td>"
+            "</tr>"
+        )
+
+    tbody = "".join(rows_html) if rows_html else '<tr><td colspan="5">No tests</td></tr>'
+    table = (
+        "<table>"
+        "<thead><tr><th>Test</th><th>Suite</th><th>Latest run</th><th>Platform</th><th>Finished</th></tr></thead>"
+        f"<tbody>{tbody}</tbody>"
+        "</table>"
+    )
+    title = f"QA-OS — {proj.name} — {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+    body_html = (
+        f"<p>Automated test status from <strong>QA-OS</strong> (project id {project_id}).</p>"
+        f"{table}"
+    )
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        if not space_key:
+            r = await client.get(f"{base}/rest/api/space?limit=10", headers=headers)
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Could not list Confluence spaces: HTTP {r.status_code}")
+            results = r.json().get("results") or []
+            if not results:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No spaces found — open Confluence and create a space, or set Confluence space key in Settings",
+                )
+            space_key = str(results[0].get("key") or "")
+
+        payload = {
+            "type": "page",
+            "title": title,
+            "space": {"key": space_key},
+            "body": {"storage": {"value": body_html, "representation": "storage"}},
+        }
+        r = await client.post(f"{base}/rest/api/content", json=payload, headers=headers)
+        if r.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"Confluence create page failed: HTTP {r.status_code} {r.text[:400]}")
+        data = r.json()
+        links = data.get("_links") or {}
+        web_ui = links.get("webui") or ""
+        page_id = data.get("id") or ""
+        base_ui = base.rstrip("/")
+        page_url = f"{base_ui}{web_ui}" if web_ui else base_ui
+        return {"ok": True, "page_id": page_id, "page_url": page_url, "space_key": space_key, "title": title}
+
+
 # ── AI Connection Test ─────────────────────────────────────────────────
 
 @app.post("/api/test-connection/ai")
@@ -375,6 +503,10 @@ class GenerateStepsRequest(BaseModel):
     platform: str
     prompt: str
     page_source_xml: str = ""
+    screen_names: list[str] = []
+    folder_id: Optional[int] = None
+    project_id: Optional[int] = None
+    build_id: Optional[int] = None
 
 
 @app.post("/api/ai/generate-steps")
@@ -388,29 +520,85 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
-    system_prompt = (
-        "You are a senior mobile QA automation engineer.\n"
-        "Return ONLY valid JSON with this shape:\n"
-        '{"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-        ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
-        ' "text": "...", "ms": 1000, "expect":"..."}]}\n'
-        "IMPORTANT: For keyboard keys (return, done, go, next, search), use keyboardAction instead of tap.\n"
-        "Use hideKeyboard when you need to dismiss the keyboard without pressing a specific key.\n"
-        "Keep selectors realistic for Appium. Use accessibilityId where possible.\n"
-        "No markdown, no explanation, only JSON."
-    )
-    user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}"
-    if payload.page_source_xml:
-        user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
+    xml_context = ""
+    grounded = False
+    screen_images: list[tuple[str, str]] = []  # (name, base64_png)
+
+    if payload.project_id and (payload.folder_id or payload.screen_names):
+        with SessionLocal() as db:
+            if payload.folder_id:
+                q = db.query(ScreenLibrary).filter(
+                    ScreenLibrary.folder_id == payload.folder_id,
+                    ScreenLibrary.platform == payload.platform,
+                )
+            else:
+                q = db.query(ScreenLibrary).filter(
+                    ScreenLibrary.project_id == payload.project_id,
+                    ScreenLibrary.platform == payload.platform,
+                    ScreenLibrary.name.in_(payload.screen_names),
+                )
+            if payload.build_id is not None:
+                q = q.filter(ScreenLibrary.build_id == payload.build_id)
+            screens = q.all()
+            if screens:
+                xml_context = _build_xml_context(screens)
+                grounded = True
+                for scr in screens:
+                    if scr.screenshot_path:
+                        fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
+                        if fpath.exists():
+                            img_b64 = _compress_screenshot(fpath)
+                            if img_b64:
+                                screen_images.append((scr.name, img_b64))
+
+    if grounded and xml_context:
+        system_prompt = (
+            "You are a mobile QA automation expert generating Appium test steps.\n"
+            "You will receive real XML page source from the app under test.\n"
+            "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
+            'Return ONLY valid JSON: {"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
+            ' "text": "...", "ms": 1000, "expect":"..."}]}\n\n'
+            "SELECTOR PRIORITY ORDER (use first match found in XML):\n"
+            "1. resource-id (most stable)\n"
+            "2. content-desc / accessibility id (stable)\n"
+            "3. text (fragile — only if no ID available)\n"
+            "4. xpath (last resort — only if nothing else exists)\n"
+            "IMPORTANT: For keyboard keys (return, done, go, next, search), use keyboardAction instead of tap.\n"
+            "Use hideKeyboard when you need to dismiss the keyboard without pressing a specific key.\n"
+            "Every selector you use must be found verbatim in the XML below.\n"
+            "No markdown, no explanation, only JSON."
+        )
+        user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
+    else:
+        system_prompt = (
+            "You are a senior mobile QA automation engineer.\n"
+            "Return ONLY valid JSON with this shape:\n"
+            '{"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
+            ' "text": "...", "ms": 1000, "expect":"..."}]}\n'
+            "IMPORTANT: For keyboard keys (return, done, go, next, search), use keyboardAction instead of tap.\n"
+            "Use hideKeyboard when you need to dismiss the keyboard without pressing a specific key.\n"
+            "Keep selectors realistic for Appium. Use accessibilityId where possible.\n"
+            "No markdown, no explanation, only JSON."
+        )
+        user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}"
+        if payload.page_source_xml:
+            user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    parts: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
+    for img_name, img_b64 in screen_images[:6]:
+        parts.append({"text": f"\n[Screenshot: {img_name}]"})
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
     body = {
-        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_msg}"}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0.15 if grounded else 0.2, "responseMimeType": "application/json"},
     }
 
+    screens_used = len(screen_images) if grounded else 0
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(url, json=body)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
@@ -420,7 +608,7 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
             steps = parsed.get("steps")
             if not isinstance(steps, list):
                 raise HTTPException(status_code=502, detail="AI did not return steps[]")
-            return {"steps": steps}
+            return {"steps": steps, "grounded": grounded, "screens_used": screens_used}
     except HTTPException:
         raise
     except Exception as e:
@@ -435,6 +623,7 @@ class GenerateSuiteRequest(BaseModel):
     page_source_xml: str = ""
     project_id: int
     suite_id: int
+    folder_id: Optional[int] = None
 
 
 @app.post("/api/ai/generate-suite")
@@ -447,25 +636,70 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
-    system_prompt = (
-        "You are a senior mobile QA automation engineer.\n"
-        "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
-        "Return ONLY valid JSON with this shape:\n"
-        '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-        ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
-        "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
-        "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
-        "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
-        "No markdown, no explanation, only JSON."
-    )
-    user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
-    if payload.page_source_xml:
-        user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
+    xml_context = ""
+    screen_images: list[tuple[str, str]] = []
+    if payload.folder_id:
+        with SessionLocal() as db:
+            screens = db.query(ScreenLibrary).filter(
+                ScreenLibrary.folder_id == payload.folder_id,
+                ScreenLibrary.platform == payload.platform,
+            ).all()
+            if screens:
+                xml_context = _build_xml_context(screens)
+                for scr in screens:
+                    if scr.screenshot_path:
+                        fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
+                        if fpath.exists():
+                            img_b64 = _compress_screenshot(fpath)
+                            if img_b64:
+                                screen_images.append((scr.name, img_b64))
+
+    grounded = bool(xml_context)
+    if grounded:
+        system_prompt = (
+            "You are a senior mobile QA automation engineer.\n"
+            "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
+            "You will receive real XML page source and screenshots from the app under test.\n"
+            "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
+            "Return ONLY valid JSON with this shape:\n"
+            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
+            "SELECTOR PRIORITY ORDER (use first match found in XML):\n"
+            "1. resource-id (most stable)\n"
+            "2. content-desc / accessibility id (stable)\n"
+            "3. text (fragile — only if no ID available)\n"
+            "4. xpath (last resort — only if nothing else exists)\n"
+            "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+            "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
+            "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
+            "Every selector you use must be found verbatim in the XML below.\n"
+            "No markdown, no explanation, only JSON."
+        )
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
+    else:
+        system_prompt = (
+            "You are a senior mobile QA automation engineer.\n"
+            "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
+            "Return ONLY valid JSON with this shape:\n"
+            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
+            "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+            "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
+            "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
+            "No markdown, no explanation, only JSON."
+        )
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
+        if payload.page_source_xml:
+            user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    parts_list: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
+    for img_name, img_b64 in screen_images[:6]:
+        parts_list.append({"text": f"\n[Screenshot: {img_name}]"})
+        parts_list.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
     body = {
-        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_msg}"}]}],
-        "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"},
+        "contents": [{"parts": parts_list}],
+        "generationConfig": {"temperature": 0.15 if grounded else 0.3, "responseMimeType": "application/json"},
     }
 
     try:
@@ -982,7 +1216,459 @@ async def get_page_source() -> dict[str, Any]:
         return {"ok": False, "xml": "", "message": str(e)}
 
 
+# ── Screen Library ─────────────────────────────────────────────────────
+
+def _compress_screenshot(fpath: Path, max_dim: int = 512) -> str:
+    """Resize a screenshot to fit within max_dim and return base64 JPEG."""
+    try:
+        from PIL import Image
+        import io, base64
+        img = Image.open(fpath)
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=60)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
+def _build_xml_context(screens: list[ScreenLibrary]) -> str:
+    """Extract interactive elements from page source XML to reduce token usage."""
+    import xml.etree.ElementTree as ET
+    INTERACTIVE_CLASSES = {
+        "android.widget.Button", "android.widget.EditText", "android.widget.CheckBox",
+        "android.widget.RadioButton", "android.widget.Spinner", "android.widget.ImageButton",
+        "android.view.View", "android.widget.TextView", "android.widget.ImageView",
+        "android.widget.Switch", "android.widget.ToggleButton",
+        "XCUIElementTypeButton", "XCUIElementTypeTextField", "XCUIElementTypeSecureTextField",
+        "XCUIElementTypeStaticText", "XCUIElementTypeSwitch", "XCUIElementTypeImage",
+    }
+    chunks = []
+    for screen in screens:
+        try:
+            root = ET.fromstring(screen.xml_snapshot)
+        except ET.ParseError:
+            chunks.append(f"=== {screen.name} ===\n[XML parse error]")
+            continue
+        elements = []
+        for el in root.iter():
+            cls = el.get("class", "")
+            clickable = el.get("clickable") == "true"
+            focusable = el.get("focusable") == "true"
+            rid = el.get("resource-id", "")
+            cdesc = el.get("content-desc", "")
+            txt = el.get("text", "")
+            name_attr = el.get("name", "")
+            label_attr = el.get("label", "")
+            if not (cls in INTERACTIVE_CLASSES or clickable or focusable):
+                continue
+            if not (rid or cdesc or txt or name_attr or label_attr):
+                continue
+            parts = [f'class="{cls}"']
+            if rid:
+                parts.append(f'resource-id="{rid}"')
+            if cdesc:
+                parts.append(f'content-desc="{cdesc}"')
+            if txt:
+                parts.append(f'text="{txt}"')
+            if name_attr:
+                parts.append(f'name="{name_attr}"')
+            if label_attr:
+                parts.append(f'label="{label_attr}"')
+            if clickable:
+                parts.append('clickable="true"')
+            elements.append("  " + " ".join(parts))
+        chunks.append(f"=== {screen.name} ===\n" + "\n".join(elements))
+    return "\n\n".join(chunks)
+
+
+def _screen_to_dict(s: ScreenLibrary, include_xml: bool = False) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "id": s.id, "project_id": s.project_id, "build_id": s.build_id,
+        "folder_id": s.folder_id,
+        "name": s.name, "platform": s.platform,
+        "screenshot_path": s.screenshot_path,
+        "captured_at": s.captured_at.isoformat() if s.captured_at else None,
+        "captured_by": s.captured_by, "notes": s.notes,
+        "auto_captured": bool(s.auto_captured),
+        "xml_length": len(s.xml_snapshot) if s.xml_snapshot else 0,
+    }
+    if include_xml:
+        d["xml_snapshot"] = s.xml_snapshot
+    return d
+
+
+def _create_attach_driver(platform: str, device_target: str, server_url: str):
+    """Create an Appium session that attaches to whatever is currently on
+    screen — no app install, no relaunch.  Ideal for screen capture."""
+    from appium.options.android import UiAutomator2Options
+    from appium.options.ios import XCUITestOptions
+    from appium import webdriver
+
+    if platform == "android":
+        opts = UiAutomator2Options()
+        opts.platform_name = "Android"
+        opts.automation_name = "UiAutomator2"
+        if device_target:
+            opts.udid = device_target
+        opts.no_reset = True
+        opts.auto_grant_permissions = True
+        opts.new_command_timeout = 600
+        opts.set_capability("appium:autoLaunch", False)
+        opts.set_capability("appium:skipDeviceInitialization", True)
+        opts.set_capability("appium:skipServerInstallation", True)
+        return webdriver.Remote(command_executor=server_url, options=opts)
+
+    if platform in ("ios_sim", "ios"):
+        opts = XCUITestOptions()
+        opts.platform_name = "iOS"
+        opts.automation_name = "XCUITest"
+        if device_target:
+            opts.udid = device_target
+        opts.no_reset = True
+        opts.auto_accept_alerts = True
+        opts.new_command_timeout = 600
+        return webdriver.Remote(command_executor=server_url, options=opts)
+
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
+def _is_app_installed(device_target: str, package: str) -> bool:
+    """Check if an Android package is already installed on the device."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["adb", "-s", device_target, "shell", "pm", "list", "packages", package],
+            text=True, timeout=5,
+        )
+        return f"package:{package}" in out
+    except Exception:
+        return False
+
+
+def _is_app_foreground(device_target: str, package: str) -> bool:
+    """Check if the app is currently in the foreground on the device."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["adb", "-s", device_target, "shell", "dumpsys", "activity", "recents"],
+            text=True, timeout=5,
+        )
+        for line in out.splitlines():
+            if "Recent #0" in line or "mFocusedApp" in line or "realActivity" in line:
+                if package in line:
+                    return True
+                break
+        out2 = subprocess.check_output(
+            ["adb", "-s", device_target, "shell", "dumpsys", "window", "windows"],
+            text=True, timeout=5,
+        )
+        for line in out2.splitlines():
+            if "mCurrentFocus" in line or "mFocusedApp" in line:
+                if package in line:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _launch_app(device_target: str, package: str, activity: str = "") -> None:
+    """Launch an already-installed app on the device."""
+    import subprocess
+    if activity:
+        subprocess.run(
+            ["adb", "-s", device_target, "shell", "am", "start", "-n", f"{package}/{activity}"],
+            timeout=10, capture_output=True,
+        )
+    else:
+        subprocess.run(
+            ["adb", "-s", device_target, "shell", "monkey", "-p", package,
+             "-c", "android.intent.category.LAUNCHER", "1"],
+            timeout=10, capture_output=True,
+        )
+
+
+@app.post("/api/screens/capture")
+async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
+    from .runner.appium_service import ensure_appium_running
+    from .runner.session import SessionConfig, create_driver
+
+    project_id = body.get("project_id")
+    build_id = body.get("build_id")
+    folder_id = body.get("folder_id")
+    name = (body.get("name") or "").strip()
+    platform_val = body.get("platform", "android")
+    notes = body.get("notes", "")
+
+    if not project_id or not name:
+        raise HTTPException(status_code=400, detail="project_id and name are required")
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="folder_id is required — select or create a folder first")
+
+    s = _load_settings()
+    host = s.get("appium_host", settings.appium_host)
+    port = s.get("appium_port", settings.appium_port)
+    base = f"http://{host}:{port}"
+
+    app_path = None
+    build_meta: dict = {}
+    if build_id:
+        with SessionLocal() as db:
+            b = db.query(Build).filter(Build.id == build_id).first()
+            if b:
+                app_path = b.file_path
+                build_meta = b.build_metadata or {}
+                platform_val = b.platform or platform_val
+
+    device_target = ""
+    xml = ""
+    shot_b64 = ""
+    driver = None
+    needs_install = False
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, ensure_appium_running)
+
+        if platform_val == "android":
+            try:
+                import subprocess
+                adb_out = subprocess.check_output(["adb", "devices"], text=True, timeout=5)
+                for line in adb_out.strip().split("\n")[1:]:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == "device":
+                        device_target = parts[0]
+                        break
+            except Exception:
+                pass
+
+        if not device_target and platform_val == "android":
+            raise HTTPException(status_code=400, detail="No Android device or emulator found. Connect a device or start an emulator first.")
+
+        pkg = build_meta.get("package", "")
+        if platform_val == "android" and pkg:
+            needs_install = not await asyncio.get_event_loop().run_in_executor(
+                None, _is_app_installed, device_target, pkg
+            )
+
+        if needs_install and app_path:
+            cfg = SessionConfig(
+                platform=platform_val,
+                device_target=device_target,
+                app_path=app_path,
+                build_meta=build_meta,
+            )
+            try:
+                driver = await asyncio.get_event_loop().run_in_executor(None, create_driver, cfg)
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to install & launch app: {e}")
+            await asyncio.sleep(3)
+        else:
+            if platform_val == "android" and pkg and not await asyncio.get_event_loop().run_in_executor(
+                None, _is_app_foreground, device_target, pkg
+            ):
+                activity = build_meta.get("main_activity", "")
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _launch_app, device_target, pkg, activity
+                )
+                await asyncio.sleep(3)
+
+            try:
+                driver = await asyncio.get_event_loop().run_in_executor(
+                    None, _create_attach_driver, platform_val, device_target, base
+                )
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to create Appium session: {e}")
+
+        try:
+            xml = await asyncio.get_event_loop().run_in_executor(None, lambda: driver.page_source)
+            shot_b64 = await asyncio.get_event_loop().run_in_executor(None, lambda: driver.get_screenshot_as_base64())
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to capture screen: {e}")
+
+    except HTTPException:
+        raise
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail=f"Cannot connect to Appium server at {base}. Make sure Appium is running and a device is connected.")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=502, detail=f"Appium server at {base} timed out. The device may be unresponsive.")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        raise HTTPException(status_code=502, detail=f"Appium communication failed: {err}")
+
+    if not xml:
+        raise HTTPException(status_code=502, detail="Appium returned empty page source")
+
+    screenshot_path_val = None
+    if shot_b64:
+        import base64
+        screen_dir = settings.artifacts_dir / str(project_id) / "screens"
+        screen_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = name.replace(" ", "_").replace("/", "_")[:80]
+        fname = f"{safe_name}_{platform_val}_{int(datetime.utcnow().timestamp())}.png"
+        fpath = screen_dir / fname
+        fpath.write_bytes(base64.b64decode(shot_b64))
+        screenshot_path_val = f"screens/{fname}"
+
+    with SessionLocal() as db:
+        existing = db.query(ScreenLibrary).filter(
+            ScreenLibrary.project_id == project_id,
+            ScreenLibrary.build_id == build_id,
+            ScreenLibrary.name == name,
+            ScreenLibrary.platform == platform_val,
+        ).first()
+        if existing:
+            existing.xml_snapshot = xml
+            existing.screenshot_path = screenshot_path_val or existing.screenshot_path
+            existing.captured_at = datetime.utcnow()
+            existing.notes = notes or existing.notes
+            existing.folder_id = folder_id or existing.folder_id
+            db.commit()
+            db.refresh(existing)
+            return _screen_to_dict(existing)
+
+        entry = ScreenLibrary(
+            project_id=project_id, build_id=build_id, name=name,
+            folder_id=folder_id,
+            platform=platform_val, xml_snapshot=xml,
+            screenshot_path=screenshot_path_val, notes=notes,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return _screen_to_dict(entry)
+
+
+@app.get("/api/screen-folders")
+def list_screen_folders(project_id: int) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        folders = db.query(ScreenFolder).filter(ScreenFolder.project_id == project_id).order_by(ScreenFolder.name).all()
+        return [{"id": f.id, "project_id": f.project_id, "name": f.name,
+                 "screen_count": db.query(ScreenLibrary).filter(ScreenLibrary.folder_id == f.id).count(),
+                 "created_at": f.created_at.isoformat() if f.created_at else None} for f in folders]
+
+
+@app.post("/api/screen-folders")
+def create_screen_folder(body: dict[str, Any]) -> dict[str, Any]:
+    project_id = body.get("project_id")
+    name = (body.get("name") or "").strip()
+    if not project_id or not name:
+        raise HTTPException(status_code=400, detail="project_id and name are required")
+    with SessionLocal() as db:
+        existing = db.query(ScreenFolder).filter(ScreenFolder.project_id == project_id, ScreenFolder.name == name).first()
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Folder '{name}' already exists")
+        f = ScreenFolder(project_id=project_id, name=name)
+        db.add(f)
+        db.commit()
+        db.refresh(f)
+        return {"id": f.id, "project_id": f.project_id, "name": f.name, "screen_count": 0,
+                "created_at": f.created_at.isoformat() if f.created_at else None}
+
+
+@app.delete("/api/screen-folders/{folder_id}")
+def delete_screen_folder(folder_id: int):
+    with SessionLocal() as db:
+        f = db.query(ScreenFolder).filter(ScreenFolder.id == folder_id).first()
+        if not f:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        db.delete(f)
+        db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/screens")
+def list_screens(project_id: int, build_id: Optional[int] = None, folder_id: Optional[int] = None, platform: str = "") -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        q = db.query(ScreenLibrary).filter(ScreenLibrary.project_id == project_id)
+        if build_id is not None:
+            q = q.filter(ScreenLibrary.build_id == build_id)
+        if folder_id is not None:
+            q = q.filter(ScreenLibrary.folder_id == folder_id)
+        if platform:
+            q = q.filter(ScreenLibrary.platform == platform)
+        screens = q.order_by(ScreenLibrary.captured_at.desc()).all()
+        latest_build = db.query(Build).filter(Build.project_id == project_id).order_by(Build.id.desc()).first()
+        latest_bid = latest_build.id if latest_build else None
+        result = []
+        for s in screens:
+            d = _screen_to_dict(s)
+            d["stale"] = s.build_id is not None and latest_bid is not None and s.build_id != latest_bid
+            result.append(d)
+        return result
+
+
+@app.get("/api/screens/{screen_id}")
+def get_screen(screen_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        s = db.query(ScreenLibrary).filter(ScreenLibrary.id == screen_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="Screen not found")
+        return _screen_to_dict(s, include_xml=True)
+
+
+@app.put("/api/screens/{screen_id}")
+def update_screen(screen_id: int, body: dict[str, Any]) -> dict[str, Any]:
+    with SessionLocal() as db:
+        s = db.query(ScreenLibrary).filter(ScreenLibrary.id == screen_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="Screen not found")
+        if "name" in body:
+            s.name = body["name"]
+        if "notes" in body:
+            s.notes = body["notes"]
+        if "folder_id" in body:
+            s.folder_id = body["folder_id"]
+        db.commit()
+        db.refresh(s)
+        return _screen_to_dict(s)
+
+
+@app.delete("/api/screens/{screen_id}")
+def delete_screen(screen_id: int):
+    with SessionLocal() as db:
+        s = db.query(ScreenLibrary).filter(ScreenLibrary.id == screen_id).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="Screen not found")
+        db.delete(s)
+        db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/screens/{screen_id}/screenshot")
+def screen_screenshot(screen_id: int):
+    with SessionLocal() as db:
+        s = db.query(ScreenLibrary).filter(ScreenLibrary.id == screen_id).first()
+        if not s or not s.screenshot_path:
+            raise HTTPException(status_code=404, detail="Screenshot not found")
+        fpath = settings.artifacts_dir / str(s.project_id) / s.screenshot_path
+        if not fpath.exists():
+            raise HTTPException(status_code=404, detail="Screenshot file missing")
+        return FileResponse(fpath, media_type="image/png")
+
+
 # ── Triage ─────────────────────────────────────────────────────────────
+
+def _classify_failure_message(msg: str, platform: str | None) -> dict[str, Any]:
+    s = (msg or "").lower()
+    category = "other"
+    if any(x in s for x in ("nosuchelement", "no such element", "unable to locate", "could not find", "not found")):
+        category = "selector_not_found"
+    elif any(x in s for x in ("timeout", "timed out", "wait")):
+        category = "element_timeout"
+    elif "assertion" in s or "expected" in s or "assert" in s:
+        category = "assertion_failure"
+    elif any(x in s for x in ("connection", "network", "unreachable", "econnrefused", "socket")):
+        category = "network_error"
+    elif any(x in s for x in ("crash", "anr", "instrumentation")):
+        category = "app_crash"
+    return {
+        "category": category,
+        "platform": platform or "",
+        "summary": (msg or "")[:500],
+    }
+
 
 @app.post("/api/runs/{run_id}/triage")
 def triage_run(run_id: int) -> dict[str, Any]:
@@ -992,21 +1678,25 @@ def triage_run(run_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         if r.status not in ("failed", "error"):
             return {"classifications": [], "note": "Run is not failed/error"}
-        failure = {
-            "testCaseId": f"RUN-{r.id}",
-            "testCaseName": f"Run {r.id} failure",
-            "status": "FAILED",
-            "stackTrace": r.error_message or "",
-            "browser": r.platform,
+        stack = r.error_message or ""
+        summary = (r.summary or {}) if isinstance(r.summary, dict) else {}
+        step_results = summary.get("stepResults") or []
+        failed_step = next((x for x in step_results if isinstance(x, dict) and x.get("status") == "failed"), None)
+        if failed_step and isinstance(failed_step.get("details"), dict):
+            err = failed_step["details"].get("error")
+            if err:
+                stack = str(err)
+        c = _classify_failure_message(stack, r.platform)
+        return {
+            "classifications": [
+                {
+                    "testCaseId": f"RUN-{r.id}",
+                    "category": c["category"],
+                    "summary": c["summary"],
+                    "platform": c["platform"],
+                }
+            ]
         }
-        test_results = {"testCases": [failure]}
-
-    import sys
-    repo_root = Path(__file__).resolve().parents[3]
-    sys.path.insert(0, str(repo_root))
-    from tools.bug_triage import classify_failures  # type: ignore
-    classifications = classify_failures(test_results)
-    return {"classifications": classifications}
 
 
 # ── Projects ──────────────────────────────────────────────────────────
@@ -1379,7 +2069,7 @@ def append_fix_history(test_id: int, payload: AppendFixHistoryRequest) -> dict[s
         history = list(getattr(t, "fix_history", None) or [])
         tp = payload.target_platform if payload.target_platform in ("android", "ios_sim") else "android"
         entry = {
-            "analysis": payload.analysis[:500],
+            "analysis": payload.analysis,
             "fixed_steps": payload.fixed_steps,
             "changes": payload.changes,
             "run_id": payload.run_id,
@@ -1618,12 +2308,37 @@ def delete_run(run_id: int) -> dict[str, Any]:
 
 # ── Artifacts ─────────────────────────────────────────────────────────
 
+def _artifact_media_type(filename: str) -> str | None:
+    """Return MIME type so browsers handle Android (.mp4) vs iOS sim (.mov) video correctly."""
+    lower = filename.lower()
+    if lower.endswith(".mp4"):
+        return "video/mp4"
+    if lower.endswith(".mov"):
+        return "video/quicktime"
+    if lower.endswith(".webm"):
+        return "video/webm"
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+        return "image/jpeg"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    if lower.endswith(".xml"):
+        return "application/xml"
+    return None
+
+
 @app.get("/api/artifacts/{project_id}/{run_id}/{name}")
 def get_artifact(project_id: int, run_id: int, name: str) -> FileResponse:
     path = settings.artifacts_dir / str(project_id) / str(run_id) / name
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact not found")
-    return FileResponse(str(path), headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    media = _artifact_media_type(name)
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
+    fr_kw: dict[str, Any] = {"filename": name, "headers": headers}
+    if media:
+        fr_kw["media_type"] = media
+    return FileResponse(str(path), **fr_kw)
 
 
 # ── Katalon Export (Studio 9.x compatible) ───────────────────────────
@@ -2433,7 +3148,7 @@ def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> 
             continue
 
     mod_raw = payload.get("module_id")
-    module_id: int | None = None
+    module_id: Optional[int] = None
     if mod_raw is not None:
         try:
             module_id = int(mod_raw)
@@ -2540,6 +3255,940 @@ def generate_katalon_zip_endpoint(project_id: int, payload: dict[str, Any] = Bod
         BytesIO(zip_bytes),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}_katalon.zip"'},
+    )
+
+
+# ── Reports v2 — test-case-first endpoints ─────────────────────────────
+
+def _run_window(db, suite_or_test_ids: list[int], days: int, platform: str, *, by_suite: bool = True):
+    """Return runs within the time window, optionally filtered by platform."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    q = db.query(Run).filter(Run.started_at >= cutoff)
+    if platform:
+        q = q.filter(Run.platform == platform)
+    if by_suite:
+        q = q.filter(Run.test_id.in_(
+            db.query(TestDefinition.id).filter(TestDefinition.suite_id.in_(suite_or_test_ids))
+        ))
+    else:
+        q = q.filter(Run.test_id.in_(suite_or_test_ids))
+    return q.order_by(Run.id.asc()).all()
+
+
+def _steps_for_platform_record(t: TestDefinition, platform: str) -> list[dict]:
+    ps = t.platform_steps or {}
+    if isinstance(ps, dict):
+        s = ps.get(platform) or ps.get("android") or []
+        if s:
+            return list(s)
+    return list(t.steps or [])
+
+
+def _prereq_step_count(t: TestDefinition, db, platform: str = "") -> int:
+    """Return the number of prerequisite steps prepended by the runner.
+    If platform given, use that platform's prereq steps; else use the max."""
+    if not t.prerequisite_test_id or t.prerequisite_test_id == t.id:
+        return 0
+    prereq = db.query(TestDefinition).filter(TestDefinition.id == t.prerequisite_test_id).first()
+    if not prereq:
+        return 0
+    if platform:
+        return len(_steps_for_platform_record(prereq, platform))
+    return max(len(_steps_for_platform_record(prereq, "android")), len(_steps_for_platform_record(prereq, "ios_sim")))
+
+
+def _test_health_row(t: TestDefinition, test_runs: list[Run], days: int, prereq_offset: int = 0, prereq_def: "Optional[TestDefinition]" = None) -> dict[str, Any]:
+    """Build one test-case health row from its runs in the window.
+    prereq_offset: fallback count; prereq_def: prerequisite test for platform-aware offset."""
+    if not test_runs:
+        has_android = bool(_steps_for_platform_record(t, "android"))
+        has_ios = bool(_steps_for_platform_record(t, "ios_sim"))
+        plat = "android" if has_android and not has_ios else "ios_sim" if has_ios and not has_android else "android"
+        return {
+            "id": t.id, "name": t.name, "status": "not_run",
+            "steps_ran": 0, "steps_total": max(len(_steps_for_platform_record(t, "android")), len(_steps_for_platform_record(t, "ios_sim"))),
+            "platform": plat,
+            "pass_rate_pct": 0, "fail_streak": 0,
+            "last_passed_at": None, "ai_fixes_count": len(t.fix_history or []),
+            "run_history": [], "last_failed_run": None,
+        }
+
+    platforms_seen = set(r.platform for r in test_runs if r.platform)
+    plat = "both" if len(platforms_seen) > 1 else (platforms_seen.pop() if platforms_seen else "android")
+
+    passed = sum(1 for r in test_runs if r.status == "passed")
+    total = len(test_runs)
+    rate = round(100 * passed / total) if total else 0
+
+    # fail streak (from newest)
+    streak = 0
+    for r in reversed(test_runs):
+        if r.status in ("failed", "error"):
+            streak += 1
+        else:
+            break
+
+    # flaky: both pass and fail, no long consecutive fail streak
+    has_pass = any(r.status == "passed" for r in test_runs)
+    has_fail = any(r.status in ("failed", "error") for r in test_runs)
+    if has_pass and has_fail and streak <= 2:
+        status = "flaky"
+    elif streak > 0 and not has_pass:
+        status = "failing"
+    elif streak > 0:
+        status = "failing"
+    else:
+        status = "passing"
+
+    last_passed = None
+    for r in reversed(test_runs):
+        if r.status == "passed":
+            last_passed = r.finished_at.isoformat() if r.finished_at else None
+            break
+
+    # steps_total from test definition only (excludes prerequisite)
+    steps_total = max(len(_steps_for_platform_record(t, "android")), len(_steps_for_platform_record(t, "ios_sim")))
+    # steps_ran: subtract prerequisite steps from run data using the run's actual platform
+    last = test_runs[-1]
+    sr = last.summary or {}
+    step_results = sr.get("stepResults") or []
+    all_ran = sum(1 for s in step_results if s.get("status") in ("passed", "failed"))
+    run_pf = (last.platform or "android").strip() or "android"
+    actual_offset = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else prereq_offset
+    steps_ran = max(0, all_ran - actual_offset)
+
+    # last failed run detail (skip prerequisite steps)
+    last_failed_run = None
+    for r in reversed(test_runs):
+        if r.status in ("failed", "error"):
+            rsummary = r.summary or {}
+            rsteps = rsummary.get("stepResults") or []
+            arts = r.artifacts or {}
+            screenshots = arts.get("screenshots") or []
+            # Slice off prerequisite steps using this run's platform
+            r_pf = (r.platform or "android").strip() or "android"
+            r_offset = len(_steps_for_platform_record(prereq_def, r_pf)) if prereq_def else prereq_offset
+            own_rsteps = rsteps[r_offset:]
+            own_screenshots = screenshots[r_offset:]
+            step_detail = []
+            for si, sr_item in enumerate(own_rsteps):
+                shot = own_screenshots[si] if si < len(own_screenshots) else None
+                step_detail.append({
+                    "index": si,
+                    "type": (sr_item.get("step") or {}).get("type") or "",
+                    "selector": (sr_item.get("step") or {}).get("selector") or sr_item.get("details", {}).get("selector") if isinstance(sr_item.get("details"), dict) else None,
+                    "status": sr_item.get("status") or "pending",
+                    "duration_ms": sr_item.get("duration_ms"),
+                    "error": sr_item.get("details", {}).get("error") if isinstance(sr_item.get("details"), dict) else (sr_item.get("details") if sr_item.get("status") == "failed" else None),
+                    "screenshot": shot,
+                })
+            fh = t.fix_history or []
+            ai_fix = None
+            if fh:
+                latest = fh[-1]
+                ai_fix = {"analysis": latest.get("analysis", ""), "fixed_steps": latest.get("fixed_steps", []), "changes": latest.get("changes", [])}
+            last_failed_run = {
+                "id": r.id, "error_message": r.error_message,
+                "failure_category": getattr(r, "failure_category", "") or "",
+                "step_results": step_detail,
+                "ai_fix": ai_fix,
+                "platform": r.platform,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+            }
+            break
+
+    run_history = [{"id": r.id, "status": r.status, "platform": r.platform} for r in test_runs[-14:]]
+
+    return {
+        "id": t.id, "name": t.name, "status": status,
+        "acceptance_criteria": t.acceptance_criteria or "",
+        "steps_ran": steps_ran, "steps_total": steps_total,
+        "platform": plat, "pass_rate_pct": rate, "fail_streak": streak,
+        "last_passed_at": last_passed,
+        "ai_fixes_count": len(t.fix_history or []),
+        "run_history": run_history,
+        "last_failed_run": last_failed_run,
+    }
+
+
+@app.get("/api/suites/{suite_id}/health")
+def suite_health(suite_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
+    with SessionLocal() as db:
+        suite = db.query(TestSuite).filter(TestSuite.id == suite_id).first()
+        if not suite:
+            raise HTTPException(status_code=404, detail="Suite not found")
+        module = db.query(Module).filter(Module.id == suite.module_id).first()
+        tests = db.query(TestDefinition).filter(TestDefinition.suite_id == suite_id).all()
+        test_ids = [t.id for t in tests]
+        prereq_ids = set(t.prerequisite_test_id for t in tests if t.prerequisite_test_id and t.prerequisite_test_id != t.id)
+        prereq_map: dict = {}
+        if prereq_ids:
+            for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
+                prereq_map[p.id] = p
+        runs = _run_window(db, test_ids, days, platform, by_suite=False) if test_ids else []
+        runs_by_test: dict[int, list[Run]] = {}
+        for r in runs:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+
+        rows = [_test_health_row(t, runs_by_test.get(t.id, []), days, prereq_def=prereq_map.get(t.prerequisite_test_id)) for t in tests]
+        # sort: failing first (by streak desc), flaky, passing, not_run
+        order = {"failing": 0, "flaky": 1, "passing": 2, "not_run": 3}
+        rows.sort(key=lambda r: (order.get(r["status"], 4), -r["fail_streak"], r["name"]))
+
+        passing = sum(1 for r in rows if r["status"] == "passing")
+        failing = sum(1 for r in rows if r["status"] == "failing")
+        flaky = sum(1 for r in rows if r["status"] == "flaky")
+        never_run = sum(1 for r in rows if r["status"] == "not_run")
+        avg_steps = 0
+        denom = sum(1 for r in rows if r["steps_total"] > 0)
+        if denom:
+            avg_steps = round(sum(r["steps_ran"] / r["steps_total"] * 100 for r in rows if r["steps_total"] > 0) / denom)
+
+        last_run_at = None
+        if runs:
+            lr = max(runs, key=lambda r: r.finished_at or r.started_at or datetime.min)
+            last_run_at = (lr.finished_at or lr.started_at or datetime.min).isoformat()
+
+        suite_rate = round(100 * passing / len(rows)) if rows else 0
+
+    return {
+        "suite": {"id": suite.id, "name": suite.name, "module_name": module.name if module else "", "last_run_at": last_run_at, "pass_rate": suite_rate},
+        "metrics": {"total": len(rows), "passing": passing, "failing": failing, "flaky": flaky, "never_run": never_run, "avg_steps_pct": avg_steps},
+        "tests": rows,
+    }
+
+
+@app.get("/api/suites/{suite_id}/trend")
+def suite_trend(suite_id: int, days: int = 14, platform: str = "") -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        tests = db.query(TestDefinition).filter(TestDefinition.suite_id == suite_id).all()
+        test_ids = [t.id for t in tests]
+        runs = _run_window(db, test_ids, days, platform, by_suite=False) if test_ids else []
+        runs_by_test: dict[int, list[Run]] = {}
+        for r in runs:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+        out = []
+        for t in tests:
+            trs = runs_by_test.get(t.id, [])
+            total = len(trs)
+            passed = sum(1 for r in trs if r.status == "passed")
+            out.append({
+                "test_case_id": t.id, "test_name": t.name,
+                "pass_count": passed, "total_runs": total,
+                "pass_rate_pct": round(100 * passed / total) if total else 0,
+            })
+    return out
+
+
+@app.get("/api/suites/{suite_id}/step-coverage")
+def suite_step_coverage(suite_id: int, days: int = 14, platform: str = "") -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        tests = db.query(TestDefinition).filter(TestDefinition.suite_id == suite_id).all()
+        test_ids = [t.id for t in tests]
+        prereq_ids = set(t.prerequisite_test_id for t in tests if t.prerequisite_test_id and t.prerequisite_test_id != t.id)
+        prereq_map: dict = {}
+        if prereq_ids:
+            for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
+                prereq_map[p.id] = p
+        runs = _run_window(db, test_ids, days, platform, by_suite=False) if test_ids else []
+        runs_by_test: dict[int, list[Run]] = {}
+        for r in runs:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+        out = []
+        for t in tests:
+            trs = runs_by_test.get(t.id, [])
+            if not trs:
+                total_steps = max(len(_steps_for_platform_record(t, "android")), len(_steps_for_platform_record(t, "ios_sim")))
+                out.append({"test_case_id": t.id, "test_name": t.name, "avg_steps_ran": 0, "avg_steps_total": total_steps, "coverage_pct": 0})
+                continue
+            defined_total = max(len(_steps_for_platform_record(t, "android")), len(_steps_for_platform_record(t, "ios_sim")))
+            prereq_def = prereq_map.get(t.prerequisite_test_id)
+            ran_sum = 0
+            for r in trs:
+                sr = r.summary or {}
+                step_results = sr.get("stepResults") or []
+                all_ran = sum(1 for s in step_results if s.get("status") in ("passed", "failed"))
+                r_pf = (r.platform or "android").strip() or "android"
+                r_offset = len(_steps_for_platform_record(prereq_def, r_pf)) if prereq_def else 0
+                ran_sum += max(0, all_ran - r_offset)
+            n = len(trs)
+            total_sum = defined_total * n
+            avg_ran = round(ran_sum / n, 1)
+            avg_total = float(defined_total)
+            cov = round(100 * ran_sum / total_sum) if total_sum else 0
+            out.append({"test_case_id": t.id, "test_name": t.name, "avg_steps_ran": avg_ran, "avg_steps_total": avg_total, "coverage_pct": cov})
+    return out
+
+
+@app.get("/api/suites/{suite_id}/triage")
+def suite_triage(suite_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
+    with SessionLocal() as db:
+        tests = db.query(TestDefinition).filter(TestDefinition.suite_id == suite_id).all()
+        test_map = {t.id: t for t in tests}
+        test_ids = [t.id for t in tests]
+        runs = _run_window(db, test_ids, days, platform, by_suite=False) if test_ids else []
+        failed_runs = [r for r in runs if r.status in ("failed", "error")]
+        cat_map: dict[str, list[dict]] = {}
+        for r in failed_runs:
+            cat = getattr(r, "failure_category", "") or _classify_error(r.error_message or "")
+            cat_map.setdefault(cat, [])
+            t = test_map.get(r.test_id)
+            cat_map[cat].append({"id": t.id if t else 0, "name": t.name if t else f"Run #{r.id}", "error_message": r.error_message or ""})
+        total_failures = len(failed_runs)
+        categories = []
+        for cat in ["selector_not_found", "element_timeout", "assertion_failure", "network_error", "app_crash", "other"]:
+            items = cat_map.get(cat, [])
+            if not items and cat not in cat_map:
+                continue
+            categories.append({
+                "category": cat,
+                "count": len(items),
+                "pct": round(100 * len(items) / total_failures) if total_failures else 0,
+                "affected_tests": items,
+            })
+    return {"categories": categories, "total_failures": total_failures}
+
+
+@app.get("/api/collections/{collection_id}/health")
+def collection_health(collection_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
+    with SessionLocal() as db:
+        module = db.query(Module).filter(Module.id == collection_id).first()
+        if not module:
+            raise HTTPException(status_code=404, detail="Collection not found")
+        suites = db.query(TestSuite).filter(TestSuite.module_id == collection_id).all()
+        all_tests = db.query(TestDefinition).filter(TestDefinition.suite_id.in_([s.id for s in suites])).all() if suites else []
+        test_ids = [t.id for t in all_tests]
+        prereq_ids = set(t.prerequisite_test_id for t in all_tests if t.prerequisite_test_id and t.prerequisite_test_id != t.id)
+        prereq_map: dict = {}
+        if prereq_ids:
+            for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
+                prereq_map[p.id] = p
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        q = db.query(Run).filter(Run.started_at >= cutoff, Run.test_id.in_(test_ids)) if test_ids else None
+        if platform and q is not None:
+            q = q.filter(Run.platform == platform)
+        runs = q.order_by(Run.id.asc()).all() if q is not None else []
+        runs_by_test: dict[int, list[Run]] = {}
+        for r in runs:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+
+        # per-suite rollup
+        suite_rows = []
+        all_health = []
+        for s in suites:
+            s_tests = [t for t in all_tests if t.suite_id == s.id]
+            s_rows = [_test_health_row(t, runs_by_test.get(t.id, []), days, prereq_def=prereq_map.get(t.prerequisite_test_id)) for t in s_tests]
+            all_health.extend(s_rows)
+            s_pass = sum(1 for r in s_rows if r["status"] == "passing")
+            s_fail = sum(1 for r in s_rows if r["status"] == "failing")
+            s_blocker = sum(1 for r in s_rows if r["fail_streak"] >= 5 or (r.get("last_failed_run") or {}).get("failure_category") == "app_crash")
+            s_runs = [r for r in runs if r.test_id in [t.id for t in s_tests]]
+            last_at = None
+            if s_runs:
+                lr = max(s_runs, key=lambda r: r.finished_at or r.started_at or datetime.min)
+                last_at = (lr.finished_at or lr.started_at).isoformat() if (lr.finished_at or lr.started_at) else None
+            rate = round(100 * s_pass / len(s_rows)) if s_rows else 0
+            suite_rows.append({"id": s.id, "name": s.name, "pass_rate_pct": rate, "pass_count": s_pass, "fail_count": s_fail, "blocker_count": s_blocker, "last_run_at": last_at, "total": len(s_rows)})
+
+        total = len(all_health)
+        passing = sum(1 for h in all_health if h["status"] == "passing")
+        failing = sum(1 for h in all_health if h["status"] == "failing")
+        flaky = sum(1 for h in all_health if h["status"] == "flaky")
+        never_run = sum(1 for h in all_health if h["status"] == "not_run")
+        blockers = sum(1 for h in all_health if h["fail_streak"] >= 5 or (h.get("last_failed_run") or {}).get("failure_category") == "app_crash")
+        rate = round(100 * passing / total) if total else 0
+
+        # verdict
+        if blockers > 0:
+            verdict = "BLOCKED"
+        elif rate < 90:
+            verdict = "NOT_READY"
+        else:
+            verdict = "READY"
+
+        # 30-day trend
+        from datetime import timedelta as td
+        cutoff_30 = datetime.utcnow() - td(days=30)
+        trend_runs = [r for r in runs if r.started_at and r.started_at >= cutoff_30]
+        day_buckets: dict[str, dict] = {}
+        for r in trend_runs:
+            day = r.started_at.strftime("%Y-%m-%d") if r.started_at else "?"
+            day_buckets.setdefault(day, {"passed": 0, "total": 0})
+            day_buckets[day]["total"] += 1
+            if r.status == "passed":
+                day_buckets[day]["passed"] += 1
+        trend = [{"date": d, "pass_rate_pct": round(100 * v["passed"] / v["total"]) if v["total"] else 0} for d, v in sorted(day_buckets.items())]
+
+    return {
+        "collection": {"id": module.id, "name": module.name, "pass_rate": rate, "verdict": verdict},
+        "metrics": {"total": total, "passing": passing, "failing": failing, "blockers": blockers, "flaky": flaky, "never_run": never_run},
+        "suites": suite_rows,
+        "trend_30d": trend,
+    }
+
+
+@app.get("/api/collections/{collection_id}/blockers")
+def collection_blockers(collection_id: int, days: int = 14, platform: str = "") -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        suites = db.query(TestSuite).filter(TestSuite.module_id == collection_id).all()
+        suite_map = {s.id: s.name for s in suites}
+        all_tests = db.query(TestDefinition).filter(TestDefinition.suite_id.in_([s.id for s in suites])).all() if suites else []
+        test_ids = [t.id for t in all_tests]
+        prereq_ids = set(t.prerequisite_test_id for t in all_tests if t.prerequisite_test_id and t.prerequisite_test_id != t.id)
+        prereq_map: dict = {}
+        if prereq_ids:
+            for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
+                prereq_map[p.id] = p
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        q = db.query(Run).filter(Run.started_at >= cutoff, Run.test_id.in_(test_ids)) if test_ids else None
+        if platform and q is not None:
+            q = q.filter(Run.platform == platform)
+        runs = q.order_by(Run.id.asc()).all() if q is not None else []
+        runs_by_test: dict[int, list[Run]] = {}
+        for r in runs:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+
+        out = []
+        for t in all_tests:
+            trs = runs_by_test.get(t.id, [])
+            if not trs:
+                continue
+            h = _test_health_row(t, trs, days, prereq_def=prereq_map.get(t.prerequisite_test_id))
+            is_blocker = h["fail_streak"] >= 5 or (h.get("last_failed_run") or {}).get("failure_category") == "app_crash"
+            if not is_blocker:
+                continue
+            lfr = h.get("last_failed_run") or {}
+            screenshots = lfr.get("step_results") or []
+            shot = None
+            for sr in reversed(screenshots):
+                if sr.get("screenshot"):
+                    shot = sr["screenshot"]
+                    break
+            out.append({
+                "test_id": t.id, "test_name": t.name,
+                "suite_name": suite_map.get(t.suite_id, ""),
+                "error_message": lfr.get("error_message") or "",
+                "fail_streak": h["fail_streak"],
+                "run_id": lfr.get("id") or 0,
+                "screenshot_path": shot,
+                "ai_fix_available": bool(t.fix_history),
+            })
+    return out
+
+
+# ── Report export endpoints ────────────────────────────────────────────
+
+_REPORT_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:#080b0f;color:#e8eaed;padding:32px 40px;line-height:1.6;max-width:1100px;margin:0 auto}
+h1{font-size:22px;color:#fff;margin-bottom:2px;font-weight:700}
+h2{font-size:15px;color:#a78bfa;margin:32px 0 14px;border-bottom:1px solid #1e2430;padding-bottom:8px;font-weight:600}
+.subtitle{font-size:12px;color:#6b7280;margin-bottom:24px}
+.stats{display:flex;gap:16px;margin-bottom:28px;flex-wrap:wrap}
+.stat{background:#111820;border:1px solid #1e2430;border-radius:10px;padding:14px 20px;min-width:100px;text-align:center}
+.stat-val{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.stat-lbl{font-size:9px;text-transform:uppercase;color:#6b7280;margin-top:3px;letter-spacing:.8px}
+.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-weight:600;font-size:11px}
+.badge-pass{background:#0d2818;color:#00e5a0;border:1px solid #0f3d22}
+.badge-fail{background:#2a0a10;color:#ff3b5c;border:1px solid #3d1118}
+.badge-flaky{background:#2a1f06;color:#ffb020;border:1px solid #3d2c0a}
+.badge-skip{background:#1a1a1a;color:#6b7280;border:1px solid #2a2a2a}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:24px}
+thead th{background:#0f1318;color:#6b7280;text-transform:uppercase;font-size:9.5px;letter-spacing:.6px;text-align:left;padding:10px 12px;border-bottom:2px solid #1e2430;font-weight:600}
+tbody td{padding:10px 12px;border-bottom:1px solid #151a22;vertical-align:top}
+tbody tr:hover{background:rgba(139,92,246,.03)}
+.step-row{display:grid;grid-template-columns:32px 10px 1fr 70px 60px;gap:8px;align-items:center;padding:7px 10px;border-radius:6px;font-size:12px;min-height:40px}
+.step-row:nth-child(even){background:rgba(255,255,255,.015)}
+.step-row--fail{background:rgba(255,59,92,.04);border-left:3px solid #ff3b5c}
+.step-num{text-align:right;color:#555;font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.selector{color:#6b7280;font-size:10.5px;font-family:'SF Mono','Fira Code',monospace}
+.dur{color:#555;font-size:10.5px;text-align:right;font-variant-numeric:tabular-nums}
+.screenshot-thumb{width:48px;border-radius:4px;border:1px solid #1e2430;cursor:pointer}
+.screenshot-thumb--fail{border-color:#ff3b5c}
+.error-box{background:rgba(255,59,92,.06);border:1px solid rgba(255,59,92,.15);padding:14px 16px;border-radius:8px;margin:12px 0;font-size:12px;color:#ff7b93;line-height:1.5}
+.fix-box{background:rgba(139,92,246,.06);border:1px solid rgba(139,92,246,.15);padding:14px 16px;border-radius:8px;margin:12px 0}
+.fix-label{font-weight:700;color:#a78bfa;margin-bottom:6px;text-transform:uppercase;font-size:9.5px;letter-spacing:.8px}
+.fix-text{font-size:12px;color:#c4b5fd;line-height:1.5}
+.meta-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:24px}
+.meta-item{font-size:11px;color:#6b7280}.meta-item strong{color:#c9d1d9}
+.history-strip{display:flex;gap:2px;flex-wrap:wrap}
+.history-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.footer{margin-top:40px;border-top:1px solid #1e2430;padding-top:16px;font-size:10px;color:#3d4250}
+.section{margin-bottom:28px}
+img.screenshot-full{max-width:300px;border-radius:8px;border:1px solid #1e2430;margin-top:8px}
+"""
+
+
+import html as _html
+
+
+def _esc(text: str) -> str:
+    """HTML-escape text for safe embedding in reports."""
+    return _html.escape(str(text)) if text else ""
+
+
+def _screenshot_to_base64(project_id: int, run_id: int, filename: str) -> str:
+    """Read a screenshot from disk and return as base64 data URI."""
+    import base64
+    fpath = settings.artifacts_dir / str(project_id) / str(run_id) / filename
+    if not fpath.exists():
+        return ""
+    try:
+        data = fpath.read_bytes()
+        return f"data:image/png;base64,{base64.b64encode(data).decode()}"
+    except Exception:
+        return ""
+
+
+def _render_step_rows_html(step_results: list, project_id: int, run_id: int) -> str:
+    """Render step results as HTML rows with embedded screenshots."""
+    rows = ""
+    for sr in step_results:
+        idx = sr.get("index", 0)
+        st = sr.get("status", "pending")
+        stype = _esc(sr.get("type") or "")
+        sel = sr.get("selector")
+        sel_str = ""
+        if sel:
+            if isinstance(sel, dict):
+                sel_str = f'{_esc(sel.get("using", ""))}=&quot;{_esc(sel.get("value", ""))}&quot;'
+            else:
+                sel_str = _esc(str(sel))
+        dur = sr.get("duration_ms")
+        dur_str = f'{dur/1000:.1f}s' if dur is not None else ""
+        shot = sr.get("screenshot", "")
+        shot_html = ""
+        if shot:
+            b64 = _screenshot_to_base64(project_id, run_id, shot)
+            if b64:
+                fail_cls = " screenshot-thumb--fail" if st == "failed" else ""
+                shot_html = f'<img src="{b64}" class="screenshot-thumb{fail_cls}" />'
+        dot_color = "#00e5a0" if st == "passed" else "#ff3b5c" if st == "failed" else "#555"
+        fail_cls = " step-row--fail" if st == "failed" else ""
+        error_detail = ""
+        if st == "failed" and sr.get("error"):
+            err = sr["error"] if isinstance(sr["error"], str) else str(sr["error"])
+            error_detail = f'<div style="grid-column:3/6;font-size:11px;color:#ff7b93;margin-top:2px">{_esc(err)}</div>'
+        rows += f'''<div class="step-row{fail_cls}">
+<div class="step-num">{idx + 1}</div>
+<div class="dot" style="background:{dot_color}"></div>
+<div><strong>{stype}</strong>{f' <span class="selector">{sel_str}</span>' if sel_str else ""}{" — <em style='color:#555'>skipped</em>" if st not in ("passed","failed") else ""}</div>
+<div class="dur">{dur_str}</div>
+<div>{shot_html}</div>
+{error_detail}
+</div>'''
+    return rows
+
+
+@app.get("/api/tests/{test_id}/export/html")
+def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
+    """Generate a rich self-contained HTML report for a single test case."""
+    with SessionLocal() as db:
+        test = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
+        if not test:
+            raise HTTPException(status_code=404, detail="Test not found")
+        project = db.query(Project).filter(Project.id == test.project_id).first()
+        runs = db.query(Run).filter(Run.test_id == test_id).order_by(Run.id.desc()).limit(50).all()
+
+        # Build info from latest run
+        build_info = ""
+        latest_run = runs[0] if runs else None
+        if latest_run and latest_run.build_id:
+            build = db.query(Build).filter(Build.id == latest_run.build_id).first()
+            if build:
+                build_info = f"{build.file_name} ({build.platform})"
+
+        passed = sum(1 for r in runs if r.status == "passed")
+        total = len(runs)
+        rate = round(100 * passed / total) if total else 0
+        streak = 0
+        for r in runs:
+            if r.status in ("failed", "error"):
+                streak += 1
+            else:
+                break
+
+        last_passed_at = None
+        for r in runs:
+            if r.status == "passed":
+                last_passed_at = r.finished_at.isoformat() if r.finished_at else None
+                break
+
+        # Get the last failed run with full detail
+        last_failed = None
+        for r in runs:
+            if r.status in ("failed", "error"):
+                last_failed = r
+                break
+
+        prereq_def = None
+        if test.prerequisite_test_id and test.prerequisite_test_id != test.id:
+            prereq_def = db.query(TestDefinition).filter(TestDefinition.id == test.prerequisite_test_id).first()
+        step_html = ""
+        error_html = ""
+        fix_html = ""
+        fail_screenshot_html = ""
+        if last_failed:
+            rsummary = last_failed.summary or {}
+            rsteps = rsummary.get("stepResults") or []
+            arts = last_failed.artifacts or {}
+            screenshots = arts.get("screenshots") or []
+            # Skip prerequisite steps using the run's actual platform
+            run_pf = (last_failed.platform or "android").strip() or "android"
+            poffset = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else 0
+            own_rsteps = rsteps[poffset:]
+            own_screenshots = screenshots[poffset:]
+            step_detail = []
+            for si, sr_item in enumerate(own_rsteps):
+                shot = own_screenshots[si] if si < len(own_screenshots) else None
+                step_detail.append({
+                    "index": si,
+                    "type": (sr_item.get("step") or {}).get("type") or "",
+                    "selector": (sr_item.get("step") or {}).get("selector") or (sr_item.get("details", {}).get("selector") if isinstance(sr_item.get("details"), dict) else None),
+                    "status": sr_item.get("status") or "pending",
+                    "duration_ms": sr_item.get("duration_ms"),
+                    "error": sr_item.get("details", {}).get("error") if isinstance(sr_item.get("details"), dict) else (sr_item.get("details") if sr_item.get("status") == "failed" else None),
+                    "screenshot": shot,
+                })
+
+            step_html = _render_step_rows_html(step_detail, test.project_id, last_failed.id)
+
+            if last_failed.error_message:
+                error_html = f'<div class="error-box">{_esc(last_failed.error_message)}</div>'
+
+            # Failed step screenshot (full size)
+            for sd in step_detail:
+                if sd["status"] == "failed" and sd.get("screenshot"):
+                    b64 = _screenshot_to_base64(test.project_id, last_failed.id, sd["screenshot"])
+                    if b64:
+                        fail_screenshot_html = f'<h2>Failure Screenshot (Step {sd["index"]+1})</h2><img class="screenshot-full" src="{b64}" />'
+                    break
+
+            fh = test.fix_history or []
+            if fh:
+                latest_fix = fh[-1]
+                fix_html = f'<div class="fix-box"><div class="fix-label">AI Fix Suggestion</div><div class="fix-text">{_esc(latest_fix.get("analysis",""))}</div></div>'
+
+        # Run history strip
+        history_html = ""
+        for r in reversed(runs[:30]):
+            c = "#00e5a0" if r.status == "passed" else "#ff3b5c" if r.status in ("failed","error") else "#555"
+            ts = r.finished_at.strftime("%b %d %H:%M") if r.finished_at else ""
+            history_html += f'<div class="history-dot" style="background:{c}" title="Run #{r.id} {r.status} {ts}"></div>'
+
+        status_badge = "badge-pass" if streak == 0 and passed > 0 else "badge-fail" if streak > 0 else "badge-skip"
+        status_label = "Passing" if streak == 0 and passed > 0 else "Failing" if streak > 0 else "No runs"
+
+        steps_total = max(len(_steps_for_platform_record(test, "android")), len(_steps_for_platform_record(test, "ios_sim")))
+        steps_ran = 0
+        if last_failed:
+            sr_list = (last_failed.summary or {}).get("stepResults") or []
+            all_ran = sum(1 for s in sr_list if s.get("status") in ("passed", "failed"))
+            steps_ran = max(0, all_ran - poffset)
+        elif latest_run:
+            sr_list = (latest_run.summary or {}).get("stepResults") or []
+            all_ran = sum(1 for s in sr_list if s.get("status") in ("passed", "failed"))
+            run_pf = (latest_run.platform or "android").strip() or "android"
+            lr_offset = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else 0
+            steps_ran = max(0, all_ran - lr_offset)
+
+        dur_s = None
+        if last_failed and last_failed.finished_at and last_failed.started_at:
+            dur_s = round((last_failed.finished_at - last_failed.started_at).total_seconds(), 1)
+
+        html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{test.name} — Test Report</title>
+<style>{_REPORT_CSS}</style></head><body>
+<h1>{test.name} <span class="badge {status_badge}">{status_label}</span></h1>
+<div class="subtitle">{project.name if project else ""} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+
+<div class="stats">
+<div class="stat"><div class="stat-val" style="color:{"#00e5a0" if rate>=80 else "#ffb020" if rate>=50 else "#ff3b5c"}">{rate}%</div><div class="stat-lbl">Pass Rate</div></div>
+<div class="stat"><div class="stat-val">{total}</div><div class="stat-lbl">Total Runs</div></div>
+<div class="stat"><div class="stat-val" style="color:#00e5a0">{passed}</div><div class="stat-lbl">Passed</div></div>
+<div class="stat"><div class="stat-val" style="color:#ff3b5c">{total - passed}</div><div class="stat-lbl">Failed</div></div>
+<div class="stat"><div class="stat-val" style="color:{"#ff3b5c" if streak > 3 else "#ffb020" if streak > 0 else "#00e5a0"}">{streak}</div><div class="stat-lbl">Fail Streak</div></div>
+<div class="stat"><div class="stat-val">{steps_ran}/{steps_total}</div><div class="stat-lbl">Steps Ran</div></div>
+</div>
+
+<div class="meta-grid">
+<div class="meta-item">Build: <strong>{build_info or "—"}</strong></div>
+<div class="meta-item">Platform: <strong>{last_failed.platform if last_failed else "—"}</strong></div>
+<div class="meta-item">Device: <strong>{last_failed.device_target if last_failed else "—"}</strong></div>
+<div class="meta-item">Last passed: <strong>{last_passed_at[:10] if last_passed_at else "Never"}</strong></div>
+<div class="meta-item">Last run: <strong>{latest_run.finished_at.strftime("%Y-%m-%d %H:%M") if latest_run and latest_run.finished_at else "—"}</strong></div>
+<div class="meta-item">Duration: <strong>{f"{dur_s}s" if dur_s else "—"}</strong></div>
+<div class="meta-item">AI fixes used: <strong>{len(test.fix_history or [])}</strong></div>
+<div class="meta-item">Failure category: <strong>{last_failed.failure_category if last_failed and hasattr(last_failed, "failure_category") else "—"}</strong></div>
+</div>
+
+{f'<div class="section"><div style="font-size:11px;color:#6b7280;margin-bottom:6px">ACCEPTANCE CRITERIA</div><div style="font-size:12px;color:#c9d1d9;padding:10px 14px;background:#111820;border-radius:6px;border:1px solid #1e2430">{_esc(test.acceptance_criteria)}</div></div>' if test.acceptance_criteria else ""}
+
+<h2>Run History (last {min(len(runs), 30)} runs)</h2>
+<div class="history-strip" style="margin-bottom:24px">{history_html}</div>
+
+{f'<h2>Step Execution — Run #{last_failed.id}</h2>{step_html}' if step_html else '<div style="color:#6b7280;padding:20px">No failed run to display steps for.</div>'}
+
+{error_html}
+{fix_html}
+{fail_screenshot_html}
+
+<div class="footer">QA·OS Test Case Report · {test.name} · {datetime.utcnow().isoformat()}</div>
+</body></html>'''
+
+    safe_name = test.name.replace(" ", "_").replace("/", "_")[:60]
+    return StreamingResponse(
+        iter([html]), media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_report.html"'},
+    )
+
+
+@app.get("/api/suites/{suite_id}/export/csv")
+def export_suite_csv(suite_id: int, days: int = 14, platform: str = ""):
+    import csv as csvmod
+    import io
+    data = suite_health(suite_id, days, platform)
+    buf = io.StringIO()
+    w = csvmod.writer(buf)
+    w.writerow(["test_name", "status", "pass_rate_pct", "steps_ran", "steps_total", "fail_streak", "last_passed", "error_message", "failure_category", "platform"])
+    for t in data["tests"]:
+        lfr = t.get("last_failed_run") or {}
+        w.writerow([
+            t["name"], t["status"], t["pass_rate_pct"],
+            t["steps_ran"], t["steps_total"], t["fail_streak"],
+            t.get("last_passed_at") or "", lfr.get("error_message") or "",
+            lfr.get("failure_category") or "", t["platform"],
+        ])
+    buf.seek(0)
+    sname = data["suite"]["name"].replace(" ", "_")
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="suite_{sname}_health.csv"'},
+    )
+
+
+@app.get("/api/suites/{suite_id}/export/html")
+def export_suite_html(suite_id: int, days: int = 14, platform: str = ""):
+    data = suite_health(suite_id, days, platform)
+    s = data["suite"]
+    m = data["metrics"]
+    tests = data["tests"]
+
+    # Find project_id for screenshot embedding
+    with SessionLocal() as db:
+        suite = db.query(TestSuite).filter(TestSuite.id == suite_id).first()
+        mod = db.query(Module).filter(Module.id == suite.module_id).first() if suite else None
+        project_id = mod.project_id if mod else 0
+
+    def _badge(st):
+        if st == "passing": return '<span class="badge badge-pass">Passing</span>'
+        if st == "failing": return '<span class="badge badge-fail">Failing</span>'
+        if st == "flaky": return '<span class="badge badge-flaky">Flaky</span>'
+        return '<span class="badge badge-skip">No runs</span>'
+
+    test_sections = ""
+    for t in tests:
+        strip = "".join(f'<div class="history-dot" style="background:{"#00e5a0" if rh["status"]=="passed" else "#ff3b5c" if rh["status"] in ("failed","error") else "#555"}" title="#{rh["id"]} {rh["status"]}"></div>' for rh in t["run_history"])
+        rate_c = "#00e5a0" if t["pass_rate_pct"] >= 80 else "#ffb020" if t["pass_rate_pct"] >= 50 else "#ff3b5c"
+
+        detail_html = ""
+        if t.get("last_failed_run"):
+            lfr = t["last_failed_run"]
+            step_html = _render_step_rows_html(lfr.get("step_results", []), project_id, lfr["id"])
+            err = f'<div class="error-box">{_esc(lfr["error_message"])}</div>' if lfr.get("error_message") else ""
+            fix = ""
+            if lfr.get("ai_fix"):
+                fix = f'<div class="fix-box"><div class="fix-label">AI Fix Suggestion</div><div class="fix-text">{_esc(lfr["ai_fix"].get("analysis",""))}</div></div>'
+            detail_html = f'{step_html}{err}{fix}'
+
+        test_sections += f'''
+<div style="background:#0d1117;border:1px solid #1e2430;border-radius:10px;padding:16px 20px;margin-bottom:16px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+<div style="font-size:14px;font-weight:600">{t["name"]} {_badge(t["status"])}</div>
+<div style="display:flex;gap:16px;font-size:11px;color:#6b7280">
+<span>Steps: <strong style="color:#e8eaed">{t["steps_ran"]}/{t["steps_total"]}</strong></span>
+<span>Pass: <strong style="color:{rate_c}">{t["pass_rate_pct"]}%</strong></span>
+<span>Streak: <strong style="color:{"#ff3b5c" if t["fail_streak"]>0 else "#e8eaed"}">{t["fail_streak"]}</strong></span>
+</div>
+</div>
+<div class="history-strip" style="margin-bottom:10px">{strip}</div>
+{detail_html}
+</div>'''
+
+    html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Suite Report — {s["name"]}</title>
+<style>{_REPORT_CSS}</style></head><body>
+<h1>Suite Report — {s["name"]}</h1>
+<div class="subtitle">{s.get("module_name","")} · {days}-day window · Platform: {platform or "All"} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+<div class="stats">
+<div class="stat"><div class="stat-val" style="color:{"#00e5a0" if s["pass_rate"]>=80 else "#ffb020" if s["pass_rate"]>=50 else "#ff3b5c"}">{s["pass_rate"]}%</div><div class="stat-lbl">Pass Rate</div></div>
+<div class="stat"><div class="stat-val">{m["total"]}</div><div class="stat-lbl">Total</div></div>
+<div class="stat"><div class="stat-val" style="color:#00e5a0">{m["passing"]}</div><div class="stat-lbl">Passing</div></div>
+<div class="stat"><div class="stat-val" style="color:#ff3b5c">{m["failing"]}</div><div class="stat-lbl">Failing</div></div>
+<div class="stat"><div class="stat-val" style="color:#ffb020">{m["flaky"]}</div><div class="stat-lbl">Flaky</div></div>
+<div class="stat"><div class="stat-val">{m["avg_steps_pct"]}%</div><div class="stat-lbl">Avg Steps</div></div>
+</div>
+<h2>Test Cases ({m["total"]})</h2>
+{test_sections}
+<div class="footer">QA·OS Suite Report · {s["name"]} · {datetime.utcnow().isoformat()}</div>
+</body></html>'''
+
+    return StreamingResponse(
+        iter([html]), media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="suite_{s["name"].replace(" ","_")}_report.html"'},
+    )
+
+
+@app.get("/api/suites/{suite_id}/export/screenshots")
+def export_suite_screenshots(suite_id: int, days: int = 14, platform: str = ""):
+    import zipfile as zf
+    data = suite_health(suite_id, days, platform)
+    buf = BytesIO()
+    total_size = 0
+    MAX_SIZE = 15 * 1024 * 1024
+    with zf.ZipFile(buf, "w", zf.ZIP_DEFLATED) as z:
+        for t in data["tests"]:
+            lfr = t.get("last_failed_run")
+            if not lfr:
+                continue
+            for sr in lfr.get("step_results") or []:
+                shot = sr.get("screenshot")
+                if not shot:
+                    continue
+                # find the file on disk
+                with SessionLocal() as db:
+                    suite = db.query(TestSuite).filter(TestSuite.id == suite_id).first()
+                    if not suite:
+                        continue
+                    mod = db.query(Module).filter(Module.id == suite.module_id).first()
+                    if not mod:
+                        continue
+                    project_id = mod.project_id
+                art_path = settings.artifacts_dir / str(project_id) / str(lfr["id"]) / shot
+                if art_path.exists():
+                    content = art_path.read_bytes()
+                    total_size += len(content)
+                    if total_size > MAX_SIZE:
+                        break
+                    arcname = f'{data["suite"]["name"]}/{t["name"]}/run_{lfr["id"]}_step_{sr["index"]}.png'
+                    z.writestr(arcname, content)
+            if total_size > MAX_SIZE:
+                break
+    buf.seek(0)
+    sname = data["suite"]["name"].replace(" ", "_")
+    return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{sname}_screenshots.zip"'})
+
+
+def _format_date(iso_str) -> str:
+    """Format an ISO date string for reports, or return '—' for None/empty."""
+    if not iso_str or iso_str == "None":
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %H:%M")
+    except Exception:
+        return str(iso_str)[:16]
+
+
+@app.get("/api/collections/{collection_id}/export/html")
+def export_collection_html(collection_id: int, days: int = 14, platform: str = ""):
+    data = collection_health(collection_id, days, platform)
+    c = data["collection"]
+    m = data["metrics"]
+
+    verdict_map = {"READY": "badge-pass", "BLOCKED": "badge-fail", "AT RISK": "badge-flaky"}
+    verdict_cls = verdict_map.get(c["verdict"], "badge-skip")
+
+    suite_cards = ""
+    for s in data["suites"]:
+        bar_w = s["pass_rate_pct"]
+        bar_c = "#00e5a0" if bar_w >= 80 else "#ffb020" if bar_w >= 50 else "#ff3b5c"
+        last_run = _format_date(s.get("last_run_at"))
+        suite_cards += f'''
+<div style="background:#0d1117;border:1px solid #1e2430;border-radius:10px;padding:16px 20px;margin-bottom:12px">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+<div style="font-size:14px;font-weight:600">{_esc(s["name"])}</div>
+<div style="font-size:11px;color:#6b7280">Last run: {last_run}</div>
+</div>
+<div style="display:flex;gap:20px;align-items:center;margin-bottom:8px">
+<div style="flex:1;height:10px;background:#1e2430;border-radius:5px;overflow:hidden"><div style="height:100%;width:{bar_w}%;background:{bar_c};border-radius:5px"></div></div>
+<div style="font-size:18px;font-weight:700;color:{bar_c};min-width:50px;text-align:right">{s["pass_rate_pct"]}%</div>
+</div>
+<div style="display:flex;gap:20px;font-size:11px;color:#6b7280">
+<span>Pass: <strong style="color:#00e5a0">{s["pass_count"]}</strong></span>
+<span>Fail: <strong style="color:#ff3b5c">{s["fail_count"]}</strong></span>
+<span>Blockers: <strong style="color:#ff6b35">{s["blocker_count"]}</strong></span>
+<span>Total: <strong style="color:#e8eaed">{s["pass_count"] + s["fail_count"]}</strong></span>
+</div>
+</div>'''
+
+    # Build a proper trend chart with axes, gridlines, labels, and data points
+    trend_html = ""
+    pts = data.get("trend_30d") or []
+    if len(pts) >= 2:
+        w, h = 600, 160
+        pad_l, pad_r, pad_t, pad_b = 45, 20, 10, 30
+        cw = w - pad_l - pad_r
+        ch = h - pad_t - pad_b
+        # Y axis gridlines and labels (0%, 25%, 50%, 75%, 100%)
+        grid_lines = ""
+        for pct in [0, 25, 50, 75, 100]:
+            y = pad_t + ch - (pct / 100 * ch)
+            grid_lines += f'<line x1="{pad_l}" y1="{y}" x2="{w - pad_r}" y2="{y}" stroke="#1e2430" stroke-width="1"/>'
+            grid_lines += f'<text x="{pad_l - 6}" y="{y + 3}" text-anchor="end" fill="#6b7280" font-size="9" font-family="system-ui">{pct}%</text>'
+        # Data points and line
+        coords = []
+        dots = ""
+        labels = ""
+        for i, p in enumerate(pts):
+            x = pad_l + (i * cw / max(len(pts) - 1, 1))
+            y = pad_t + ch - (p["pass_rate_pct"] / 100 * ch)
+            coords.append(f"{x},{y}")
+            dot_c = "#00e5a0" if p["pass_rate_pct"] >= 50 else "#ff3b5c"
+            dots += f'<circle cx="{x}" cy="{y}" r="4" fill="{dot_c}" stroke="#080b0f" stroke-width="2"/>'
+            dots += f'<text x="{x}" y="{y - 10}" text-anchor="middle" fill="#e8eaed" font-size="9" font-weight="600" font-family="system-ui">{p["pass_rate_pct"]}%</text>'
+            # X axis labels (show every Nth to avoid crowding)
+            date_str = str(p.get("date", ""))
+            if date_str and (i == 0 or i == len(pts) - 1 or len(pts) <= 7 or i % max(1, len(pts) // 5) == 0):
+                labels += f'<text x="{x}" y="{h - 4}" text-anchor="middle" fill="#6b7280" font-size="8" font-family="system-ui">{date_str[5:]}</text>'
+        poly = " ".join(coords)
+        # Area fill under the line
+        area_pts = f"{coords[0].split(',')[0]},{pad_t + ch} {poly} {coords[-1].split(',')[0]},{pad_t + ch}"
+        trend_html = f'''<h2>30-Day Pass Rate Trend</h2>
+<svg viewBox="0 0 {w} {h}" style="width:100%;max-width:700px;height:{h}px;margin-bottom:16px">
+{grid_lines}
+<polygon points="{area_pts}" fill="rgba(0,229,160,.06)"/>
+<polyline points="{poly}" fill="none" stroke="#00e5a0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+{dots}
+{labels}
+</svg>'''
+    elif len(pts) == 1:
+        trend_html = f'<h2>30-Day Trend</h2><div style="padding:16px;background:#0d1117;border:1px solid #1e2430;border-radius:8px;font-size:12px;color:#6b7280">Only 1 data point — {pts[0]["pass_rate_pct"]}% pass rate. More data points needed to render a trend.</div>'
+
+    html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Collection Report — {_esc(c["name"])}</title>
+<style>{_REPORT_CSS}</style></head><body>
+<h1>{_esc(c["name"])} <span class="badge {verdict_cls}">{c["verdict"]}</span></h1>
+<div class="subtitle">{days}-day window · Platform: {platform or "All"} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+<div class="stats">
+<div class="stat"><div class="stat-val">{m["total"]}</div><div class="stat-lbl">Total</div></div>
+<div class="stat"><div class="stat-val" style="color:#00e5a0">{m["passing"]}</div><div class="stat-lbl">Passing</div></div>
+<div class="stat"><div class="stat-val" style="color:#ff3b5c">{m["failing"]}</div><div class="stat-lbl">Failing</div></div>
+<div class="stat"><div class="stat-val" style="color:#ff6b35">{m["blockers"]}</div><div class="stat-lbl">Blockers</div></div>
+<div class="stat"><div class="stat-val" style="color:#ffb020">{m["flaky"]}</div><div class="stat-lbl">Flaky</div></div>
+<div class="stat"><div class="stat-val">{m["never_run"]}</div><div class="stat-lbl">Never Ran</div></div>
+</div>
+<h2>Suites ({len(data["suites"])})</h2>
+{suite_cards}
+{trend_html}
+<div class="footer">QA·OS Collection Report · {_esc(c["name"])} · {datetime.utcnow().isoformat()}</div>
+</body></html>'''
+
+    return StreamingResponse(
+        iter([html]), media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="collection_{c["name"].replace(" ","_")}_report.html"'},
     )
 
 

@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { DndContext, closestCenter, DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef } from "./api";
+import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef, SuiteHealthResponse, TestHealthRow, SuiteTrendItem, StepCoverageItem, TriageResponse, CollectionHealthResponse, BlockerItem, ScreenEntry, ScreenEntryFull, ScreenFolder } from "./api";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, Legend } from "recharts";
 import { XmlElementTree, simplifyXmlForAI } from "./XmlElementTree";
 
 /* ── Toast ─────────────────────────────────────────── */
@@ -30,6 +31,29 @@ type Page = "dashboard" | "execution" | "library" | "reports" | "builds" | "sett
 function guessModule(n: string) { const p = n.split(/[_\s-]+/); return p.length >= 2 ? p[0][0].toUpperCase() + p[0].slice(1) : "General"; }
 function statusDot(s: string) { return s === "passed" ? "dot-green" : s === "failed" || s === "error" ? "dot-danger" : s === "running" ? "dot-warn" : "dot-gray"; }
 function statusIcon(s: string) { return s === "passed" ? "si-pass" : s === "failed" || s === "error" ? "si-fail" : s === "running" ? "si-run" : "si-skip"; }
+
+/** MediaRecorder: Chrome favors WebM; Safari often supports MP4 — pick first supported for stitched replay video. */
+function pickScreenRecorderMime(): { mime?: string; ext: string } {
+  if (typeof MediaRecorder === "undefined") return { ext: "webm" };
+  const candidates: { mime: string; ext: string }[] = [
+    { mime: "video/webm;codecs=vp9", ext: "webm" },
+    { mime: "video/webm;codecs=vp8", ext: "webm" },
+    { mime: "video/webm", ext: "webm" },
+    { mime: "video/mp4", ext: "mp4" },
+    { mime: "video/mp4; codecs=avc1.42E01E", ext: "mp4" },
+  ];
+  for (const c of candidates) {
+    if (MediaRecorder.isTypeSupported(c.mime)) return c;
+  }
+  return { ext: "webm" };
+}
+
+function replayExtFromRecorderMime(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m.includes("mp4")) return "mp4";
+  if (m.includes("webm")) return "webm";
+  return "webm";
+}
 /** Backend sends naive UTC ISO timestamps; parse as UTC so relative times match server clock. */
 function parseApiDate(iso: string | null | undefined): Date | null {
   if (!iso) return null;
@@ -339,7 +363,7 @@ export function App() {
           )}
           {page === "execution" && <ExecutionView project={project} tests={tests} builds={builds} runs={runs} devices={devices} modules={modules} suites={suites} activeRunId={activeRunId} onRunCreated={id => { setActiveRunId(id); refresh(); }} onRefresh={refresh} />}
           {page === "library" && <LibraryView project={project} tests={tests} runs={runs} modules={modules} suites={suites} onRefresh={refresh} />}
-          {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} onRefresh={refresh} />}
+          {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} modules={modules} suites={suites} onRefresh={refresh} />}
           {page === "builds" && <BuildsView project={project} builds={builds} runs={runs} onRefresh={refresh} />}
           {page === "settings" && <SettingsView />}
         </div>
@@ -909,6 +933,9 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   const [liveXmlName, setLiveXmlName] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsReconnectAttemptRef = useRef(0);
+  const [wsLive, setWsLive] = useState(true);
 
   const bfp = useMemo(() => builds.filter(b => b.platform === platform), [builds, platform]);
   const devList = platform === "android" ? devices.android : devices.ios_simulators;
@@ -926,33 +953,74 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   }, []);
 
   useEffect(() => {
-    if (!activeRunId) { setRun(null); setStepResults([]); setSelShot(null); return; }
+    if (!activeRunId) {
+      setRun(null);
+      setStepResults([]);
+      setSelShot(null);
+      setWsLive(true);
+      return;
+    }
+    setWsLive(true);
     loadRun(activeRunId);
     wsRef.current?.close();
+    if (wsReconnectTimerRef.current) {
+      clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
     let cancelled = false;
-    (async () => {
-      const token = await api.bootstrapAuth();
+    const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+    const connect = () => {
       if (cancelled) return;
-      const url = `ws://${location.host}/ws/runs/${activeRunId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-      ws.onmessage = msg => {
-        const ev = JSON.parse(msg.data);
-        if (ev.type === "step") {
-          const p = ev.payload;
-          setStepResults(prev => { const n = [...prev]; n[p.idx] = { idx: p.idx, status: p.status, details: p.details, screenshot: p.screenshot, pageSource: p.pageSource }; return n; });
-          if (p.screenshot) setSelShot(p.screenshot);
-          if (p.pageSource) {
-            setLiveXmlName(p.pageSource);
-            fetch(`/api/artifacts/${project.id}/${activeRunId}/${p.pageSource}`).then(r => r.ok ? r.text() : "").then(setLiveXml).catch(() => {});
+      wsRef.current?.close();
+      (async () => {
+        const token = await api.bootstrapAuth();
+        if (cancelled) return;
+        const url = `${wsProto}//${location.host}/ws/runs/${activeRunId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+        const ws = new WebSocket(url);
+        wsRef.current = ws;
+        ws.onopen = () => {
+          if (!cancelled) {
+            setWsLive(true);
+            wsReconnectAttemptRef.current = 0;
           }
-        }
-        if (ev.type === "finished") { loadRun(activeRunId); onRefresh(); }
-      };
-      pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
-    })();
-    return () => { cancelled = true; wsRef.current?.close(); wsRef.current = null; if (pollRef.current) clearInterval(pollRef.current); };
-  }, [activeRunId, loadRun, onRefresh]);
+        };
+        ws.onmessage = msg => {
+          const ev = JSON.parse(msg.data);
+          if (ev.type === "step") {
+            const p = ev.payload;
+            setStepResults(prev => { const n = [...prev]; n[p.idx] = { idx: p.idx, status: p.status, details: p.details, screenshot: p.screenshot, pageSource: p.pageSource }; return n; });
+            if (p.screenshot) setSelShot(p.screenshot);
+            if (p.pageSource) {
+              setLiveXmlName(p.pageSource);
+              fetch(`/api/artifacts/${project.id}/${activeRunId}/${p.pageSource}`).then(r => r.ok ? r.text() : "").then(setLiveXml).catch(() => {});
+            }
+          }
+          if (ev.type === "finished") { loadRun(activeRunId); onRefresh(); }
+        };
+        ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+        ws.onclose = () => {
+          if (cancelled) return;
+          setWsLive(false);
+          const attempt = wsReconnectAttemptRef.current++;
+          const delay = Math.min(1000 * Math.pow(2, attempt), 15000);
+          wsReconnectTimerRef.current = setTimeout(connect, delay);
+        };
+      })();
+    };
+    connect();
+    pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
+    return () => {
+      cancelled = true;
+      if (wsReconnectTimerRef.current) {
+        clearTimeout(wsReconnectTimerRef.current);
+        wsReconnectTimerRef.current = null;
+      }
+      wsReconnectAttemptRef.current = 0;
+      wsRef.current?.close();
+      wsRef.current = null;
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [activeRunId, loadRun, onRefresh, project.id]);
 
   const waitForRunComplete = async (runId: number): Promise<Run> => {
     for (let i = 0; i < 300; i++) {
@@ -1480,7 +1548,7 @@ ${meta.main_activity ? `<div class="label">Activity</div><div class="val" style=
 
 ${run.error_message ? `<h2>Error Message</h2><div class="card" style="border-color:rgba(255,59,92,.3);color:#ff3b5c;font-family:monospace;font-size:12px;white-space:pre-wrap">${run.error_message}</div>` : ""}
 
-${(targetTestApply?.fix_history?.length ?? 0) > 0 ? `<h2>Previously Tried Fixes (${targetTestApply!.fix_history!.length})</h2><div class="card">${(targetTestApply!.fix_history as any[]).map((h: any, i: number) => "<div style=\"margin-bottom:12px;padding:12px;border:1px solid #2a2f38;border-radius:6px;background:rgba(255,59,92,.04)\"><div style=\"font-size:10px;color:#8a8f98;margin-bottom:4px\">Attempt " + (i + 1) + (h.run_id ? " · Run #" + h.run_id : "") + (h.created_at ? " · " + h.created_at : "") + "</div><div style=\"font-size:12px;color:#e8eaed;margin-bottom:6px\">" + (h.analysis || "").slice(0, 300) + ((h.analysis || "").length > 300 ? "…" : "") + "</div>" + ((h.changes || []).length > 0 ? "<div style=\"font-size:10px;color:#8a8f98\">" + h.changes.length + " change(s)</div>" : "") + "</div>").join("")}</div>` : ""}
+${(targetTestApply?.fix_history?.length ?? 0) > 0 ? `<h2>Previously Tried Fixes (${targetTestApply!.fix_history!.length})</h2><div class="card">${(targetTestApply!.fix_history as any[]).map((h: any, i: number) => "<div style=\"margin-bottom:12px;padding:12px;border:1px solid #2a2f38;border-radius:6px;background:rgba(255,59,92,.04)\"><div style=\"font-size:10px;color:#8a8f98;margin-bottom:4px\">Attempt " + (i + 1) + (h.run_id ? " · Run #" + h.run_id : "") + (h.created_at ? " · " + h.created_at : "") + "</div><div style=\"font-size:12px;color:#e8eaed;margin-bottom:6px\">" + (h.analysis || "") + "</div>" + ((h.changes || []).length > 0 ? "<div style=\"font-size:10px;color:#8a8f98\">" + h.changes.length + " change(s)</div>" : "") + "</div>").join("")}</div>` : ""}
 
 <h2>AI Root Cause Analysis (Current Fix)</h2>
 <div class="analysis">${fixResult.analysis}</div>
@@ -1505,13 +1573,39 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
   };
 
   const downloadVideo = async () => {
-    if (!run || screenshots.length === 0) { toast("No screenshots to generate video", "error"); return; }
+    if (!run) { toast("No run", "error"); return; }
+    const arts = run.artifacts as Record<string, unknown> | undefined;
+    const vid = arts?.video;
+    if (typeof vid === "string" && vid.length > 0) {
+      toast("Downloading device recording…", "info");
+      try {
+        const res = await fetch(`/api/artifacts/${project.id}/${run.id}/${encodeURIComponent(vid)}`);
+        if (!res.ok) { toast("Video file not found on server", "error"); return; }
+        const raw = await res.blob();
+        const ct = res.headers.get("content-type")?.split(";")[0]?.trim();
+        const blob = ct && ct.startsWith("video/") ? new Blob([raw], { type: ct }) : raw;
+        const vl = vid.toLowerCase();
+        const ext = vl.endsWith(".mov") ? "mov" : vl.endsWith(".webm") ? "webm" : vl.endsWith(".mp4") ? "mp4" : "mp4";
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `run_${run.id}_recording.${ext}`;
+        a.click();
+        toast("Video downloaded", "success");
+      } catch (e: any) {
+        toast(e?.message || "Download failed", "error");
+      }
+      return;
+    }
+    if (screenshots.length === 0) { toast("No screenshots to generate video", "error"); return; }
     toast("Generating video from screenshots...", "info");
     const canvas = document.createElement("canvas");
     canvas.width = 540; canvas.height = 960;
     const ctx = canvas.getContext("2d")!;
     const stream = canvas.captureStream(30);
-    const recorder = new MediaRecorder(stream, { mimeType: "video/webm" });
+    const picked = pickScreenRecorderMime();
+    const recorder = picked.mime
+      ? new MediaRecorder(stream, { mimeType: picked.mime })
+      : new MediaRecorder(stream);
     const chunks: Blob[] = [];
     recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
     recorder.start();
@@ -1539,9 +1633,11 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
     }
     recorder.stop();
     await new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
-    const blob = new Blob(chunks, { type: "video/webm" });
+    const outMime = recorder.mimeType || (picked.mime ?? "video/webm");
+    const ext = replayExtFromRecorderMime(outMime);
+    const blob = new Blob(chunks, { type: outMime });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `run_${run.id}_replay.webm`; a.click();
+    a.download = `run_${run.id}_replay.${ext}`; a.click();
     toast("Video downloaded", "success");
   };
 
@@ -1554,14 +1650,19 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
         </div>
         <div style={{ display: "flex", gap: 10 }}>
           {agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "#a78bfa", borderColor: "rgba(167,139,250,.4)" }} onClick={pauseAgent}>⏸ Pause Agent</button>}
-          {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }}>⏸ Pause</button>}
           {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }} onClick={async () => { try { await api.cancelRun(run!.id); toast("Stop requested", "info"); } catch (e: any) { toast(e.message, "error"); } }}>⏹ Stop</button>}
           {run && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={() => api.exportKatalon(run.id)}>⬇ Katalon</button>}
-          {run && screenshots.length > 0 && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={downloadVideo}>🎬 Video</button>}
+          {run && (screenshots.length > 0 || !!(run.artifacts as Record<string, unknown> | undefined)?.video) && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={downloadVideo}>🎬 Video</button>}
           {isFailed && <button className="btn-primary" style={{ fontSize: 11, padding: "7px 14px", background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiFixRun} disabled={fixBusy}>{fixBusy ? "⏳ AI Analyzing..." : "🤖 AI Fix"}</button>}
           {run && ["passed", "failed", "error"].includes(run.status) && <button className="run-now-btn" onClick={rerun} disabled={busy}>▶ Rerun</button>}
         </div>
       </div>
+
+      {activeRunId && !wsLive && (
+        <div style={{ padding: "10px 14px", marginBottom: 14, background: "rgba(255,107,53,.1)", border: "1px solid rgba(255,107,53,.35)", borderRadius: 8, fontSize: 12, color: "#ffb020" }}>
+          Live feed offline — reconnecting… Step-level events may be delayed; run status still updates via polling.
+        </div>
+      )}
 
       {/* Agent Progress Panel — when no run yet (before execution opens) */}
       {(agentRunning || agentProgressLog.length > 0) && !run && (
@@ -1857,7 +1958,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                           </div>
                         ) : null;
                       })()}
-                      <div style={{ flex: 1, padding: 12, background: "rgba(99,102,241,.08)", borderRadius: 6, fontSize: 12, lineHeight: 1.7, color: "var(--text)" }}>
+                      <div style={{ flex: 1, minWidth: 0, padding: 12, background: "rgba(99,102,241,.08)", borderRadius: 6, fontSize: 12, lineHeight: 1.7, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word", overflowWrap: "anywhere" }}>
                         <div style={{ fontWeight: 600, marginBottom: 4, color: "#a78bfa", fontFamily: "var(--sans)" }}>Root Cause</div>
                         {fixResult.analysis}
                       </div>
@@ -2027,7 +2128,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
 const STEP_TYPES = ["tap", "type", "wait", "waitForVisible", "assertText", "assertVisible", "takeScreenshot", "swipe", "keyboardAction", "hideKeyboard"];
 const NO_SELECTOR_TYPES = new Set(["wait", "hideKeyboard", "takeScreenshot"]);
 
-function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void }) {
+function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[] }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: `step-${i}` });
   const st = stepStatuses?.[i];
   const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 };
@@ -2047,7 +2148,18 @@ function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStep
           <select value={s.selector?.using || "accessibilityId"} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; })} style={{ width: 110 }}>
             {["accessibilityId", "id", "xpath", "className"].map(u => <option key={u}>{u}</option>)}
           </select>
-          <input value={s.selector?.value || ""} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, value: e.target.value } }; })} placeholder="selector value" style={{ flex: 1 }} />
+          <input
+            value={s.selector?.value || ""}
+            onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, value: e.target.value } }; })}
+            placeholder="selector value"
+            style={{ flex: 1 }}
+            list={figmaNames && figmaNames.length > 0 ? `figma-datalist-${i}` : undefined}
+          />
+          {figmaNames && figmaNames.length > 0 && (
+            <datalist id={`figma-datalist-${i}`}>
+              {figmaNames.map(n => <option key={n} value={n} />)}
+            </datalist>
+          )}
           {onPickStep && (
             <button className="btn-ghost btn-sm" style={{ fontSize: 9, padding: "2px 6px", borderColor: isPicking ? "var(--accent)" : undefined }} onClick={() => onPickStep(i)} title="Pick selector from XML tree">
               {isPicking ? "⏳ Pick…" : "📋 Pick"}
@@ -2073,7 +2185,7 @@ function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStep
   );
 }
 
-function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void }) {
+function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[] }) {
   const ids = useMemo(() => steps.map((_, i) => `step-${i}`), [steps.length]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   const handleDragEnd = useCallback((event: DragEndEvent) => {
@@ -2086,7 +2198,7 @@ function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onP
     <div className="step-builder">
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-          {steps.map((s, i) => <SortableStepRow key={ids[i]} s={s} i={i} steps={steps} setSteps={setSteps} stepStatuses={stepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={onPickStep} />)}
+          {steps.map((s, i) => <SortableStepRow key={ids[i]} s={s} i={i} steps={steps} setSteps={setSteps} stepStatuses={stepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={onPickStep} figmaNames={figmaNames} />)}
         </SortableContext>
       </DndContext>
       <button className="btn-ghost btn-sm" style={{ marginTop: 6 }} onClick={() => setSteps([...steps, { type: "tap", selector: { using: "accessibilityId", value: "" } }])}>+ Add Step</button>
@@ -2099,6 +2211,43 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   /** Upload % when set, or null = indeterminate (AI / server processing). */
   const [taskProgress, setTaskProgress] = useState<{ label: string; pct: number | null } | null>(null);
   const [platform, setPlatform] = useState<"android" | "ios_sim">("android");
+  const [libTab, setLibTab] = useState<"tests" | "screens">("tests");
+
+  // Screen Library state
+  const [screens, setScreens] = useState<ScreenEntry[]>([]);
+  const [screenDetail, setScreenDetail] = useState<ScreenEntryFull | null>(null);
+  const [showCapture, setShowCapture] = useState(false);
+  const [captureName, setCaptureName] = useState("");
+  const [captureNotes, setCaptureNotes] = useState("");
+  const [captureStatus, setCaptureStatus] = useState("");
+  const [screenBuildFilter, setScreenBuildFilter] = useState<number | null>(null);
+  const [screenPlatformFilter, setScreenPlatformFilter] = useState<string>("");
+  const [editingScreenId, setEditingScreenId] = useState<number | null>(null);
+  const [editScreenName, setEditScreenName] = useState("");
+  const [editScreenNotes, setEditScreenNotes] = useState("");
+  const [builds, setBuilds] = useState<Build[]>([]);
+  const [screenFolders, setScreenFolders] = useState<ScreenFolder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [showNewFolder, setShowNewFolder] = useState(false);
+
+  const loadScreenFolders = useCallback(async () => {
+    try { setScreenFolders(await api.listScreenFolders(project.id)); } catch {}
+  }, [project.id]);
+
+  const loadScreens = useCallback(async () => {
+    try {
+      const s = await api.listScreens(project.id, { buildId: screenBuildFilter, folderId: activeFolderId, platform: screenPlatformFilter });
+      setScreens(s);
+    } catch {}
+  }, [project.id, screenBuildFilter, activeFolderId, screenPlatformFilter]);
+
+  const loadBuilds = useCallback(async () => {
+    try { setBuilds(await api.listBuilds(project.id)); } catch {}
+  }, [project.id]);
+
+  useEffect(() => { loadScreenFolders(); }, [loadScreenFolders]);
+  useEffect(() => { if (libTab === "screens") { loadScreens(); loadBuilds(); } }, [libTab, loadScreens, loadBuilds]);
 
   // Create test state
   const [showCreate, setShowCreate] = useState(false);
@@ -2141,6 +2290,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const [genSuitePrompt, setGenSuitePrompt] = useState("");
   const [genSuiteTargetId, setGenSuiteTargetId] = useState<number | null>(null);
   const [genSuiteStatus, setGenSuiteStatus] = useState("");
+  const [genSuiteFolderId, setGenSuiteFolderId] = useState<number | null>(null);
 
   // Import script / sheet (preview → confirm)
   const [showImport, setShowImport] = useState(false);
@@ -2169,6 +2319,17 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   // Filters for test table: null = all suites, [] = none, [id,...] = these suites
   const [filterCollectionId, setFilterCollectionId] = useState<number | null>(null);
   const [filterSuiteIds, setFilterSuiteIds] = useState<number[] | null>(null);
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [debouncedLibrarySearch, setDebouncedLibrarySearch] = useState("");
+  const [figmaNames, setFigmaNames] = useState<string[]>([]);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedLibrarySearch(librarySearch), 200);
+    return () => clearTimeout(t);
+  }, [librarySearch]);
+  useEffect(() => {
+    if (libTab !== "tests") return;
+    api.listFigmaComponents().then(r => setFigmaNames(r.names || [])).catch(() => setFigmaNames([]));
+  }, [libTab]);
 
   // Related tests when editing (for suggestion banner)
   const [editRelated, setEditRelated] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
@@ -2179,20 +2340,27 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const [newXml, setNewXml] = useState<string | null>(null);
   const [newSelectorPickStepIndex, setNewSelectorPickStepIndex] = useState<number | null>(null);
 
+  // Screen context for generation
+  const [genFolderId, setGenFolderId] = useState<number | null>(null);
+
   const aiGenerate = async () => {
     if (!aiPrompt.trim()) { toast("Describe the test", "error"); return; }
     setBusy(true);
-    setTaskProgress({ label: "Capturing page source (Appium)…", pct: null });
+    setTaskProgress({ label: genFolderId ? "Generating with Screen Library context (XML + screenshots)…" : "Capturing page source (Appium)…", pct: null });
     setAiStatus("Generating...");
     let xml = "";
     try {
-      try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      if (!genFolderId) {
+        try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      }
       setTaskProgress({ label: "AI is generating steps — usually 15–45s…", pct: null });
-      const res = await api.generateSteps(platform === "ios_sim" ? "ios_sim" : "android", aiPrompt, xml);
+      const opts = genFolderId ? { folder_id: genFolderId, project_id: project.id, build_id: screenBuildFilter } : undefined;
+      const res = await api.generateSteps(platform === "ios_sim" ? "ios_sim" : "android", aiPrompt, xml, opts);
       setNewSteps(res.steps);
       setNewAcceptanceCriteria(prev => prev || aiPrompt);
-      setAiStatus(`Generated ${res.steps.length} steps`);
-      toast(`AI generated ${res.steps.length} steps`, "success");
+      const grounded = res.grounded && (res.screens_used || 0) > 0;
+      setAiStatus(`Generated ${res.steps.length} steps${grounded ? ` (grounded on ${res.screens_used} screen${(res.screens_used || 0) > 1 ? "s" : ""})` : ""}`);
+      toast(`AI generated ${res.steps.length} steps${grounded ? " with real selectors + screenshots" : ""}`, "success");
     } catch (e: any) {
       setAiStatus("");
       toast(e.message, "error");
@@ -2311,14 +2479,16 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
     if (!genSuitePrompt.trim()) { toast("Describe the feature to test", "error"); return; }
     if (!genSuiteTargetId) { toast("Select a Test Suite", "error"); return; }
     setBusy(true);
-    setTaskProgress({ label: "Capturing page source (Appium)…", pct: null });
-    setGenSuiteStatus("Capturing page source...");
+    setTaskProgress({ label: genSuiteFolderId ? "Generating with Screen Library context (XML + screenshots)…" : "Capturing page source (Appium)…", pct: null });
+    setGenSuiteStatus(genSuiteFolderId ? "Generating with screen context..." : "Capturing page source...");
     let xml = "";
     try {
-      try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      if (!genSuiteFolderId) {
+        try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      }
       setTaskProgress({ label: "AI is generating multiple test cases — may take a minute…", pct: null });
       setGenSuiteStatus("AI generating test cases...");
-      const res = await api.generateSuite(platform, genSuitePrompt, project.id, genSuiteTargetId, xml);
+      const res = await api.generateSuite(platform, genSuitePrompt, project.id, genSuiteTargetId, xml, genSuiteFolderId);
       setGenSuiteStatus(`Created ${res.created} test cases`);
       toast(`Generated ${res.created} test cases`, "success");
       setGenSuitePrompt("");
@@ -2377,25 +2547,41 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
     if (filterSuiteIds === null) return true;
     if (filterSuiteIds.length === 0) return false;
     return (t.suite_id != null) && filterSuiteIds.includes(t.suite_id);
+  }).filter(t => {
+    const q = debouncedLibrarySearch.trim().toLowerCase();
+    if (!q) return true;
+    if (t.name.toLowerCase().includes(q)) return true;
+    if ((t.acceptance_criteria || "").toLowerCase().includes(q)) return true;
+    const stepBlob = JSON.stringify([...stepsForPlatform(t, "android"), ...stepsForPlatform(t, "ios_sim")]).toLowerCase();
+    return stepBlob.includes(q);
   });
 
   return (
     <>
       <div className="section-head">
-        <div><div className="section-title">Test Library</div><div className="section-sub">{tests.length} test cases · {modules.length} collections · {suites.length} suites</div></div>
+        <div><div className="section-title">Test Library</div><div className="section-sub">{tests.length} test cases · {modules.length} collections · {suites.length} suites · {screens.length} screens</div></div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn-ghost btn-sm" onClick={() => {
-            const opening = !showImport;
-            setShowImport(opening);
-            if (opening) setImportTab("single");
-            setImportPreview(null);
-            setBulkImportResult(null);
-            setBulkFlatCases([]);
-            setImportGroovyIdx(0);
-          }}>{showImport ? "Close" : "⬆ Import"}</button>
-          <button className="btn-ghost btn-sm" onClick={() => setShowGenerateSuite(!showGenerateSuite)}>{showGenerateSuite ? "Close" : "✨ Generate Suite"}</button>
-          <button className="btn-ghost btn-sm" onClick={() => setShowCreate(!showCreate)}>{showCreate ? "Close" : "+ New Test"}</button>
+          {libTab === "tests" && <>
+            <button className="btn-ghost btn-sm" onClick={() => {
+              const opening = !showImport;
+              setShowImport(opening);
+              if (opening) setImportTab("single");
+              setImportPreview(null);
+              setBulkImportResult(null);
+              setBulkFlatCases([]);
+              setImportGroovyIdx(0);
+            }}>{showImport ? "Close" : "⬆ Import"}</button>
+            <button className="btn-ghost btn-sm" onClick={() => setShowGenerateSuite(!showGenerateSuite)}>{showGenerateSuite ? "Close" : "✨ Generate Suite"}</button>
+            <button className="btn-ghost btn-sm" onClick={() => setShowCreate(!showCreate)}>{showCreate ? "Close" : "+ New Test"}</button>
+          </>}
+          {libTab === "screens" && <button className="btn-ghost btn-sm" onClick={() => setShowCapture(!showCapture)}>{showCapture ? "Close" : "📸 Capture Screen"}</button>}
         </div>
+      </div>
+
+      {/* Tab switcher */}
+      <div className="report-tabs" style={{ marginBottom: 12 }}>
+        <button className={`report-tab ${libTab === "tests" ? "active" : ""}`} onClick={() => setLibTab("tests")}>Tests</button>
+        <button className={`report-tab ${libTab === "screens" ? "active" : ""}`} onClick={() => setLibTab("screens")}>Screens</button>
       </div>
 
       {taskProgress && (
@@ -2413,6 +2599,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
         </div>
       )}
 
+      {libTab === "tests" && <>
       {/* Import Katalon / Gherkin / Python / sheet / ZIP / folder */}
       {showImport && (
         <div className="panel" style={{ padding: 18, marginBottom: 16, border: "1px solid rgba(0,229,160,.25)" }}>
@@ -2740,7 +2927,12 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
               <option value="">Select Test Suite</option>
               {modules.map(m => suites.filter(s => s.module_id === m.id).map(s => <option key={s.id} value={s.id}>{m.name} / {s.name}</option>))}
             </select>
+            <select value={genSuiteFolderId ?? ""} onChange={e => setGenSuiteFolderId(e.target.value ? Number(e.target.value) : null)} style={{ fontSize: 11, minWidth: 180 }}>
+              <option value="">No screen folder</option>
+              {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name} ({f.screen_count} screens)</option>)}
+            </select>
           </div>
+          {genSuiteFolderId && <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8 }}>AI will use real selectors + screenshots from the selected folder.</div>}
           <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder="Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..." rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
           {genSuiteStatus && <div style={{ fontSize: 11, color: "var(--accent2)", marginBottom: 8 }}>{genSuiteStatus}</div>}
           <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || !genSuitePrompt.trim() || !genSuiteTargetId}>{busy ? "Generating..." : "✨ Generate Test Suite"}</button>
@@ -2778,6 +2970,15 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             <button className="btn-primary btn-sm" onClick={aiGenerate} disabled={busy}>AI Generate</button>
             <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setNewXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium">📄 Capture XML</button>
           </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
+              <select value={genFolderId ?? ""} onChange={e => setGenFolderId(e.target.value ? Number(e.target.value) : null)} style={{ fontSize: 11, minWidth: 180 }}>
+                <option value="">No screen folder</option>
+                {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name} ({f.screen_count} screens)</option>)}
+              </select>
+              {genFolderId
+                ? <span style={{ fontSize: 10, color: "var(--accent)" }}>AI will use real selectors + screenshots from this folder.</span>
+                : <span style={{ fontSize: 10, color: "var(--muted)" }}>Select a screen folder for better accuracy.</span>}
+            </div>
             {aiStatus && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>{aiStatus}</div>}
             <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>While AI Generate runs, a progress bar appears under the Test Library title above.</div>
           <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Test name" className="form-input" style={{ width: "100%", marginBottom: 10 }} />
@@ -2786,7 +2987,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             <textarea value={newAcceptanceCriteria} onChange={e => setNewAcceptanceCriteria(e.target.value)} placeholder="What this test must validate. e.g. Login: Email+Password must appear; fail if password field absent" rows={2} className="form-input" style={{ width: "100%", fontSize: 11 }} />
           </div>
           {newSelectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {newSelectorPickStepIndex + 1} selector</div>}
-          <StepBuilder steps={newSteps} setSteps={setNewSteps} selectorPickStepIndex={newSelectorPickStepIndex} onPickStep={(i) => setNewSelectorPickStepIndex(prev => prev === i ? null : i)} />
+          <StepBuilder steps={newSteps} setSteps={setNewSteps} selectorPickStepIndex={newSelectorPickStepIndex} onPickStep={(i) => setNewSelectorPickStepIndex(prev => prev === i ? null : i)} figmaNames={figmaNames} />
           {newXml && (
             <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
@@ -2846,7 +3047,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
           </div>
           {aiEditStatus && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>{aiEditStatus}</div>}
           {selectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {selectorPickStepIndex + 1} selector</div>}
-          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={(i) => setSelectorPickStepIndex(prev => prev === i ? null : i)} />
+          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={(i) => setSelectorPickStepIndex(prev => prev === i ? null : i)} figmaNames={figmaNames} />
           {editXml && (
             <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
@@ -2872,6 +3073,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
       {/* Filter bar — above test cases */}
       <div className="panel" style={{ padding: 12, marginBottom: 12, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
         <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>Filter</div>
+        <input className="form-input" style={{ fontSize: 11, minWidth: 160, maxWidth: 260, padding: "6px 10px" }} placeholder="Search tests…" value={librarySearch} onChange={e => setLibrarySearch(e.target.value)} />
         <select value={filterCollectionId ?? ""} onChange={e => { const v = e.target.value ? Number(e.target.value) : null; setFilterCollectionId(v); setFilterSuiteIds(null); }} style={{ fontSize: 11, minWidth: 180 }}>
           <option value="">All collections</option>
           {modules.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
@@ -2898,8 +3100,8 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             </div>
           </>
         )}
-        {(filterCollectionId || filterSuiteIds !== null) && (
-          <button className="btn-ghost btn-sm" style={{ fontSize: 10, marginLeft: "auto" }} onClick={() => { setFilterCollectionId(null); setFilterSuiteIds(null); }}>Clear</button>
+        {(filterCollectionId || filterSuiteIds !== null || librarySearch.trim()) && (
+          <button className="btn-ghost btn-sm" style={{ fontSize: 10, marginLeft: "auto" }} onClick={() => { setFilterCollectionId(null); setFilterSuiteIds(null); setLibrarySearch(""); }}>Clear</button>
         )}
         <div style={{ fontSize: 11, color: "var(--accent2)", marginLeft: "auto" }}>{filteredTests.length} of {tests.length} test cases</div>
       </div>
@@ -2932,247 +3134,688 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
           </tbody>
         </table>
       </div>
+      </>}
+
+      {/* ── Screen Library tab ── */}
+      {libTab === "screens" && <>
+        <div style={{ display: "grid", gridTemplateColumns: "200px 1fr", gap: 16 }}>
+          {/* Folder sidebar */}
+          <div className="panel" style={{ padding: 12, alignSelf: "start" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".5px", marginBottom: 8 }}>Folders</div>
+            <button className={`btn-ghost btn-sm ${activeFolderId === null ? "active" : ""}`} style={{ width: "100%", textAlign: "left", fontSize: 11, marginBottom: 2 }} onClick={() => setActiveFolderId(null)}>
+              All screens
+            </button>
+            {screenFolders.map(f => (
+              <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
+                <button className={`btn-ghost btn-sm ${activeFolderId === f.id ? "active" : ""}`} style={{ flex: 1, textAlign: "left", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} onClick={() => setActiveFolderId(f.id)}>
+                  {f.name} <span style={{ color: "var(--muted)", fontSize: 10 }}>({f.screen_count})</span>
+                </button>
+                <button className="btn-ghost btn-sm" style={{ fontSize: 9, color: "var(--danger)", padding: "2px 4px", flexShrink: 0 }} onClick={async () => { if (confirm(`Delete folder "${f.name}" and unlink its screens?`)) { await api.deleteScreenFolder(f.id); loadScreenFolders(); if (activeFolderId === f.id) setActiveFolderId(null); loadScreens(); } }}>×</button>
+              </div>
+            ))}
+            {showNewFolder ? (
+              <div style={{ marginTop: 8, display: "flex", gap: 4 }}>
+                <input type="text" value={newFolderName} onChange={e => setNewFolderName(e.target.value)} placeholder="Folder name" autoFocus style={{ flex: 1, fontSize: 11, padding: "4px 6px" }} onKeyDown={async e => {
+                  if (e.key === "Enter" && newFolderName.trim()) {
+                    await api.createScreenFolder({ project_id: project.id, name: newFolderName.trim() });
+                    setNewFolderName(""); setShowNewFolder(false); loadScreenFolders();
+                  }
+                  if (e.key === "Escape") { setShowNewFolder(false); setNewFolderName(""); }
+                }} />
+                <button className="btn-primary btn-sm" style={{ fontSize: 10 }} disabled={!newFolderName.trim()} onClick={async () => {
+                  await api.createScreenFolder({ project_id: project.id, name: newFolderName.trim() });
+                  setNewFolderName(""); setShowNewFolder(false); loadScreenFolders();
+                }}>Add</button>
+              </div>
+            ) : (
+              <button className="btn-ghost btn-sm" style={{ width: "100%", textAlign: "left", fontSize: 10, color: "var(--accent)", marginTop: 6 }} onClick={() => setShowNewFolder(true)}>+ New folder</button>
+            )}
+          </div>
+
+          {/* Main content */}
+          <div>
+            {/* Capture panel */}
+            {showCapture && (() => {
+              const selectedBuild = builds.find(b => b.id === screenBuildFilter) || builds[0] || null;
+              const capturePlatform = selectedBuild?.platform || platform;
+              return (
+              <div className="panel" style={{ padding: 16, marginBottom: 12, border: "1px solid rgba(139,92,246,.25)" }}>
+                <div style={{ fontFamily: "var(--sans)", fontWeight: 600, marginBottom: 4, fontSize: 13 }}>Capture Screen</div>
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>
+                  First capture installs the app. After that, navigate on the emulator and capture any screen.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
+                  <div style={{ minWidth: 130 }}>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Folder</label>
+                    <select value={activeFolderId ?? ""} onChange={e => setActiveFolderId(e.target.value ? Number(e.target.value) : null)} style={{ fontSize: 11, width: "100%" }}>
+                      <option value="" disabled>Select folder</option>
+                      {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 140 }}>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Screen name</label>
+                    <input type="text" value={captureName} onChange={e => setCaptureName(e.target.value)} placeholder='e.g. "Login screen"' style={{ width: "100%", fontSize: 11, padding: "6px 8px" }} />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Build</label>
+                    <select value={screenBuildFilter ?? ""} onChange={e => {
+                      const val = e.target.value ? Number(e.target.value) : null;
+                      setScreenBuildFilter(val);
+                      const b = builds.find(x => x.id === val);
+                      if (b) setPlatform(b.platform as any);
+                    }} style={{ fontSize: 11 }}>
+                      <option value="">Latest</option>
+                      {builds.map(b => <option key={b.id} value={b.id}>{b.file_name} ({b.platform})</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Platform</label>
+                    <span className={`screen-badge screen-badge--${capturePlatform === "ios_sim" ? "ios" : "android"}`} style={{ padding: "5px 10px", fontSize: 10 }}>
+                      {capturePlatform === "ios_sim" ? "iOS" : "Android"}
+                    </span>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 120 }}>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Notes</label>
+                    <input type="text" value={captureNotes} onChange={e => setCaptureNotes(e.target.value)} placeholder="Optional" style={{ width: "100%", fontSize: 11, padding: "6px 8px" }} />
+                  </div>
+                  <button className="btn-primary btn-sm" disabled={busy || !captureName.trim() || !activeFolderId} onClick={async () => {
+                    setBusy(true);
+                    setCaptureStatus("Capturing screen — first time may install the app (~20s), otherwise a few seconds...");
+                    try {
+                      const entry = await api.captureScreen({ project_id: project.id, build_id: screenBuildFilter, folder_id: activeFolderId!, name: captureName.trim(), platform: capturePlatform, notes: captureNotes });
+                      setCaptureStatus(`Captured "${entry.name}" — ${entry.xml_length.toLocaleString()} chars of XML`);
+                      setCaptureName("");
+                      setCaptureNotes("");
+                      loadScreens(); loadScreenFolders();
+                    } catch (e: any) {
+                      setCaptureStatus(`Error: ${e?.message || e}`);
+                    } finally { setBusy(false); }
+                  }}>Capture</button>
+                </div>
+                {!activeFolderId && <div style={{ marginTop: 8, fontSize: 10, color: "var(--warn)" }}>Select or create a folder first.</div>}
+                {captureStatus && (
+                  <div style={{ marginTop: 8, fontSize: 11, padding: "6px 10px", background: captureStatus.startsWith("Error") ? "rgba(255,59,92,.06)" : "rgba(0,229,160,.06)", borderRadius: 6, color: captureStatus.startsWith("Error") ? "var(--danger)" : captureStatus.startsWith("Capturing") ? "var(--warn)" : "var(--accent)" }}>
+                    {captureStatus}
+                  </div>
+                )}
+              </div>
+              );
+            })()}
+
+            {/* Toolbar */}
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+              <button className={`btn-sm ${showCapture ? "btn-ghost" : "btn-primary"}`} style={{ fontSize: 11 }} onClick={() => setShowCapture(!showCapture)}>{showCapture ? "Hide Capture" : "Capture Screen"}</button>
+              <div className="seg-btn" style={{ marginLeft: 8 }}>
+                {(["", "android", "ios_sim"] as const).map(p => (
+                  <button key={p} className={screenPlatformFilter === p ? "active" : ""} onClick={() => setScreenPlatformFilter(p)}>{p === "" ? "All" : p === "android" ? "Android" : "iOS"}</button>
+                ))}
+              </div>
+              <div style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>
+                {activeFolderId ? screenFolders.find(f => f.id === activeFolderId)?.name ?? "" : "All"} — {screens.length} screen{screens.length !== 1 ? "s" : ""}
+              </div>
+            </div>
+
+            {screens.length === 0 && (
+              <div className="panel" style={{ padding: 32, textAlign: "center" }}>
+                <div style={{ fontSize: 14, fontWeight: 600, fontFamily: "var(--sans)", marginBottom: 8 }}>{activeFolderId ? "No screens in this folder" : "No screens yet"}</div>
+                <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 16 }}>{activeFolderId ? "Click Capture Screen above to add screens to this folder." : "Create a folder in the sidebar, select it, then capture screens."}</div>
+                {!showCapture && <button className="btn-primary btn-sm" onClick={() => setShowCapture(true)}>Capture Screen</button>}
+              </div>
+            )}
+
+            {/* Screen grid */}
+            {screens.length > 0 && (
+              <div className="screen-grid">
+                {screens.map(s => (
+                  <div key={s.id} className={`screen-card ${s.stale ? "screen-card--stale" : ""}`} onClick={() => {
+                    if (editingScreenId === s.id) return;
+                    api.getScreen(s.id).then(setScreenDetail).catch(() => {});
+                  }}>
+                    <div className="screen-card-img">
+                      {s.screenshot_path ? <img src={api.screenScreenshotUrl(s.id)} alt={s.name} /> : <div className="screen-card-placeholder">No screenshot</div>}
+                    </div>
+                    <div className="screen-card-body">
+                      {editingScreenId === s.id ? (
+                        <div onClick={e => e.stopPropagation()}>
+                          <input type="text" value={editScreenName} onChange={e => setEditScreenName(e.target.value)} style={{ width: "100%", fontSize: 11, marginBottom: 4, padding: "4px 6px" }} />
+                          <input type="text" value={editScreenNotes} onChange={e => setEditScreenNotes(e.target.value)} placeholder="Notes..." style={{ width: "100%", fontSize: 10, padding: "4px 6px" }} />
+                          <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                            <button className="btn-primary btn-sm" style={{ fontSize: 10 }} onClick={async () => {
+                              await api.updateScreen(s.id, { name: editScreenName, notes: editScreenNotes });
+                              setEditingScreenId(null); loadScreens();
+                            }}>Save</button>
+                            <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={() => setEditingScreenId(null)}>Cancel</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="screen-card-name">{s.name}</div>
+                          <div className="screen-card-meta">
+                            <span className={`screen-badge screen-badge--${s.platform === "ios_sim" ? "ios" : "android"}`}>{s.platform === "ios_sim" ? "iOS" : "Android"}</span>
+                            {s.stale && <span className="screen-badge screen-badge--stale">Stale</span>}
+                            <span>{s.xml_length.toLocaleString()} chars</span>
+                          </div>
+                          {s.notes && <div className="screen-card-notes">{s.notes}</div>}
+                          <div className="screen-card-actions" onClick={e => e.stopPropagation()}>
+                            <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={() => { setEditingScreenId(s.id); setEditScreenName(s.name); setEditScreenNotes(s.notes || ""); }}>Edit</button>
+                            <button className="btn-ghost btn-sm" style={{ fontSize: 10, color: "var(--danger)" }} onClick={async () => { if (confirm(`Delete screen "${s.name}"?`)) { await api.deleteScreen(s.id); loadScreens(); loadScreenFolders(); if (screenDetail?.id === s.id) setScreenDetail(null); } }}>Delete</button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Screen detail modal */}
+        {screenDetail && (
+          <div className="modal-backdrop" onClick={() => setScreenDetail(null)}>
+            <div className="modal" style={{ maxWidth: 960, width: "95vw", maxHeight: "90vh", display: "flex", flexDirection: "column" }} onClick={e => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 20px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 15 }}>{screenDetail.name}</div>
+                <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 11, color: "var(--muted)" }}>
+                  <span className="screen-badge">{screenDetail.platform}</span>
+                  <span>Build {screenDetail.build_id ?? "—"}</span>
+                  <span>{screenDetail.captured_at ? new Date(screenDetail.captured_at).toLocaleString() : ""}</span>
+                  <span>{screenDetail.xml_length.toLocaleString()} chars</span>
+                  <button className="btn-ghost btn-sm" onClick={() => setScreenDetail(null)}>Close</button>
+                </div>
+              </div>
+              {screenDetail.notes && <div style={{ padding: "8px 20px", fontSize: 11, color: "var(--muted)", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>{screenDetail.notes}</div>}
+              <div style={{ display: "grid", gridTemplateColumns: screenDetail.screenshot_path ? "220px 1fr" : "1fr", flex: 1, minHeight: 0, overflow: "hidden" }}>
+                {screenDetail.screenshot_path && (
+                  <div style={{ padding: 16, overflow: "auto", borderRight: "1px solid var(--border)" }}>
+                    <img src={api.screenScreenshotUrl(screenDetail.id)} alt={screenDetail.name} style={{ width: "100%", borderRadius: 8, border: "1px solid var(--border)" }} />
+                  </div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>
+                  <div style={{ padding: "10px 16px 6px", fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".5px", flexShrink: 0 }}>XML Source</div>
+                  <pre className="code-panel" style={{ flex: 1, margin: "0 16px 16px", overflowY: "auto", overflowX: "hidden", fontSize: 10.5, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-all", tabSize: 2 }}>
+                    {screenDetail.xml_snapshot || "(empty)"}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </>}
     </>
   );
 }
 
 /* ── Reports ───────────────────────────────────────── */
-function ReportsView({ project, runs, tests, onRefresh }: { project: Project; runs: Run[]; tests: TestDef[]; onRefresh?: () => void }) {
-  const [hier, setHier] = useState<any>(null);
-  const [loadErr, setLoadErr] = useState<string | null>(null);
-  const [exp, setExp] = useState<Record<string, boolean>>({});
+function ReportsView({ project, runs, tests, modules, suites, onRefresh }: { project: Project; runs: Run[]; tests: TestDef[]; modules: ModuleDef[]; suites: SuiteDef[]; onRefresh?: () => void }) {
+  type Scope = "suite" | "collection";
+  const [scope, setScope] = useState<Scope>("suite");
+  const [scopeId, setScopeId] = useState<number | null>(null);
+  const [platform, setPlatform] = useState<"" | "android" | "ios_sim">("");
+  const [days, setDays] = useState<number>(14);
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [search, setSearch] = useState("");
+  const [tab, setTab] = useState<string>("health");
+  const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [confluenceBusy, setConfluenceBusy] = useState(false);
 
-  const passedFlat = runs.filter(r => r.status === "passed").length;
-  const failedFlat = runs.filter(r => r.status === "failed" || r.status === "error").length;
-  const totalFlat = runs.length;
-  const rateFlat = totalFlat > 0 ? ((passedFlat / totalFlat) * 100).toFixed(1) : "0";
+  const [suiteData, setSuiteData] = useState<SuiteHealthResponse | null>(null);
+  const [trendData, setTrendData] = useState<SuiteTrendItem[] | null>(null);
+  const [stepCov, setStepCov] = useState<StepCoverageItem[] | null>(null);
+  const [triageData, setTriageData] = useState<TriageResponse | null>(null);
+  const [collData, setCollData] = useState<CollectionHealthResponse | null>(null);
+  const [blockers, setBlockers] = useState<BlockerItem[] | null>(null);
 
-  const loadHierarchy = useCallback(() => {
-    setLoadErr(null);
-    api.getReportsHierarchy(project.id).then(setHier).catch((e: Error) => setLoadErr(e.message || String(e)));
-  }, [project.id]);
+  // auto-select first suite/collection
+  useEffect(() => {
+    if (scopeId) return;
+    if (scope === "suite" && suites.length) setScopeId(suites[0].id);
+    if (scope === "collection" && modules.length) setScopeId(modules[0].id);
+  }, [scope, suites, modules, scopeId]);
 
-  useEffect(() => { loadHierarchy(); }, [loadHierarchy]);
-
-  const toggle = (key: string) => setExp(e => ({ ...e, [key]: !e[key] }));
-
-  const exportRunHtml = (run: any, testName: string) => {
-    const steps = (run.step_results || []) as any[];
-    const rows = steps.map((s, i) => `<tr><td>${i + 1}</td><td>${(s?.status || "").toString()}</td><td>${String(JSON.stringify(s?.details || "")).slice(0, 400)}</td></tr>`).join("");
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Run #${run.id}</title><style>body{font-family:system-ui;background:#080b0f;color:#e8eaed;padding:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:8px;font-size:12px}</style></head><body><h1>Run #${run.id} — ${testName}</h1><p>Status: ${run.status} · ${run.platform} · ${run.device_target || ""}</p>${run.error_message ? `<pre style="color:#f66;white-space:pre-wrap">${run.error_message}</pre>` : ""}<h2>Steps</h2><table><thead><tr><th>#</th><th>Status</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-    a.download = `run_${run.id}_report.html`;
-    a.click();
-  };
-
-  const exportCollectionFromHierarchy = async (col: any) => {
-    const flat: { r: any; testName: string }[] = [];
-    for (const su of col.suites || []) {
-      for (const te of su.tests || []) {
-        for (const r of te.runs || []) {
-          flat.push({ r, testName: te.name });
-        }
-      }
+  // data loading
+  useEffect(() => {
+    if (!scopeId) return;
+    setLoading(true);
+    if (scope === "suite") {
+      Promise.all([
+        api.getSuiteHealth(scopeId, days, platform),
+        api.getSuiteTrend(scopeId, days, platform),
+        api.getSuiteStepCoverage(scopeId, days, platform),
+        api.getSuiteTriage(scopeId, days, platform),
+      ]).then(([h, t, sc, tr]) => { setSuiteData(h); setTrendData(t); setStepCov(sc); setTriageData(tr); setCollData(null); setBlockers(null); })
+        .catch(() => {})
+        .finally(() => setLoading(false));
+    } else {
+      Promise.all([
+        api.getCollectionHealth(scopeId, days, platform),
+        api.getCollectionBlockers(scopeId, days, platform),
+      ]).then(([ch, bl]) => { setCollData(ch); setBlockers(bl); setSuiteData(null); setTrendData(null); setStepCov(null); setTriageData(null); })
+        .catch(() => {})
+        .finally(() => setLoading(false));
     }
-    const shotEntries: { runId: number; testName: string; shots: { idx: number; status: string; b64: string }[] }[] = [];
-    for (const { r, testName } of flat.slice(0, 15)) {
-      const arts = r.screenshots || [];
-      const summary = r.step_results || [];
-      const runShots: typeof shotEntries[0]["shots"] = [];
-      for (let i = 0; i < Math.min(arts.length, 4); i++) {
-        try {
-          const resp = await fetch(`/api/artifacts/${project.id}/${r.id}/${encodeURIComponent(arts[i])}`);
-          if (resp.ok) {
-            const blob = await resp.blob();
-            const b64: string = await new Promise(res => { const rd = new FileReader(); rd.onloadend = () => res(rd.result as string); rd.readAsDataURL(blob); });
-            runShots.push({ idx: i, status: summary[i]?.status || "unknown", b64 });
-          }
-        } catch { /* ignore */ }
-      }
-      shotEntries.push({ runId: r.id, testName, shots: runShots });
+  }, [scope, scopeId, days, platform]);
+
+  const statusColor = (s: string) => s === "passing" ? "var(--accent)" : s === "failing" ? "var(--danger)" : s === "flaky" ? "var(--warn)" : "var(--muted)";
+  const rateColor = (pct: number) => pct >= 80 ? "var(--accent)" : pct >= 50 ? "var(--warn)" : "var(--danger)";
+  const catLabel: Record<string, string> = { selector_not_found: "Selector Not Found", element_timeout: "Element Timeout", assertion_failure: "Assertion Failure", network_error: "Network/API Error", app_crash: "App Crash/ANR", other: "Other" };
+  const catColor: Record<string, string> = { selector_not_found: "#ff3b5c", element_timeout: "#ffb020", assertion_failure: "#a78bfa", network_error: "#3b82f6", app_crash: "#ff6b35", other: "#6b7280" };
+
+  const filteredTests = useMemo(() => {
+    if (!suiteData) return [];
+    let t = suiteData.tests;
+    if (statusFilter !== "all") t = t.filter(r => r.status === statusFilter);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      t = t.filter(r => r.name.toLowerCase().includes(q) || (r.acceptance_criteria || "").toLowerCase().includes(q));
     }
+    return t;
+  }, [suiteData, statusFilter, search]);
 
-    const runsHtml = flat.map(({ r, testName }) => {
-      const bg = r.status === "passed" ? "#0a2a1a" : r.status === "failed" || r.status === "error" ? "#2a0a0f" : "#151a20";
-      const color = r.status === "passed" ? "#00e5a0" : r.status === "failed" ? "#ff3b5c" : "#8a8f98";
-      return `<tr style="background:${bg}"><td>#${r.id}</td><td>${testName}</td><td style="color:${color};font-weight:700">${String(r.status).toUpperCase()}</td><td>${r.platform}</td><td>${r.device_target || "default"}</td><td style="font-size:11px;color:#8a8f98">${r.error_message || ""}</td></tr>`;
-    }).join("");
+  // ── Suite view tabs ──
+  const renderHealthList = () => (
+    <div className="panel" style={{ padding: 0, overflow: "hidden" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "20px 1fr 130px 80px 130px 56px", gap: 8, padding: "8px 14px", borderBottom: "1px solid var(--border)", fontSize: 10, color: "var(--muted)", textTransform: "uppercase" as const, letterSpacing: ".5px" }}>
+        <div></div><div>Test</div><div>Steps</div><div>Platform</div><div>History</div><div style={{ textAlign: "right" }}>Pass%</div>
+      </div>
+      {filteredTests.length === 0 && <div style={{ padding: 20, color: "var(--muted)", fontSize: 12 }}>No test cases match the current filters.</div>}
+      {filteredTests.map(t => (
+        <React.Fragment key={t.id}>
+          <div className="health-row" onClick={() => setExpandedId(expandedId === t.id ? null : t.id)}>
+            <div style={{ width: 12, height: 12, borderRadius: "50%", background: statusColor(t.status) }} />
+            <div className="h-name">{t.name}</div>
+            <div className="h-steps" style={{ color: t.steps_total > 0 && t.steps_ran / t.steps_total < 0.5 ? "var(--danger)" : "var(--text)" }}>{t.steps_ran} of {t.steps_total} steps</div>
+            <div className="h-platform" style={{ color: t.platform === "both" ? "var(--text)" : "var(--warn)" }}>{t.platform === "both" ? "Both" : t.platform === "ios_sim" ? "iOS" : "Android"}</div>
+            <div className="run-strip">
+              {t.run_history.map(rh => <div key={rh.id} className={`rc ${rh.status === "passed" ? "rc-pass" : rh.status === "failed" || rh.status === "error" ? "rc-fail" : "rc-other"}`} title={`#${rh.id} ${rh.status}`} />)}
+            </div>
+            <div className="h-rate" style={{ color: rateColor(t.pass_rate_pct) }}>{t.pass_rate_pct}%</div>
+          </div>
+          {expandedId === t.id && (
+            <div className="health-expanded">
+              {t.acceptance_criteria && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>{t.acceptance_criteria}</div>}
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 12, fontSize: 11, color: "var(--muted)" }}>
+                <span>Fail streak: <strong style={{ color: t.fail_streak > 0 ? "var(--danger)" : "var(--text)" }}>{t.fail_streak}</strong></span>
+                <span>Last passed: {t.last_passed_at ? new Date(t.last_passed_at).toLocaleDateString() : "Never"}</span>
+                <span>AI fixes used: {t.ai_fixes_count}</span>
+              </div>
+              {t.last_failed_run && (
+                <>
+                  <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: "var(--muted)" }}>
+                    {t.steps_ran} of {t.steps_total} steps executed — {t.steps_ran < t.steps_total
+                      ? `test stopped at step ${t.steps_ran + 1}`
+                      : t.last_failed_run.step_results.some(sr => sr.status === "failed")
+                        ? `failed at step ${(t.last_failed_run.step_results.findIndex(sr => sr.status === "failed") + 1)}`
+                        : "all steps passed"}
+                  </div>
+                  {t.last_failed_run.step_results.map(sr => {
+                    const isFailed = sr.status === "failed";
+                    const isSkipped = sr.status !== "passed" && sr.status !== "failed";
+                    return (
+                      <div key={sr.index} className={`step-row ${isFailed ? "step-row--failed" : ""} ${isSkipped ? "step-row--skipped" : ""}`}>
+                        <div className="step-num">{sr.index + 1}</div>
+                        <div className="step-dot" style={{ background: sr.status === "passed" ? "var(--accent)" : sr.status === "failed" ? "var(--danger)" : "#555" }} />
+                        <div>
+                          <span style={{ fontWeight: 500 }}>{sr.type}</span>
+                          {sr.selector && <span className="step-selector"> · {typeof sr.selector === "object" ? `${sr.selector.using}="${sr.selector.value}"` : String(sr.selector)}</span>}
+                          {isSkipped && <span style={{ color: "var(--muted)", marginLeft: 8 }}>Not reached</span>}
+                        </div>
+                        <div className="step-dur">{sr.duration_ms != null ? `${(sr.duration_ms / 1000).toFixed(1)}s` : ""}</div>
+                        <div>
+                          {sr.screenshot && <img src={`/api/artifacts/${project.id}/${t.last_failed_run!.id}/${encodeURIComponent(sr.screenshot)}`} alt="" style={{ width: 32, height: 56, objectFit: "cover", borderRadius: 4, border: `1px solid ${isFailed ? "var(--danger)" : "var(--border)"}` }} />}
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {t.last_failed_run.error_message && <div className="error-detail">{t.last_failed_run.error_message}</div>}
+                  {t.last_failed_run.ai_fix && (
+                    <div className="ai-fix-box">
+                      <div className="ai-label">AI Fix Suggestion</div>
+                      <div className="ai-text">{t.last_failed_run.ai_fix.analysis}</div>
+                    </div>
+                  )}
+                </>
+              )}
+              <div style={{ display: "flex", gap: 8, marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+                <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={() => {
+                  const a = document.createElement("a");
+                  a.href = `/api/tests/${t.id}/export/html`;
+                  a.download = `${t.name.replace(/\s+/g, "_")}_report.html`;
+                  a.click();
+                }}>Download Report</button>
+              </div>
+            </div>
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
 
-    const failedRunsDetail = flat.filter(({ r }) => r.status === "failed" || r.status === "error").map(({ r, testName }) => {
-      const steps = r.step_results || [];
-      const failIdx = steps.findIndex((s: any) => s?.status === "failed");
-      const stepsHtml = steps.map((sr: any, i: number) => {
-        const st = sr?.status || "pending";
-        const c = st === "passed" ? "#00e5a0" : st === "failed" ? "#ff3b5c" : "#8a8f98";
-        return `<div style="padding:4px 8px;border-bottom:1px solid #1e2430;font-size:11px;display:flex;gap:8px"><span style="color:${c};min-width:24px;font-weight:700">${i + 1}</span><span>${st}</span>${st === "failed" ? `<span style="color:#ff3b5c;margin-left:auto">${typeof sr?.details === "string" ? sr.details : sr?.details?.error || "Failed"}</span>` : ""}</div>`;
-      }).join("");
-      const entry = shotEntries.find(e => e.runId === r.id);
-      const shotsHtml = entry?.shots.map(s => `<img src="${s.b64}" style="width:120px;border-radius:6px;border:2px solid ${s.status === "failed" ? "#ff3b5c" : "#00e5a0"}" />`).join("") || "";
-      return `<div style="margin-bottom:20px;border:1px solid rgba(255,59,92,.3);border-radius:8px;overflow:hidden"><div style="background:rgba(255,59,92,.08);padding:12px;font-weight:600">#${r.id} — ${testName} — FAILED at step ${failIdx >= 0 ? failIdx + 1 : "?"}</div><div style="padding:12px">${r.error_message ? `<div style="background:rgba(255,59,92,.1);padding:10px;border-radius:6px;font-family:monospace;font-size:11px;color:#ff3b5c;margin-bottom:12px">${r.error_message}</div>` : ""}<div style="border:1px solid #1e2430;border-radius:6px;margin-bottom:12px">${stepsHtml}</div>${shotsHtml ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${shotsHtml}</div>` : ""}</div></div>`;
-    }).join("");
+  const renderCharts = () => (
+    <div>
+      {/* Pass rate trend */}
+      <div className="chart-card">
+        <div className="chart-title">Pass Rate by Test Case ({days}d)</div>
+        {trendData && trendData.length > 0 ? (
+          <ResponsiveContainer width="100%" height={Math.max(200, trendData.length * 32)}>
+            <BarChart data={trendData} layout="vertical" margin={{ left: 120, right: 20 }}>
+              <XAxis type="number" domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#555" fontSize={10} />
+              <YAxis type="category" dataKey="test_name" width={110} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 18 ? v.slice(0, 16) + "…" : v} />
+              <Tooltip formatter={(v: any) => `${v}%`} contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} />
+              <Bar dataKey="pass_rate_pct" radius={[0, 4, 4, 0]}>
+                {trendData.map((d, i) => <Cell key={i} fill={d.pass_rate_pct >= 80 ? "#00e5a0" : d.pass_rate_pct >= 50 ? "#ffb020" : "#ff3b5c"} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        ) : <div style={{ color: "var(--muted)", fontSize: 12, padding: 20 }}>No trend data</div>}
+      </div>
 
-    const total = flat.length;
-    const passed = flat.filter(({ r }) => r.status === "passed").length;
-    const failed = flat.filter(({ r }) => r.status === "failed" || r.status === "error").length;
-    const rate = total > 0 ? Math.round((passed / total) * 100) : 0;
+      {/* Steps coverage */}
+      <div className="chart-card">
+        <div className="chart-title">Steps Executed vs Skipped</div>
+        {stepCov && stepCov.length > 0 ? (
+          <ResponsiveContainer width="100%" height={Math.max(200, stepCov.length * 32)}>
+            <BarChart data={stepCov.map(s => ({ ...s, skipped: Math.max(0, s.avg_steps_total - s.avg_steps_ran) }))} layout="vertical" margin={{ left: 120, right: 20 }}>
+              <XAxis type="number" stroke="#555" fontSize={10} />
+              <YAxis type="category" dataKey="test_name" width={110} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 18 ? v.slice(0, 16) + "…" : v} />
+              <Tooltip contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} />
+              <Bar dataKey="avg_steps_ran" stackId="a" fill="#00e5a0" name="Ran" radius={[0, 0, 0, 0]} />
+              <Bar dataKey="skipped" stackId="a" fill="#555" name="Skipped" radius={[0, 4, 4, 0]} />
+              <Legend wrapperStyle={{ fontSize: 10 }} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : <div style={{ color: "var(--muted)", fontSize: 12, padding: 20 }}>No step data</div>}
+      </div>
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Collection Report — ${col.name}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',system-ui,sans-serif;background:#080b0f;color:#e8eaed;padding:32px;line-height:1.6}h1{font-size:22px;color:#00e5a0;margin-bottom:4px}h2{font-size:16px;color:#a78bfa;margin:28px 0 12px;border-bottom:1px solid #1e2430;padding-bottom:8px}.meta{font-size:12px;color:#8a8f98;margin-bottom:24px}.card{background:#0d1117;border:1px solid #1e2430;border-radius:8px;padding:16px;margin-bottom:16px}table{width:100%;border-collapse:collapse;font-size:12px}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px;text-align:left;padding:8px 10px;border-bottom:1px solid #1e2430}td{padding:8px 10px;border-bottom:1px solid #151a20}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center;margin-bottom:20px}.stat-val{font-size:28px;font-weight:700}.stat-lbl{font-size:10px;text-transform:uppercase;color:#8a8f98;margin-top:4px}</style></head><body>
-<h1>📁 Collection Report — ${col.name}</h1>
-<div class="meta">${project.name} · Generated ${new Date().toLocaleString()}</div>
-<div class="stats"><div><div class="stat-val" style="color:${rate >= 90 ? "#00e5a0" : rate >= 70 ? "#ffb020" : "#ff3b5c"}">${rate}%</div><div class="stat-lbl">Pass Rate (runs)</div></div><div><div class="stat-val">${total}</div><div class="stat-lbl">Total Runs</div></div><div><div class="stat-val" style="color:#00e5a0">${passed}</div><div class="stat-lbl">Passed</div></div><div><div class="stat-val" style="color:#ff3b5c">${failed}</div><div class="stat-lbl">Failed</div></div></div>
-<h2>All Runs (${total})</h2>
-<div class="card" style="padding:0;overflow:hidden"><table><thead><tr><th>ID</th><th>Test</th><th>Status</th><th>Platform</th><th>Device</th><th>Error</th></tr></thead><tbody>${runsHtml}</tbody></table></div>
-${failedRunsDetail ? `<h2>Failed Runs — Detail</h2>${failedRunsDetail}` : ""}
-<div style="margin-top:32px;border-top:1px solid #1e2430;padding-top:16px;font-size:11px;color:#555">QA·OS Collection Report · ${project.name} · ${col.name} · ${new Date().toISOString()}</div>
-</body></html>`;
+      {/* Failure type donut */}
+      {triageData && triageData.categories.length > 0 && (
+        <div className="chart-card">
+          <div className="chart-title">Failure Type Breakdown ({triageData.total_failures} failures)</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap" }}>
+            <ResponsiveContainer width={200} height={200}>
+              <PieChart>
+                <Pie data={triageData.categories} dataKey="count" nameKey="category" cx="50%" cy="50%" innerRadius={50} outerRadius={80} paddingAngle={2}>
+                  {triageData.categories.map((c, i) => <Cell key={i} fill={catColor[c.category] || "#6b7280"} />)}
+                </Pie>
+                <Tooltip contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} formatter={(v: any, name: any) => [v, catLabel[name] || name]} />
+              </PieChart>
+            </ResponsiveContainer>
+            <div className="donut-legend">
+              {triageData.categories.map(c => (
+                <div key={c.category} className="donut-legend-item">
+                  <div className="donut-legend-dot" style={{ background: catColor[c.category] || "#6b7280" }} />
+                  <span>{catLabel[c.category] || c.category}: {c.count} ({c.pct}%)</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-    a.download = `collection_report_${col.name.replace(/\s+/g, "_")}.html`;
-    a.click();
+  const renderMatrix = () => {
+    if (!suiteData) return null;
+    const allRunIds = new Set<number>();
+    for (const t of suiteData.tests) for (const rh of t.run_history) allRunIds.add(rh.id);
+    const sortedIds = Array.from(allRunIds).sort((a, b) => a - b);
+    return (
+      <div className="panel" style={{ padding: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12 }}>Run Matrix — {sortedIds.length} runs × {suiteData.tests.length} tests</div>
+        <div className="matrix-grid">
+          {suiteData.tests.map(t => {
+            const rhMap = new Map(t.run_history.map(r => [r.id, r.status]));
+            return (
+              <div key={t.id} className="matrix-row">
+                <div className="matrix-label" title={t.name}>{t.name}</div>
+                {sortedIds.map(rid => {
+                  const st = rhMap.get(rid);
+                  const bg = st === "passed" ? "#00e5a0" : st === "failed" || st === "error" ? "#ff3b5c" : st ? "#555" : "#1a1f26";
+                  return <div key={rid} className="matrix-cell" style={{ background: bg }} title={st ? `#${rid}: ${st}` : `#${rid}: not run`} onClick={() => { if (st === "failed" || st === "error") setExpandedId(expandedId === t.id ? null : t.id); }} />;
+                })}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
   };
 
-  const exportAll = () => {
-    const rows = runs.map(r => `<tr><td>#${r.id}</td><td>${tests.find(t => t.id === r.test_id)?.name || "—"}</td><td style="color:${r.status === "passed" ? "#00e5a0" : "#ff3b5c"};font-weight:700">${r.status}</td><td>${r.platform}</td><td>${r.device_target || "default"}</td><td>${r.finished_at || "—"}</td><td style="font-size:11px;color:#8a8f98">${r.error_message || ""}</td></tr>`).join("");
-    const html = `<!DOCTYPE html><html><head><title>QA Report - ${project.name}</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui;padding:32px;background:#080b0f;color:#e8eaed}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid #1e2430;padding:8px;text-align:left}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px}h1{color:#00e5a0;margin-bottom:12px}</style></head><body><h1>${project.name} — Full Test Report</h1><p style="color:#8a8f98;margin-bottom:20px">Generated: ${new Date().toLocaleString()} | Total: ${totalFlat} | Passed: ${passedFlat} | Failed: ${failedFlat} | Pass Rate: ${rateFlat}%</p><table><thead><tr><th>ID</th><th>Test</th><th>Status</th><th>Platform</th><th>Device</th><th>Finished</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
-    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([html], { type: "text/html" })); a.download = `qa_report_${project.name}.html`; a.click();
+  const renderTriage = () => {
+    if (!triageData) return null;
+    return (
+      <div className="panel" style={{ padding: 16 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12 }}>Failure Triage — {triageData.total_failures} total failures</div>
+        {triageData.categories.map(c => (
+          <details key={c.category} className="triage-cat" style={{ borderLeftColor: catColor[c.category] || "#555", borderLeftWidth: 3, borderLeftStyle: "solid" }}>
+            <summary style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontWeight: 600, fontSize: 12 }}>{catLabel[c.category] || c.category}</span>
+              <span style={{ fontSize: 11, color: "var(--muted)" }}>{c.count} ({c.pct}%)</span>
+            </summary>
+            <div style={{ marginTop: 10 }}>
+              {c.affected_tests.map((at, i) => (
+                <div key={i} style={{ padding: "6px 0", borderBottom: "1px solid var(--border)", fontSize: 11 }}>
+                  <div style={{ fontWeight: 500 }}>{at.name}</div>
+                  {at.error_message && <div style={{ color: "var(--danger)", fontFamily: "var(--mono)", fontSize: 10, marginTop: 4 }}>{at.error_message.slice(0, 200)}</div>}
+                </div>
+              ))}
+            </div>
+          </details>
+        ))}
+      </div>
+    );
   };
 
-  const sum = hier?.summary;
+  const renderExport = () => {
+    if (!scopeId) return null;
+    return (
+      <div className="panel" style={{ padding: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--sans)", marginBottom: 16 }}>Export & Download</div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {scope === "suite" && (
+            <>
+              <button className="btn-primary btn-sm" onClick={() => api.downloadSuiteHtml(scopeId!, days, platform)}>HTML Report</button>
+              <button className="btn-ghost btn-sm" onClick={() => api.downloadSuiteCsv(scopeId!, days, platform)}>CSV</button>
+              <button className="btn-ghost btn-sm" onClick={() => api.downloadSuiteScreenshots(scopeId!, days, platform)}>Screenshots ZIP</button>
+            </>
+          )}
+          {scope === "collection" && (
+            <button className="btn-primary btn-sm" onClick={() => api.downloadCollectionHtml(scopeId!, days, platform)}>Collection HTML Report</button>
+          )}
+        </div>
+      </div>
+    );
+  };
 
+  // ── Collection view ──
+  const renderCollectionView = () => {
+    if (!collData) return <div style={{ padding: 20, color: "var(--muted)" }}>Loading collection data...</div>;
+    const c = collData.collection;
+    const m = collData.metrics;
+    const verdictCls = c.verdict === "READY" ? "verdict-ready" : c.verdict === "BLOCKED" ? "verdict-blocked" : "verdict-not-ready";
+    return (
+      <>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 20 }}>
+          <div style={{ fontFamily: "var(--sans)", fontSize: 18, fontWeight: 700 }}>{c.name}</div>
+          <span className={`verdict-badge ${verdictCls}`}>{c.verdict}</span>
+        </div>
+
+        <div className="report-metrics">
+          <div className="metric-card"><div className="metric-val">{m.total}</div><div className="metric-lbl">Total Tests</div></div>
+          <div className="metric-card"><div className="metric-val" style={{ color: "var(--accent)" }}>{m.passing}</div><div className="metric-lbl">Passing</div></div>
+          <div className="metric-card"><div className="metric-val" style={{ color: "var(--danger)" }}>{m.failing}</div><div className="metric-lbl">Failing</div></div>
+          <div className="metric-card"><div className="metric-val" style={{ color: "#ff6b35" }}>{m.blockers}</div><div className="metric-lbl">Blockers</div></div>
+          <div className="metric-card"><div className="metric-val" style={{ color: "var(--warn)" }}>{m.flaky}</div><div className="metric-lbl">Flaky</div></div>
+          <div className="metric-card"><div className="metric-val">{m.never_run}</div><div className="metric-lbl">Never Ran</div></div>
+        </div>
+
+        {/* Suite breakdown */}
+        <div className="panel" style={{ padding: 0, marginBottom: 16, overflow: "hidden" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 56px 56px 56px 56px auto", gap: 8, padding: "8px 14px", fontSize: 10, color: "var(--muted)", textTransform: "uppercase" as const, borderBottom: "1px solid var(--border)" }}>
+            <div>Suite</div><div>Pass Rate</div><div>%</div><div>Pass</div><div>Fail</div><div>Block</div><div>Last Run</div>
+          </div>
+          {collData.suites.map(s => (
+            <div key={s.id} style={{ display: "grid", gridTemplateColumns: "1fr 120px 56px 56px 56px 56px auto", gap: 8, padding: "10px 14px", borderBottom: "1px solid var(--border)", fontSize: 12, alignItems: "center", cursor: "pointer" }} onClick={() => { setScope("suite"); setScopeId(s.id); setTab("health"); }}>
+              <div style={{ fontWeight: 500 }}>{s.name}</div>
+              <div style={{ height: 8, background: "rgba(255,255,255,.06)", borderRadius: 4, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${s.pass_rate_pct}%`, background: rateColor(s.pass_rate_pct), borderRadius: 4 }} />
+              </div>
+              <div style={{ color: rateColor(s.pass_rate_pct), fontWeight: 700 }}>{s.pass_rate_pct}%</div>
+              <div style={{ color: "var(--accent)" }}>{s.pass_count}</div>
+              <div style={{ color: "var(--danger)" }}>{s.fail_count}</div>
+              <div style={{ color: "#ff6b35" }}>{s.blocker_count}</div>
+              <div style={{ fontSize: 10, color: "var(--muted)" }}>{s.last_run_at ? ago(s.last_run_at) : "—"}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Blockers */}
+        {blockers && blockers.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, fontFamily: "var(--sans)", marginBottom: 10, color: "var(--danger)" }}>Blockers ({blockers.length})</div>
+            {blockers.map(b => (
+              <div key={b.test_id} className="blocker-card">
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ fontWeight: 600, fontSize: 12 }}>{b.test_name}</div>
+                  <div style={{ fontSize: 10, color: "var(--muted)" }}>{b.suite_name} · streak {b.fail_streak}</div>
+                </div>
+                {b.error_message && <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#ff9999", marginBottom: 6 }}>{b.error_message.slice(0, 200)}</div>}
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  {b.screenshot_path && b.run_id > 0 && <img src={`/api/artifacts/${project.id}/${b.run_id}/${encodeURIComponent(b.screenshot_path)}`} alt="" style={{ width: 40, height: 72, objectFit: "cover", borderRadius: 4 }} />}
+                  {b.ai_fix_available && <span style={{ fontSize: 10, color: "#a78bfa" }}>AI fix available</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* 30-day trend */}
+        {collData.trend_30d.length > 1 && (
+          <div className="chart-card">
+            <div className="chart-title">30-Day Pass Rate Trend</div>
+            <ResponsiveContainer width="100%" height={180}>
+              <LineChart data={collData.trend_30d} margin={{ left: 10, right: 20 }}>
+                <XAxis dataKey="date" tick={{ fontSize: 9, fill: "#8a8f98" }} tickFormatter={d => d.slice(5)} />
+                <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => `${v}%`} />
+                <Tooltip contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} formatter={(v: any) => `${v}%`} />
+                <Line type="monotone" dataKey="pass_rate_pct" stroke="#00e5a0" strokeWidth={2} dot={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {renderExport()}
+      </>
+    );
+  };
+
+  // ── Main render ──
   return (
     <>
       <div className="section-head">
         <div>
           <div className="section-title">Reports</div>
-          <div className="section-sub">{project.name} · hierarchy · last 5 runs per test</div>
+          <div className="section-sub">{project.name} · test-case-first · {days}-day window</div>
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
-          <button className="btn-ghost btn-sm" onClick={() => { onRefresh?.(); loadHierarchy(); }}>↻ Refresh</button>
-          <button className="btn-ghost btn-sm" onClick={exportAll}>⬇ Full Report (flat)</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn-ghost btn-sm" disabled={confluenceBusy} onClick={async () => {
+            setConfluenceBusy(true);
+            try {
+              const r = await api.syncConfluenceProject(project.id);
+              if (r.page_url) window.open(r.page_url, "_blank");
+              toast(r.title ? `Confluence: ${r.title}` : "Published to Confluence", "success");
+            } catch (e: any) {
+              toast(e?.message || "Confluence sync failed", "error");
+            } finally {
+              setConfluenceBusy(false);
+            }
+          }}>{confluenceBusy ? "Publishing…" : "Push to Confluence"}</button>
+          <button className="btn-ghost btn-sm" onClick={() => onRefresh?.()}>Refresh</button>
         </div>
       </div>
 
-      {loadErr && <div className="error-box" style={{ marginBottom: 12 }}>{loadErr}</div>}
+      {/* Filter bar */}
+      <div className="report-filter-bar">
+        <select value={`${scope}:${scopeId || ""}`} onChange={e => {
+          const [s, id] = e.target.value.split(":");
+          setScope(s as Scope);
+          setScopeId(id ? Number(id) : null);
+          setExpandedId(null);
+          setTab("health");
+        }}>
+          <optgroup label="Collections">
+            {modules.map(m => <option key={`c-${m.id}`} value={`collection:${m.id}`}>{m.name}</option>)}
+          </optgroup>
+          <optgroup label="Suites">
+            {modules.map(m => suites.filter(s => s.module_id === m.id).map(s => <option key={`s-${s.id}`} value={`suite:${s.id}`}>{m.name} / {s.name}</option>))}
+          </optgroup>
+        </select>
 
-      <div className="report-grid">
-        <div className="panel" style={{ gridColumn: "span 3" }}>
-          <div className="panel-header"><div className="panel-title">Summary (tests)</div></div>
-          <div style={{ padding: 20, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 16 }}>
-            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700 }}>{sum ? `${sum.pass_rate}%` : rateFlat + "%"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Pass rate</div></div>
-            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700 }}>{sum?.total_tests ?? "—"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Tests</div></div>
-            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--accent2)" }}>{sum?.executed ?? "—"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Executed</div></div>
-            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--accent)" }}>{sum?.passed ?? passedFlat}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Passed</div></div>
-            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--danger)" }}>{sum?.failed ?? failedFlat}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Failed</div></div>
+        <div className="seg-btn">
+          {(["", "android", "ios_sim"] as const).map(p => (
+            <button key={p} className={platform === p ? "active" : ""} onClick={() => setPlatform(p)}>{p === "" ? "All" : p === "android" ? "Android" : "iOS"}</button>
+          ))}
+        </div>
+
+        <select value={days} onChange={e => setDays(Number(e.target.value))}>
+          <option value={7}>7 days</option>
+          <option value={14}>14 days</option>
+          <option value={30}>30 days</option>
+          <option value={90}>90 days</option>
+        </select>
+
+        {scope === "suite" && (
+          <>
+            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+              <option value="all">All statuses</option>
+              <option value="failing">Failing</option>
+              <option value="passing">Passing</option>
+              <option value="flaky">Flaky</option>
+            </select>
+            <input type="text" placeholder="Search tests..." value={search} onChange={e => setSearch(e.target.value)} />
+          </>
+        )}
+      </div>
+
+      {loading && <div style={{ padding: 20, textAlign: "center", color: "var(--muted)" }}>Loading report data...</div>}
+
+      {!loading && scope === "collection" && renderCollectionView()}
+
+      {!loading && scope === "suite" && suiteData && (
+        <>
+          {/* Suite header */}
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16, flexWrap: "wrap" }}>
+            <div style={{ fontFamily: "var(--sans)", fontSize: 16, fontWeight: 700 }}>{suiteData.suite.name}</div>
+            <span style={{ fontSize: 11, color: "var(--muted)" }}>{suiteData.suite.module_name}</span>
+            <span style={{ fontSize: 13, fontWeight: 700, color: rateColor(suiteData.suite.pass_rate) }}>{suiteData.suite.pass_rate}% pass</span>
+            {suiteData.suite.last_run_at && <span style={{ fontSize: 10, color: "var(--muted)" }}>Last run: {ago(suiteData.suite.last_run_at)}</span>}
           </div>
-        </div>
-      </div>
 
-      <div className="panel">
-        <div className="panel-header">
-          <div className="panel-title">Collections → suites → tests → runs</div>
-          <div style={{ fontSize: 11, color: "var(--muted)" }}>Expand rows · proof thumbnails · per-run download</div>
-        </div>
-        <div style={{ padding: 12 }}>
-          {!hier?.collections?.length && <div style={{ color: "var(--muted)", fontSize: 12 }}>No collections yet. Create a collection and suites in Test Library.</div>}
-          {(hier?.collections || []).map((col: any) => (
-            <div key={col.id} style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
-              <div
-                role="button"
-                tabIndex={0}
-                onClick={() => toggle(`c-${col.id}`)}
-                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`c-${col.id}`); } }}
-                style={{ padding: "10px 14px", background: "var(--bg3)", display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}
-              >
-                <span style={{ fontSize: 14, color: "var(--muted)", width: 18 }}>{exp[`c-${col.id}`] ? "▼" : "▶"}</span>
-                <div style={{ flex: 1, fontFamily: "var(--sans)", fontWeight: 600 }}>📁 {col.name}</div>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>{col.total_tests} tests · {col.pass_rate}% pass · {col.failed_count} fail</div>
-                <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={e => { e.stopPropagation(); exportCollectionFromHierarchy(col); }} title="Download HTML report">⬇</button>
-              </div>
-              {exp[`c-${col.id}`] && (
-                <div style={{ padding: "8px 12px 12px", background: "var(--bg2)" }}>
-                  {(col.suites || []).map((su: any) => (
-                    <div key={su.id} style={{ marginTop: 8, marginLeft: 8, borderLeft: "2px solid rgba(0,229,160,.25)", paddingLeft: 10 }}>
-                      <div
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => toggle(`s-${su.id}`)}
-                        onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`s-${su.id}`); } }}
-                        style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "6px 0" }}
-                      >
-                        <span style={{ fontSize: 12, color: "var(--muted)", width: 16 }}>{exp[`s-${su.id}`] ? "▼" : "▶"}</span>
-                        <span style={{ fontWeight: 600, fontSize: 12 }}>📋 {su.name}</span>
-                        <span style={{ fontSize: 10, color: "var(--muted)" }}>{su.total_tests} tests · {su.pass_rate}%</span>
-                      </div>
-                      {exp[`s-${su.id}`] && (
-                        <div style={{ marginLeft: 12 }}>
-                          {(su.tests || []).map((te: any) => (
-                            <div key={te.id} style={{ marginTop: 8, border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden" }}>
-                              <div
-                                role="button"
-                                tabIndex={0}
-                                onClick={() => toggle(`t-${te.id}`)}
-                                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`t-${te.id}`); } }}
-                                style={{ padding: "8px 10px", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", background: "rgba(0,0,0,.15)" }}
-                              >
-                                <span style={{ fontSize: 11, color: "var(--muted)", width: 14 }}>{exp[`t-${te.id}`] ? "▼" : "▶"}</span>
-                                <div style={{ flex: 1, fontSize: 12 }}>{te.name}</div>
-                                <div className={`dot ${te.latest_status === "passed" ? "dot-green" : te.latest_status === "failed" || te.latest_status === "error" ? "dot-danger" : te.latest_status === "not_run" ? "dot-gray" : "dot-warn"}`} />
-                                <span style={{ fontSize: 10, color: "var(--muted)" }}>{te.latest_status} · {te.steps_count} steps</span>
-                              </div>
-                              {exp[`t-${te.id}`] && (
-                                <div style={{ padding: 8, fontSize: 11 }}>
-                                  {(te.runs || []).length === 0 && <div style={{ color: "var(--muted)" }}>No runs yet</div>}
-                                  {(te.runs || []).map((run: any) => (
-                                    <div key={run.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, padding: "8px 6px", borderBottom: "1px solid var(--border)" }}>
-                                      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                                        <span style={{ fontFamily: "var(--mono)", color: "var(--accent2)" }}>#{run.id}</span>
-                                        <span className={`run-pct ${run.status === "passed" ? "pct-pass" : "pct-fail"}`} style={{ fontSize: 11 }}>{run.status}</span>
-                                        <span style={{ color: "var(--muted)" }}>{run.platform} · {run.device_target || "default"}</span>
-                                        {run.duration_s != null && <span style={{ color: "var(--muted)" }}>{run.duration_s}s</span>}
-                                        {run.passed_steps != null && run.total_steps != null && (
-                                          <span style={{ color: "var(--muted)" }}>{run.passed_steps}/{run.total_steps} steps</span>
-                                        )}
-                                        <div style={{ display: "flex", gap: 4 }}>
-                                          {(run.screenshots || []).slice(0, 4).map((name: string, i: number) => (
-                                            <img key={i} src={`/api/artifacts/${project.id}/${run.id}/${encodeURIComponent(name)}`} alt="" style={{ width: 40, height: 72, objectFit: "cover", borderRadius: 4, border: "1px solid var(--border)" }} />
-                                          ))}
-                                        </div>
-                                      </div>
-                                      <button className="btn-ghost btn-sm" style={{ fontSize: 10, alignSelf: "start" }} onClick={() => exportRunHtml(run, te.name)}>⬇ Run</button>
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
+          {/* Metrics */}
+          <div className="report-metrics">
+            <div className="metric-card"><div className="metric-val">{suiteData.metrics.total}</div><div className="metric-lbl">Total</div></div>
+            <div className="metric-card"><div className="metric-val" style={{ color: "var(--accent)" }}>{suiteData.metrics.passing}</div><div className="metric-lbl">Passing</div></div>
+            <div className="metric-card"><div className="metric-val" style={{ color: "var(--danger)" }}>{suiteData.metrics.failing}</div><div className="metric-lbl">Failing</div></div>
+            <div className="metric-card"><div className="metric-val" style={{ color: "var(--warn)" }}>{suiteData.metrics.flaky}</div><div className="metric-lbl">Flaky</div></div>
+            <div className="metric-card"><div className="metric-val">{suiteData.metrics.never_run}</div><div className="metric-lbl">Never Ran</div></div>
+            <div className="metric-card"><div className="metric-val">{suiteData.metrics.avg_steps_pct}%</div><div className="metric-lbl">Avg Steps</div></div>
+          </div>
 
-      <div className="panel">
-        <div className="panel-header"><div className="panel-title">Recent runs (flat)</div></div>
-        <div className="panel-body">
-          {runs.slice(0, 50).map(r => (
-            <div key={r.id} className="run-row">
-              <div className={`status-icon ${statusIcon(r.status)}`} />
-              <div><div className="run-name">{tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}</div><div className="run-meta">{r.device_target || "default"} · {r.platform}</div></div>
-              <div className={`run-pct ${r.status === "passed" ? "pct-pass" : "pct-fail"}`}>{r.status}</div>
-              <div className="run-tag">{r.platform}</div>
-              <div className="run-dur">{ago(r.finished_at || r.started_at)}</div>
-            </div>
-          ))}
-        </div>
-      </div>
+          {/* Tabs */}
+          <div className="report-tabs">
+            {["health", "charts", "matrix", "triage", "export"].map(t => (
+              <button key={t} className={`report-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>{t.charAt(0).toUpperCase() + t.slice(1)}</button>
+            ))}
+          </div>
+
+          {tab === "health" && renderHealthList()}
+          {tab === "charts" && renderCharts()}
+          {tab === "matrix" && renderMatrix()}
+          {tab === "triage" && renderTriage()}
+          {tab === "export" && renderExport()}
+        </>
+      )}
     </>
   );
 }
@@ -3283,6 +3926,7 @@ function SettingsView() {
                 <div className="form-row">
                   <div className="form-group"><div className="form-label">Base URL</div><input className={`form-input${s.confluence_url ? " connected" : ""}`} value={s.confluence_url || ""} onChange={e => upd("confluence_url", e.target.value)} placeholder="https://your-domain.atlassian.net/wiki" /></div>
                   <div className="form-group"><div className="form-label">API Token</div><input className={`form-input${s.confluence_token ? " connected" : ""}`} type="password" value={s.confluence_token || ""} onChange={e => upd("confluence_token", e.target.value)} />{confSt && <div className={`conn-status${confSt.startsWith("✓") ? "" : " err"}`}>{confSt}</div>}</div>
+                  <div className="form-group"><div className="form-label">Space key (optional)</div><input className="form-input" value={s.confluence_space_key || ""} onChange={e => upd("confluence_space_key", e.target.value)} placeholder="e.g. DEV — leave blank to use first space" /></div>
                 </div>
                 <button className="btn-ghost btn-sm" onClick={async () => { setConfSt("Testing..."); try { const r = await api.testConfluence(); setConfSt(r.ok ? `✓ ${r.message}` : r.message); } catch (e: any) { setConfSt(e.message); } }}>Test Connection</button>
               </div>
