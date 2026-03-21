@@ -81,7 +81,8 @@ class TestDefinition(Base):
     suite_id: Mapped[Optional[int]] = mapped_column(ForeignKey("test_suites.id", ondelete="SET NULL"), nullable=True)
     prerequisite_test_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tests.id", ondelete="SET NULL"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
-    steps: Mapped[list[dict]] = mapped_column(JSON)
+    steps: Mapped[list[dict]] = mapped_column(JSON)  # legacy; kept in sync with platform_steps["android"]
+    platform_steps: Mapped[dict] = mapped_column(JSON, default=dict)  # {"android": [...], "ios_sim": [...]}
     acceptance_criteria: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Source of truth: what this test must validate
     fix_history: Mapped[list[dict]] = mapped_column(JSON, default=list)  # [{analysis, fixed_steps, changes, run_id?, created_at}]
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -139,6 +140,25 @@ def init_db() -> None:
         con.commit()
     if "acceptance_criteria" not in cols:
         cur.execute("ALTER TABLE tests ADD COLUMN acceptance_criteria TEXT")
+        con.commit()
+    if "platform_steps" not in cols:
+        cur.execute("ALTER TABLE tests ADD COLUMN platform_steps JSON DEFAULT '{}'")
+        con.commit()
+        import json as _json
+
+        rows = cur.execute("SELECT id, steps FROM tests WHERE steps IS NOT NULL").fetchall()
+        for test_id, steps_raw in rows:
+            try:
+                if isinstance(steps_raw, str):
+                    steps = _json.loads(steps_raw)
+                else:
+                    steps = steps_raw
+                if not steps:
+                    continue
+                platform_steps = _json.dumps({"android": steps, "ios_sim": []})
+                cur.execute("UPDATE tests SET platform_steps = ? WHERE id = ?", (platform_steps, test_id))
+            except Exception:
+                pass
         con.commit()
     con.close()
 

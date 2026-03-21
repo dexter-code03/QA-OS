@@ -16,6 +16,7 @@ export type TestDef = {
   prerequisite_test_id?: number | null;
   name: string;
   steps: Array<Record<string, unknown>>;
+  platform_steps?: { android?: Array<Record<string, unknown>>; ios_sim?: Array<Record<string, unknown>> };
   acceptance_criteria?: string | null;
   fix_history?: Array<Record<string, unknown>>;
   created_at: string;
@@ -39,6 +40,23 @@ export type DeviceList = {
   ios_simulators: Array<{ udid: string; name: string; state: string; runtime: string }>;
 };
 
+export type TapDiagnosisOut = {
+  found: boolean;
+  root_cause: string;
+  root_cause_detail: string;
+  is_clickable: boolean;
+  is_visible: boolean;
+  recommended_wait_ms: number;
+  suggestions: { strategy: string; value: string; score: number; label: string }[];
+};
+
+export type AiFixResponse = {
+  analysis: string;
+  fixed_steps: any[];
+  changes: any[];
+  tap_diagnosis: TapDiagnosisOut | null;
+};
+
 let authBootstrapped = false;
 let authBootstrapPromise: Promise<string> | null = null;
 
@@ -58,6 +76,64 @@ async function bootstrapAuth(force = false): Promise<string> {
     });
 
   return authBootstrapPromise;
+}
+
+export type UploadProgressOpts = { onUploadProgress?: (pct: number | null) => void };
+
+function errorFromResponseText(raw: string, status: number): Error {
+  try {
+    const j = JSON.parse(raw) as { detail?: unknown };
+    if (j.detail != null) {
+      return new Error(typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail));
+    }
+  } catch {
+    /* not JSON */
+  }
+  return new Error(raw || `Request failed (${status})`);
+}
+
+/** Multipart POST with upload byte progress (0–100 when length-computable). */
+async function xhrPostFormDataJson<T>(
+  url: string,
+  buildFormData: () => FormData,
+  onUploadProgress?: (pct: number | null) => void,
+): Promise<T> {
+  await bootstrapAuth();
+  const exec = () =>
+    new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.withCredentials = true;
+      xhr.upload.onloadstart = () => {
+        onUploadProgress?.(0);
+      };
+      xhr.upload.onprogress = (ev) => {
+        if (!onUploadProgress) return;
+        if (ev.lengthComputable && ev.total > 0) {
+          onUploadProgress(Math.min(100, Math.round((100 * ev.loaded) / ev.total)));
+        } else {
+          onUploadProgress(null);
+        }
+      };
+      xhr.onload = () => resolve({ status: xhr.status, text: xhr.responseText || "" });
+      xhr.onerror = () => reject(new Error("Network error during upload"));
+      if (onUploadProgress) {
+        onUploadProgress(0);
+      }
+      xhr.send(buildFormData());
+    });
+
+  let { status, text } = await exec();
+  if (status === 401) {
+    await bootstrapAuth(true);
+    ({ status, text } = await exec());
+  }
+  if (status < 200 || status >= 300) throw errorFromResponseText(text, status);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error("Invalid JSON from server");
+  }
 }
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -83,7 +159,19 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
       credentials: "same-origin",
     });
   }
-  if (!res.ok) throw new Error(await res.text());
+  if (!res.ok) {
+    const raw = await res.text();
+    let body: { detail?: unknown } | undefined;
+    try {
+      body = JSON.parse(raw) as { detail?: unknown };
+    } catch {
+      /* not JSON */
+    }
+    if (body?.detail != null) {
+      throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
+    }
+    throw new Error(raw || `Request failed (${res.status})`);
+  }
   return (await res.json()) as T;
 }
 
@@ -139,20 +227,177 @@ export const api = {
 
   // Tests
   listTests: (projectId: number) => http<TestDef[]>(`/api/projects/${projectId}/tests`),
-  createTest: (projectId: number, payload: { name: string; steps: any[]; suite_id?: number | null; prerequisite_test_id?: number | null; acceptance_criteria?: string | null }) =>
-    http<TestDef>(`/api/projects/${projectId}/tests`, { method: "POST", body: JSON.stringify(payload) }),
-  updateTest: (testId: number, payload: { name?: string; steps?: any[]; suite_id?: number | null; prerequisite_test_id?: number | null; acceptance_criteria?: string | null }) =>
-    http<TestDef>(`/api/tests/${testId}`, { method: "PUT", body: JSON.stringify(payload) }),
+  createTest: (
+    projectId: number,
+    payload: {
+      name: string;
+      steps?: any[];
+      platform_steps?: { android?: any[]; ios_sim?: any[] };
+      suite_id?: number | null;
+      prerequisite_test_id?: number | null;
+      acceptance_criteria?: string | null;
+    },
+  ) => http<TestDef>(`/api/projects/${projectId}/tests`, { method: "POST", body: JSON.stringify(payload) }),
+  updateTest: (
+    testId: number,
+    payload: {
+      name?: string;
+      steps?: any[];
+      platform?: "android" | "ios_sim";
+      platform_steps?: { android?: any[]; ios_sim?: any[] };
+      suite_id?: number | null;
+      prerequisite_test_id?: number | null;
+      acceptance_criteria?: string | null;
+    },
+  ) => http<TestDef>(`/api/tests/${testId}`, { method: "PUT", body: JSON.stringify(payload) }),
   deleteTest: (testId: number) =>
     http<{ ok: boolean }>(`/api/tests/${testId}`, { method: "DELETE" }),
   getRelatedTests: (testId: number) =>
     http<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] }>(`/api/tests/${testId}/related`),
-  applyFixToRelated: (testId: number, payload: { fixed_steps: any[]; prefix_length: number; original_steps: any[]; test_ids?: number[] }) =>
+  applyFixToRelated: (testId: number, payload: { fixed_steps: any[]; prefix_length: number; original_steps: any[]; test_ids?: number[]; target_platform?: "android" | "ios_sim" }) =>
     http<{ updated_test_ids: number[] }>(`/api/tests/${testId}/apply-fix-to-related`, { method: "POST", body: JSON.stringify(payload) }),
-  appendFixHistory: (testId: number, payload: { analysis: string; fixed_steps: any[]; changes: any[]; run_id?: number; steps_before_fix?: any[] }) =>
+  appendFixHistory: (testId: number, payload: { analysis: string; fixed_steps: any[]; changes: any[]; run_id?: number; steps_before_fix?: any[]; target_platform?: "android" | "ios_sim" }) =>
     http<{ ok: boolean }>(`/api/tests/${testId}/append-fix-history`, { method: "POST", body: JSON.stringify(payload) }),
   undoLastFix: (testId: number) =>
-    http<{ ok: boolean; steps: any[] }>(`/api/tests/${testId}/undo-last-fix`, { method: "POST" }),
+    http<{ ok: boolean; steps: any[]; target_platform?: string }>(`/api/tests/${testId}/undo-last-fix`, { method: "POST" }),
+
+  // Script / sheet import (preview → confirm)
+  importScript: async (
+    projectId: number,
+    suiteId: number,
+    platform: string,
+    file: File,
+    opts?: UploadProgressOpts,
+  ) => {
+    const url = `/api/projects/${projectId}/import/script?suite_id=${suiteId}&platform=${encodeURIComponent(platform)}`;
+    return xhrPostFormDataJson<{
+      test_cases: any[];
+      filename: string;
+      warnings: string[];
+      katalon_import_mode?: "ai" | "heuristic";
+    }>(
+      url,
+      () => {
+        const fd = new FormData();
+        fd.append("file", file);
+        return fd;
+      },
+      opts?.onUploadProgress,
+    );
+  },
+
+  confirmScriptImport: (projectId: number, payload: { suite_id: number | null; test_cases: any[] }) =>
+    http<{ created: number; tests: { id: number; name: string }[] }>(
+      `/api/projects/${projectId}/import/script/confirm`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  importSheet: async (
+    projectId: number,
+    suiteId: number,
+    platform: string,
+    file: File,
+    opts?: UploadProgressOpts,
+  ) => {
+    const url = `/api/projects/${projectId}/import/sheet?suite_id=${suiteId}&platform=${encodeURIComponent(platform)}`;
+    return xhrPostFormDataJson<{
+      test_cases: any[];
+      filename: string;
+      row_count: number;
+      scripts?: { name: string; content: string }[];
+      warnings?: string[];
+    }>(url, () => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return fd;
+    }, opts?.onUploadProgress);
+  },
+
+  getReportsHierarchy: (projectId: number) => http<any>(`/api/projects/${projectId}/reports/hierarchy`),
+
+  importZip: async (projectId: number, platform: string, file: File, opts?: UploadProgressOpts) => {
+    const url = `/api/projects/${projectId}/import/zip?platform=${encodeURIComponent(platform)}`;
+    return xhrPostFormDataJson<{
+      groups: Record<string, any[]>;
+      total_cases: number;
+      total_files: number;
+      warnings: string[];
+      files: { path: string; cases_count: number; status: string }[];
+    }>(url, () => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return fd;
+    }, opts?.onUploadProgress);
+  },
+
+  confirmZipImport: (
+    projectId: number,
+    payload: { suite_map?: Record<string, number>; module_id?: number; test_cases: any[]; platform: string },
+  ) =>
+    http<{ created: number; created_suites: string[]; tests: any[] }>(
+      `/api/projects/${projectId}/import/zip/confirm`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  importFolder: async (
+    projectId: number,
+    platform: string,
+    files: File[] | FileList,
+    opts?: UploadProgressOpts,
+  ) => {
+    const list = Array.isArray(files) ? files : Array.from(files);
+    if (!list.length) {
+      throw new Error("No files to upload — folder picker returned empty (try Browse folder again).");
+    }
+    const url = `/api/projects/${projectId}/import/folder?platform=${encodeURIComponent(platform)}`;
+    return xhrPostFormDataJson<{
+      groups: Record<string, any[]>;
+      total_cases: number;
+      total_files: number;
+      warnings: string[];
+      files: { path: string; cases_count: number; status: string }[];
+    }>(
+      url,
+      () => {
+        const fd = new FormData();
+        for (const f of list) {
+          const rel = ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, "/");
+          fd.append("files", f, rel);
+        }
+        return fd;
+      },
+      opts?.onUploadProgress,
+    );
+  },
+
+  downloadKatalonZip: async (
+    projectId: number,
+    payload: { test_case_ids?: number[]; test_cases?: any[]; project_name: string },
+  ) => {
+    await bootstrapAuth();
+    let res = await fetch(`/api/projects/${projectId}/generate/katalon-zip`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(payload),
+    });
+    if (res.status === 401) {
+      await bootstrapAuth(true);
+      res = await fetch(`/api/projects/${projectId}/generate/katalon-zip`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify(payload),
+      });
+    }
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const safe = (payload.project_name || "QA_Project").replace(/\s+/g, "_");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${safe}_katalon.zip`;
+    a.click();
+  },
 
   // Runs
   listRuns: (projectId: number) => http<Run[]>(`/api/projects/${projectId}/runs`),
@@ -212,8 +457,9 @@ export const api = {
     already_tried_fixes?: any[];
     acceptance_criteria?: string;
     app_context?: string;
+    target_platform?: string;
   }) =>
-    http<{ analysis: string; fixed_steps: any[]; changes: any[] }>("/api/ai/fix-steps", {
+    http<AiFixResponse>("/api/ai/fix-steps", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -233,8 +479,9 @@ export const api = {
     previous_fixed_steps: any[];
     previous_changes: any[];
     user_suggestion: string;
+    target_platform?: string;
   }) =>
-    http<{ analysis: string; fixed_steps: any[]; changes: any[] }>("/api/ai/refine-fix", {
+    http<AiFixResponse>("/api/ai/refine-fix", {
       method: "POST",
       body: JSON.stringify(payload),
     }),

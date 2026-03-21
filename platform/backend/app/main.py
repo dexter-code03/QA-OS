@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -35,13 +35,25 @@ from .schemas import (
     RunOut,
 )
 from .settings import ensure_dirs, load_encrypted_json, save_encrypted_json, settings
+from .parser.script_generator import generate_katalon_zip, safe_katalon_name, steps_to_groovy
+from .parser.script_parser import (
+    group_steps_into_test_cases,
+    katalon_or_leaves_and_aliases,
+    parse_groovy,
+    parse_gherkin,
+    parse_test_sheet,
+    sheet_row_combined_steps,
+)
+from .parser.zip_importer import ParsedFile, extract_folder_name, parse_folder_files, parse_zip
+from .runner.appium_service import ensure_appium_running
 from .runner.engine import run_engine
+from .runner.tap_debugger import diagnose_tap_failure
 from pydantic import BaseModel
 
 
 app = FastAPI(title="QA Platform (Local Appium TestOps)", version="0.1.0")
 
-ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173"]
+ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173", "http://127.0.0.1:5174", "http://localhost:5174"]
 AUTH_COOKIE_NAME = "qa_os_token"
 AUTH_TOKEN_FILE = settings.data_dir / "token.txt"
 
@@ -67,6 +79,41 @@ def _ai_creds(s: dict | None = None) -> tuple[str, str]:
     key = s.get("ai_api_key") or s.get("ai_key") or ""
     model = s.get("ai_model") or "gemini-2.5-flash"
     return key, model
+
+
+def _gemini_extract_text(data: dict[str, Any]) -> str:
+    """Pull model text from generateContent JSON; raise HTTPException with a clear message if unusable."""
+    err = data.get("error")
+    if err:
+        if isinstance(err, dict):
+            msg = str(err.get("message", json.dumps(err)[:400]))
+        else:
+            msg = str(err)
+        raise HTTPException(status_code=502, detail=f"Gemini API error: {msg}")
+    cands = data.get("candidates")
+    if not cands:
+        fb = data.get("promptFeedback")
+        extra = json.dumps(fb)[:500] if fb else "(none)"
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini returned no candidates — often quota, safety block, or wrong model id. "
+                f"Check Settings → AI model name and API key. promptFeedback={extra}"
+            ),
+        )
+    first = cands[0]
+    content = first.get("content") or {}
+    parts = content.get("parts") or []
+    if not parts:
+        reason = first.get("finishReason", "")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned no text (finishReason={reason}). Try again or shorten screenshot/XML payload.",
+        )
+    text = parts[0].get("text")
+    if not text:
+        raise HTTPException(status_code=502, detail="Gemini returned an empty text part.")
+    return text
 
 
 def _save_settings(data: dict) -> None:
@@ -262,7 +309,7 @@ def list_devices() -> dict[str, Any]:
 async def test_appium() -> dict[str, Any]:
     s = _load_settings()
     host = s.get("appium_host", settings.appium_host)
-    port = s.get("appium_port", settings.appium_port)
+    port = int(s.get("appium_port", settings.appium_port))
     url = f"http://{host}:{port}/status"
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -271,6 +318,15 @@ async def test_appium() -> dict[str, Any]:
                 return {"ok": True, "message": f"Appium is running at {host}:{port}"}
             return {"ok": False, "message": f"Appium returned HTTP {r.status_code}"}
     except Exception as e:
+        handle = ensure_appium_running(host=host, port=port)
+        if handle is not None:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(url)
+                    if r.status_code == 200:
+                        return {"ok": True, "message": f"Started Appium at {host}:{port}"}
+            except Exception:
+                pass
         return {"ok": False, "message": f"Cannot reach Appium at {host}:{port}: {e}"}
 
 
@@ -438,7 +494,18 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                 if not isinstance(steps, list):
                     continue
                 ac = tc.get("acceptance_criteria") or payload.prompt[:2000]
-                t = TestDefinition(project_id=payload.project_id, suite_id=payload.suite_id, name=name, steps=steps, acceptance_criteria=ac)
+                plat = payload.platform if payload.platform in ("android", "ios_sim") else "android"
+                ps = {"android": [], "ios_sim": []}
+                ps[plat] = list(steps)
+                legacy_android = list(ps.get("android") or [])
+                t = TestDefinition(
+                    project_id=payload.project_id,
+                    suite_id=payload.suite_id,
+                    name=name,
+                    steps=legacy_android,
+                    platform_steps=ps,
+                    acceptance_criteria=ac,
+                )
                 db.add(t)
                 db.commit()
                 db.refresh(t)
@@ -453,6 +520,78 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
 
 # ── AI Fix Failed Steps ───────────────────────────────────────────────
 
+
+def _build_tap_diagnosis_for_ai(
+    failed_step: dict[str, Any],
+    failed_step_index: int,
+    all_steps: list[dict[str, Any]],
+    step_results: list[dict[str, Any]],
+    page_source_xml: str,
+) -> tuple[dict[str, Any] | None, str]:
+    tap_diagnosis: dict[str, Any] | None = None
+    tap_diagnosis_text = ""
+    if failed_step.get("type") not in ("tap", "type", "waitForVisible", "assertVisible"):
+        return tap_diagnosis, tap_diagnosis_text
+    sel = failed_step.get("selector") or {}
+    strategy = sel.get("using", "accessibilityId")
+    value = (sel.get("value") or "").strip()
+    if not value or not page_source_xml:
+        return tap_diagnosis, tap_diagnosis_text
+
+    diag = diagnose_tap_failure(
+        strategy=strategy,
+        value=value,
+        page_source_xml=page_source_xml,
+        step_index=failed_step_index,
+        all_steps=all_steps,
+        step_results=step_results,
+    )
+
+    tap_diagnosis = {
+        "found": diag.found,
+        "root_cause": diag.root_cause,
+        "root_cause_detail": diag.root_cause_detail,
+        "is_clickable": diag.is_clickable,
+        "is_visible": diag.is_visible,
+        "recommended_wait_ms": diag.recommended_wait_ms,
+        "suggestions": [
+            {"strategy": s.strategy, "value": s.value, "score": s.score, "label": s.label}
+            for s in diag.suggestions
+        ],
+    }
+
+    rc_map = {
+        "wrong_selector": "WRONG SELECTOR — the element exists but the selector strategy is wrong",
+        "timing_race": "TIMING — the element exists but was not yet rendered when Appium looked for it",
+        "scrolled_off": "SCROLLED — element is in the page source but outside the visible viewport",
+        "overlay_blocking": "OVERLAY — a dialog or loading screen is blocking the element",
+        "element_disabled": "DISABLED — element found but enabled=false",
+        "wrong_screen": "WRONG SCREEN — the app navigated to an unexpected page",
+        "element_missing": "MISSING — element not present in the page source at all",
+    }
+    tap_diagnosis_text = (
+        f"\n=== TAP DEBUGGER DIAGNOSIS (run BEFORE this prompt) ===\n"
+        f"Root cause: {rc_map.get(diag.root_cause, diag.root_cause)}\n"
+        f"Detail: {diag.root_cause_detail}\n"
+        f"Element found in XML: {diag.found}\n"
+    )
+    if diag.suggestions:
+        tap_diagnosis_text += "Working selectors ranked by reliability:\n"
+        for sug in diag.suggestions[:3]:
+            tap_diagnosis_text += f"  - {sug.strategy}='{sug.value}' ({sug.score}% reliable)\n"
+    if diag.recommended_wait_ms:
+        tap_diagnosis_text += f"Recommended: add waitForVisible {diag.recommended_wait_ms}ms before tap\n"
+    tap_diagnosis_text += (
+        "\nUSE THE DIAGNOSIS ABOVE. Do not guess selectors — pick from the working list when suggestions exist.\n"
+        "If root_cause is timing, insert a waitForVisible step before the tap.\n"
+        "If root_cause is wrong_selector, replace the selector with the highest-scored suggestion.\n"
+        "If root_cause is scrolled, insert a swipe step before the tap.\n"
+        "=== END DIAGNOSIS ===\n"
+    )
+
+    return tap_diagnosis, tap_diagnosis_text
+
+
 class FixStepsRequest(BaseModel):
     platform: str
     original_steps: list[dict[str, Any]]
@@ -465,6 +604,7 @@ class FixStepsRequest(BaseModel):
     already_tried_fixes: list[dict[str, Any]] = []  # [{analysis, fixed_steps}, ...] from test.fix_history
     acceptance_criteria: str = ""  # Source of truth: what this test must validate (from test definition)
     app_context: str = ""  # App name, package, etc. from build metadata for correct context
+    target_platform: str = "android"  # slot the fixed steps will be saved into
 
 
 @app.post("/api/ai/fix-steps")
@@ -476,6 +616,14 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
     failed_step = payload.original_steps[payload.failed_step_index] if payload.failed_step_index < len(payload.original_steps) else {}
+
+    tap_diagnosis, tap_diagnosis_text = _build_tap_diagnosis_for_ai(
+        failed_step,
+        payload.failed_step_index,
+        payload.original_steps,
+        payload.step_results,
+        payload.page_source_xml,
+    )
 
     passed_steps = []
     for i, r in enumerate(payload.step_results):
@@ -527,6 +675,8 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
 
     user_msg = (
         f"Platform: {payload.platform}\n"
+        f"Target automation: {payload.target_platform} (use selectors appropriate for this stack: "
+        f"Android UiAutomator2 vs iOS XCUITest)\n"
         f"Test: {payload.test_name}\n"
     )
     if payload.app_context:
@@ -550,6 +700,9 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         f"Step definition: {json.dumps(failed_step, indent=2)}\n"
         f"Error: {payload.error_message}\n"
     )
+
+    if tap_diagnosis_text:
+        user_msg += tap_diagnosis_text
 
     if payload.acceptance_criteria:
         user_msg += f"\n=== SOURCE OF TRUTH / ACCEPTANCE CRITERIA (DO NOT VIOLATE) ===\n{payload.acceptance_criteria}\n\n"
@@ -585,7 +738,7 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = _gemini_extract_text(data)
             parsed = json.loads(text)
             fixed = parsed.get("fixed_steps")
             if not isinstance(fixed, list):
@@ -594,9 +747,12 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
                 "analysis": parsed.get("analysis", ""),
                 "fixed_steps": fixed,
                 "changes": parsed.get("changes", []),
+                "tap_diagnosis": tap_diagnosis,
             }
     except HTTPException:
         raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {e}. Try again or switch model.")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI fix call failed: {e}")
 
@@ -618,6 +774,7 @@ class RefineFixRequest(BaseModel):
     previous_fixed_steps: list[dict[str, Any]] = []
     previous_changes: list[dict[str, Any]] = []
     user_suggestion: str = ""
+    target_platform: str = "android"
 
 
 @app.post("/api/ai/refine-fix")
@@ -628,7 +785,28 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
-    failed_step = payload.original_steps[payload.failed_step_index] if payload.failed_step_index < len(payload.original_steps) else {}
+    failed_step_original = (
+        payload.original_steps[payload.failed_step_index]
+        if payload.failed_step_index < len(payload.original_steps)
+        else {}
+    )
+    if (
+        payload.previous_fixed_steps
+        and payload.failed_step_index < len(payload.previous_fixed_steps)
+    ):
+        failed_step_for_diag = payload.previous_fixed_steps[payload.failed_step_index]
+        all_steps_for_diag = payload.previous_fixed_steps
+    else:
+        failed_step_for_diag = failed_step_original
+        all_steps_for_diag = payload.original_steps
+
+    tap_diagnosis, tap_diagnosis_text = _build_tap_diagnosis_for_ai(
+        failed_step_for_diag,
+        payload.failed_step_index,
+        all_steps_for_diag,
+        payload.step_results,
+        payload.page_source_xml,
+    )
 
     system_prompt = (
         "You are a senior mobile QA automation engineer. The user has already received an AI-generated fix for a failed Appium test, "
@@ -649,7 +827,11 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
         "fixed_steps must be the COMPLETE list. No markdown."
     )
 
-    user_msg = f"Platform: {payload.platform}\nTest: {payload.test_name}\n"
+    user_msg = (
+        f"Platform: {payload.platform}\n"
+        f"Target automation: {payload.target_platform} (Android UiAutomator2 vs iOS XCUITest)\n"
+        f"Test: {payload.test_name}\n"
+    )
     if payload.app_context:
         user_msg += f"App context: {payload.app_context}\n"
     user_msg += (
@@ -665,8 +847,12 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
 
     user_msg += (
         f"\n=== FAILED AT STEP {payload.failed_step_index} ===\n"
+        f"Step definition (current fix at failure index): {json.dumps(failed_step_for_diag, indent=2)}\n"
         f"Error: {payload.error_message}\n\n"
     )
+    if tap_diagnosis_text:
+        user_msg += tap_diagnosis_text
+
     if payload.acceptance_criteria:
         user_msg += f"=== SOURCE OF TRUTH / ACCEPTANCE CRITERIA (DO NOT VIOLATE) ===\n{payload.acceptance_criteria}\n\n"
     if payload.fix_history:
@@ -681,7 +867,7 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
         f"=== USER'S SUGGESTION ===\n{payload.user_suggestion}\n\n"
     )
     if payload.page_source_xml:
-        user_msg += f"=== PAGE SOURCE XML ===\n{payload.page_source_xml[:10000]}\n"
+        user_msg += f"=== PAGE SOURCE XML ===\n{payload.page_source_xml[:12000]}\n"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
@@ -699,7 +885,7 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            text = _gemini_extract_text(data)
             parsed = json.loads(text)
             fixed = parsed.get("fixed_steps")
             if not isinstance(fixed, list):
@@ -708,9 +894,12 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
                 "analysis": parsed.get("analysis", ""),
                 "fixed_steps": fixed,
                 "changes": parsed.get("changes", []),
+                "tap_diagnosis": tap_diagnosis,
             }
     except HTTPException:
         raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"AI returned invalid JSON: {e}. Try again or switch model.")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI refine fix failed: {e}")
 
@@ -1068,14 +1257,27 @@ def list_builds(project_id: int) -> list[BuildOut]:
 
 # ── Tests ─────────────────────────────────────────────────────────────
 
+def _steps_for_platform_record(t: TestDefinition, platform: str) -> list[dict]:
+    ps = getattr(t, "platform_steps", None) or {}
+    if isinstance(ps, dict) and platform in ps and ps[platform]:
+        return list(ps[platform])
+    return list(t.steps or [])
+
+
 def _test_out(t: TestDefinition) -> TestOut:
+    ps = getattr(t, "platform_steps", None) or {}
+    if not isinstance(ps, dict):
+        ps = {}
+    android_steps = list(ps.get("android") or t.steps or [])
+    ios_steps = list(ps.get("ios_sim") or [])
     return TestOut(
         id=t.id,
         project_id=t.project_id,
         suite_id=t.suite_id,
         prerequisite_test_id=t.prerequisite_test_id,
         name=t.name,
-        steps=t.steps,
+        steps=android_steps,
+        platform_steps={"android": android_steps, "ios_sim": ios_steps},
         acceptance_criteria=getattr(t, "acceptance_criteria", None),
         fix_history=getattr(t, "fix_history", None) or [],
         created_at=t.created_at,
@@ -1088,12 +1290,22 @@ def create_test(project_id: int, payload: TestCreate) -> TestOut:
         p = db.query(Project).filter(Project.id == project_id).first()
         if not p:
             raise HTTPException(status_code=404, detail="Project not found")
+        ps: dict = dict(payload.platform_steps or {})
+        legacy = list(payload.steps or [])
+        if legacy and not ps.get("android"):
+            ps["android"] = legacy
+        if "android" not in ps:
+            ps["android"] = []
+        if "ios_sim" not in ps:
+            ps["ios_sim"] = []
+        android = list(ps.get("android") or [])
         t = TestDefinition(
             project_id=project_id,
             suite_id=payload.suite_id,
             prerequisite_test_id=payload.prerequisite_test_id,
             name=payload.name,
-            steps=payload.steps,
+            steps=android,
+            platform_steps=ps,
             acceptance_criteria=payload.acceptance_criteria,
         )
         db.add(t)
@@ -1118,14 +1330,31 @@ def update_test(test_id: int, payload: TestUpdate, request: Request) -> TestOut:
         provided = payload.model_fields_set
         if "name" in provided and payload.name is not None:
             t.name = payload.name
-        if "steps" in provided and payload.steps is not None:
-            t.steps = payload.steps
         if "suite_id" in provided:
             t.suite_id = payload.suite_id
         if "prerequisite_test_id" in provided:
             t.prerequisite_test_id = payload.prerequisite_test_id
         if "acceptance_criteria" in provided:
             t.acceptance_criteria = payload.acceptance_criteria
+
+        if "platform_steps" in provided and payload.platform_steps is not None:
+            current_ps = dict(t.platform_steps or {})
+            for k, v in payload.platform_steps.items():
+                if isinstance(v, list):
+                    current_ps[str(k)] = v
+            t.platform_steps = current_ps
+            if "android" in current_ps:
+                t.steps = list(current_ps["android"])
+        elif "steps" in provided and payload.steps is not None:
+            target_pf = payload.platform or "android"
+            if target_pf not in ("android", "ios_sim"):
+                target_pf = "android"
+            current_ps = dict(t.platform_steps or {})
+            current_ps[target_pf] = list(payload.steps)
+            t.platform_steps = current_ps
+            if target_pf == "android":
+                t.steps = list(payload.steps)
+
         db.commit()
         db.refresh(t)
         return _test_out(t)
@@ -1137,6 +1366,7 @@ class AppendFixHistoryRequest(BaseModel):
     changes: list[dict[str, Any]] = []
     run_id: Optional[int] = None
     steps_before_fix: Optional[list[dict[str, Any]]] = None
+    target_platform: str = "android"
 
 
 @app.post("/api/tests/{test_id}/append-fix-history")
@@ -1147,11 +1377,13 @@ def append_fix_history(test_id: int, payload: AppendFixHistoryRequest) -> dict[s
         if not t:
             raise HTTPException(status_code=404, detail="Test not found")
         history = list(getattr(t, "fix_history", None) or [])
+        tp = payload.target_platform if payload.target_platform in ("android", "ios_sim") else "android"
         entry = {
             "analysis": payload.analysis[:500],
             "fixed_steps": payload.fixed_steps,
             "changes": payload.changes,
             "run_id": payload.run_id,
+            "target_platform": tp,
             "created_at": datetime.utcnow().isoformat(),
         }
         if payload.steps_before_fix is not None:
@@ -1164,7 +1396,7 @@ def append_fix_history(test_id: int, payload: AppendFixHistoryRequest) -> dict[s
 
 @app.post("/api/tests/{test_id}/undo-last-fix")
 def undo_last_fix(test_id: int) -> dict[str, Any]:
-    """Revert test steps to before the last AI fix. Removes last fix_history entry."""
+    """Revert steps for the platform recorded on the last fix. Removes last fix_history entry."""
     with SessionLocal() as db:
         t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
         if not t:
@@ -1173,13 +1405,20 @@ def undo_last_fix(test_id: int) -> dict[str, Any]:
         if not history:
             raise HTTPException(status_code=400, detail="No fix history to undo")
         last = history[-1]
+        target_pf = last.get("target_platform") or "android"
+        if target_pf not in ("android", "ios_sim"):
+            target_pf = "android"
         steps_before = last.get("steps_before_fix")
         if steps_before is None:
             raise HTTPException(status_code=400, detail="Cannot undo: previous steps not stored")
-        t.steps = steps_before
+        ps = dict(t.platform_steps or {})
+        ps[target_pf] = list(steps_before)
+        t.platform_steps = ps
+        if target_pf == "android":
+            t.steps = list(steps_before)
         t.fix_history = history[:-1]
         db.commit()
-        return {"ok": True, "steps": t.steps}
+        return {"ok": True, "steps": steps_before, "target_platform": target_pf}
 
 
 @app.delete("/api/tests/{test_id}")
@@ -1225,7 +1464,7 @@ def get_related_tests(test_id: int) -> dict[str, Any]:
         if not t:
             raise HTTPException(status_code=404, detail="Test not found")
         project_id = t.project_id
-        my_steps = list(t.steps or [])
+        my_steps = _steps_for_platform_record(t, "android")
 
         dependents = db.query(TestDefinition).filter(
             TestDefinition.project_id == project_id,
@@ -1241,7 +1480,7 @@ def get_related_tests(test_id: int) -> dict[str, Any]:
         for o in others:
             if o.id in dep_ids:
                 continue
-            other_steps = list(o.steps or [])
+            other_steps = _steps_for_platform_record(o, "android")
             prefix_len = _shared_prefix_length(my_steps, other_steps)
             if prefix_len >= 2:
                 similar.append({"test": _test_out(o), "shared_prefix_length": prefix_len})
@@ -1257,6 +1496,7 @@ class ApplyFixToRelatedRequest(BaseModel):
     prefix_length: int
     original_steps: list[dict[str, Any]]  # steps before fix, for finding similar tests
     test_ids: list[int] = []
+    target_platform: str = "android"
 
 
 @app.post("/api/tests/{test_id}/apply-fix-to-related")
@@ -1268,6 +1508,7 @@ def apply_fix_to_related(test_id: int, payload: ApplyFixToRelatedRequest) -> dic
             raise HTTPException(status_code=404, detail="Test not found")
         project_id = t.project_id
         original = list(payload.original_steps or [])
+        plat = payload.target_platform if payload.target_platform in ("android", "ios_sim") else "android"
 
         related = db.query(TestDefinition).filter(
             TestDefinition.project_id == project_id,
@@ -1282,12 +1523,16 @@ def apply_fix_to_related(test_id: int, payload: ApplyFixToRelatedRequest) -> dic
         for o in related:
             if target_ids is not None and o.id not in target_ids:
                 continue
-            other_steps = list(o.steps or [])
+            other_steps = _steps_for_platform_record(o, plat)
             shared = _shared_prefix_length(original, other_steps)
             if shared < prefix_len:
                 continue
             new_steps = list(payload.fixed_steps[:prefix_len]) + other_steps[prefix_len:]
-            o.steps = new_steps
+            ps = dict(o.platform_steps or {})
+            ps[plat] = new_steps
+            o.platform_steps = ps
+            if plat == "android":
+                o.steps = new_steps
             updated.append(o.id)
 
         db.commit()
@@ -1415,8 +1660,12 @@ def export_katalon(run_id: int):
             "",
         ]
         obj_files: dict[str, str] = {}
+        run_plat = (r.platform or "android") if r else "android"
+        if run_plat not in ("android", "ios_sim"):
+            run_plat = "android"
+        export_steps = _steps_for_platform_record(t, run_plat)
 
-        for i, s in enumerate(t.steps or []):
+        for i, s in enumerate(export_steps):
             stype = s.get("type", "")
             sel = s.get("selector", {})
             using = sel.get("using", "accessibilityId")
@@ -1528,6 +1777,882 @@ def export_katalon(run_id: int):
             media_type="application/zip",
             headers={"Content-Disposition": f"attachment; filename={proj_name}_katalon.zip"},
         )
+
+
+# ── Script / Sheet import & Reports hierarchy ─────────────────────────-
+
+_NO_SELECTOR_STEP_TYPES = frozenset({"wait", "takeScreenshot", "hideKeyboard", "swipe", "gherkin_raw", "python_raw"})
+
+
+def _validate_test_cases(test_cases: list[dict]) -> list[str]:
+    warnings: list[str] = []
+    for tc in test_cases:
+        bad = 0
+        for s in tc.get("steps", []) or []:
+            t = s.get("type")
+            if t in _NO_SELECTOR_STEP_TYPES:
+                continue
+            sel = s.get("selector") or {}
+            if not (isinstance(sel, dict) and sel.get("value")):
+                bad += 1
+        if bad:
+            name = tc.get("name", "?")
+            warnings.append(f"'{name}': {bad} step(s) have empty selectors")
+    return warnings
+
+
+def _groovy_scripts_for_sheet_cases(test_cases: list[dict], filename: str) -> list[dict[str, Any]]:
+    """Katalon Groovy source per test case; mutates each tc with groovy_script."""
+    stem = safe_katalon_name(Path(filename).stem) if filename else "ImportedSheet"
+    scripts: list[dict[str, Any]] = []
+    for tc in test_cases:
+        steps = tc.get("steps") or []
+        name = tc.get("name", "Unnamed")
+        g_content = steps_to_groovy(
+            test_name=name,
+            steps=steps,
+            screen_name=stem,
+            source_hint=f"Generated from {filename or 'sheet'}",
+        )
+        tc["groovy_script"] = g_content
+        scripts.append({"name": safe_katalon_name(name) + ".groovy", "content": g_content})
+    return scripts
+
+
+async def _ai_complete_gherkin(
+    raw_steps: list, platform: str, source: str, api_key: str, model: str
+) -> list[dict]:
+    if not api_key:
+        return [{"name": "Imported from Gherkin", "steps": raw_steps, "import": True, "acceptance_criteria": ""}]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    prompt = (
+        "Convert this Gherkin feature file into Appium test cases. "
+        f"Platform: {platform}. Return ONLY JSON: "
+        '{"test_cases": [{"name": "...", "steps": [...], "acceptance_criteria": "..."}]}. '
+        "Use accessibilityId selectors where possible.\n\n" + source[:6000]
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(url, json=body)
+        if r.status_code != 200:
+            return [{"name": "Imported from Gherkin", "steps": raw_steps, "import": True, "acceptance_criteria": ""}]
+        try:
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+            return [dict(tc, **{"import": True}) for tc in parsed.get("test_cases", [])]
+        except (KeyError, IndexError, json.JSONDecodeError, TypeError):
+            return [{"name": "Imported from Gherkin", "steps": raw_steps, "import": True, "acceptance_criteria": ""}]
+
+
+async def _ai_parse_python_script(source: str, platform: str, api_key: str, model: str) -> list[dict]:
+    if not api_key:
+        return []
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    prompt = (
+        f"Parse this Appium Python test script into test cases for platform {platform}. "
+        "Map driver.find_element, element.click, element.send_keys to tap/type/waitForVisible. "
+        'Return ONLY JSON: {"test_cases": [{"name": "...", "steps": [...], "acceptance_criteria": "..."}]}.\n\n'
+        + source[:6000]
+    )
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.post(url, json=body)
+        if r.status_code != 200:
+            return []
+        try:
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = json.loads(text)
+            return [dict(tc, **{"import": True}) for tc in parsed.get("test_cases", [])]
+        except (KeyError, IndexError, json.JSONDecodeError, TypeError):
+            return []
+
+
+def _normalize_ai_katalon_cases(
+    parsed: dict[str, Any], stem: str, fallback_cases: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    cases = parsed.get("test_cases")
+    if not isinstance(cases, list) or not cases:
+        return None
+    out: list[dict[str, Any]] = []
+    for i, tc in enumerate(cases):
+        if not isinstance(tc, dict):
+            return None
+        name = str(tc.get("name") or "").strip() or stem
+        steps = tc.get("steps")
+        if not isinstance(steps, list) or len(steps) == 0:
+            fb = (
+                fallback_cases[i]
+                if i < len(fallback_cases)
+                else (fallback_cases[0] if fallback_cases else None)
+            )
+            if not fb:
+                return None
+            tc = {**fb, "name": name}
+        else:
+            tc["name"] = name
+        tc["import"] = True
+        tc.setdefault("acceptance_criteria", str(tc.get("acceptance_criteria") or "") or "")
+        out.append(tc)
+    return out
+
+
+def _katalon_ai_locator_looks_like_ui_label(value: str, leaves: set[str]) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return True
+    if v in leaves:
+        return False
+    if re.search(r"\s&\s", v) or "  " in v:
+        return True
+    # Visible copy: phrase with spaces, no OR-style token (underscore / camel prefix)
+    if " " in v and "_" not in v:
+        return True
+    return False
+
+
+def _merge_katalon_ai_steps_with_heuristic(
+    ai_steps: list[dict[str, Any]],
+    heuristic_steps: list[dict[str, Any]],
+    leaves: set[str],
+) -> list[dict[str, Any]]:
+    """Keep AI step types/order where reasonable; restore OR leaf selectors from heuristic when AI used UI labels."""
+    out: list[dict[str, Any]] = []
+    for i, s in enumerate(ai_steps):
+        merged: dict[str, Any] = dict(s)
+        h = heuristic_steps[i] if i < len(heuristic_steps) else None
+        hs = h.get("selector") if h else None
+        hv = hs.get("value") if isinstance(hs, dict) else None
+        sel = merged.get("selector")
+        if isinstance(sel, dict) and isinstance(hs, dict) and hv and str(hv).strip():
+            av = str(sel.get("value") or "").strip()
+            if av != str(hv).strip():
+                if _katalon_ai_locator_looks_like_ui_label(av, leaves) or (hv in leaves and av not in leaves):
+                    merged["selector"] = {
+                        **sel,
+                        "using": hs.get("using") or sel.get("using") or "accessibilityId",
+                        "value": hv,
+                    }
+        elif isinstance(sel, dict) and not str(sel.get("value") or "").strip() and hv:
+            merged["selector"] = dict(hs) if isinstance(hs, dict) else merged.get("selector")
+        out.append(merged)
+    return out
+
+
+def _apply_katalon_locator_snap(
+    ai_cases: list[dict[str, Any]],
+    fallback_cases: list[dict[str, Any]],
+    source: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Snap AI selectors to Object Repository leaves; if AI invents far more steps than the script,
+    trust the rule-based parse for this file (common model failure on callTestCase / imports).
+    """
+    notes: list[str] = []
+    leaves, _ = katalon_or_leaves_and_aliases(source)
+    out: list[dict[str, Any]] = []
+    for ci, tc in enumerate(ai_cases):
+        if not isinstance(tc, dict):
+            out.append(tc)
+            continue
+        fb = (
+            fallback_cases[ci]
+            if ci < len(fallback_cases)
+            else (fallback_cases[0] if fallback_cases else {})
+        )
+        h_steps = (fb.get("steps") or []) if isinstance(fb, dict) else []
+        steps = tc.get("steps") or []
+        if not isinstance(steps, list) or not h_steps:
+            out.append(tc)
+            continue
+        n_ai, n_h = len(steps), len(h_steps)
+        if n_h > 0 and n_ai > max(20, n_h * 3):
+            name = str(tc.get("name") or "?")
+            out.append({**tc, "steps": list(h_steps)})
+            notes.append(
+                f'"{name}": AI produced {n_ai} steps vs {n_h} from script; using rule-based parse '
+                f"(set AI API key and re-import if you need AI — or shorten script for context)."
+            )
+            continue
+        out.append({**tc, "steps": _merge_katalon_ai_steps_with_heuristic(steps, h_steps, leaves)})
+    return out, notes
+
+
+async def _ai_parse_katalon_source(
+    source: str,
+    platform: str,
+    logical_path: str,
+    api_key: str,
+    model: str,
+    fallback_cases: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Parse Katalon Groovy/Java mobile scripts with Gemini; None = caller uses heuristic fallback."""
+    extra_warnings: list[str] = []
+    if not api_key or not source.strip():
+        return None, extra_warnings
+    stem = Path(logical_path).stem or "Imported"
+    max_chars = 56_000
+    src = source if len(source) <= max_chars else source[:max_chars] + "\n\n// ... [truncated for AI context] ...\n"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    system = (
+        "You parse Katalon Studio Mobile test scripts (Groovy/Java calling Mobile.*) into JSON for Appium.\n"
+        f"Target platform: {platform} (android = UiAutomator2, ios_sim = XCUITest).\n\n"
+        "Output ONLY valid JSON:\n"
+        '{"test_cases":[{"name":"...","steps":[...],"acceptance_criteria":"..."}]}\n\n'
+        "Step object shape:\n"
+        '{"type":"tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|hideKeyboard|keyboardAction",'
+        '"selector":{"using":"accessibilityId|id|xpath|className","value":"..."},'
+        '"text":"...","ms":1000,"expect":"..."}\n'
+        "Omit selector on: wait, takeScreenshot, swipe (use text for direction: up|down|left|right), hideKeyboard, keyboardAction.\n\n"
+        "SELECTOR RULES (mandatory):\n"
+        "- For EVERY element, resolve TestObject/def variables: `TestObject x = findTestObject('Object Repository/.../leafName')`. "
+        "The locator token is the substring AFTER the final '/' — e.g. txtBox_libiPrompt, btn_TextEnterButton. "
+        "Set selector.value to that leaf EXACTLY: keep underscores, hyphens, camelCase; never replace with human-readable UI text.\n"
+        "- Mobile.tap(txtPrompt, ...) means: look up txtPrompt's findTestObject binding and use THAT leaf as selector.value.\n"
+        "- FORBIDDEN as selector.value: strings from base.logInfo, user-visible setText bodies, screenshot file names, "
+        "or prettified labels like 'Selfcare & transactions' unless the script literally uses that exact token in findTestObject.\n"
+        "- If the script only has callTestCase(findTestCase(...)) lines and no local Mobile.* steps, output minimal waits — "
+        "do NOT invent a long unrelated checkout flow.\n"
+        "- Resource ids in literals/comments: use using=id with full resource id.\n"
+        "- For verifyElementText, set expect from the script's expected string.\n"
+        "- Map waitForElementPresent / retryWaitForElementPresent to waitForVisible; timeout seconds → ms.\n"
+        "- Map Mobile.delay / delay to wait with ms.\n"
+        "- scrollToText: use swipe (direction in text, usually down) and waitForVisible/assertVisible for the target when you can name a selector; "
+        "otherwise minimal swipe + wait.\n"
+        "- callTestCase: use wait steps to reflect handoff, keep subsequent flow.\n"
+        "- System keyboard keys: keyboardAction, not tap.\n\n"
+        "Use one test_cases entry unless the file clearly defines multiple independent tests (e.g. several unrelated test methods). "
+        f'Default name: "{stem}".\n'
+        f"Source file path hint: {logical_path}\n"
+    )
+    body = {
+        "contents": [{"parts": [{"text": system + "\n--- SOURCE ---\n" + src}]}],
+        "generationConfig": {"temperature": 0.08, "responseMimeType": "application/json"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, json=body)
+        if r.status_code != 200:
+            return None, extra_warnings
+        text = _gemini_extract_text(r.json())
+        merged = _normalize_ai_katalon_cases(json.loads(text), stem, fallback_cases)
+        if merged:
+            merged, snap_notes = _apply_katalon_locator_snap(merged, fallback_cases, source)
+            extra_warnings.extend(snap_notes)
+            return merged, extra_warnings
+    except (HTTPException, json.JSONDecodeError, TypeError, KeyError, IndexError, httpx.HTTPError, Exception):
+        return None, extra_warnings
+    return None, extra_warnings
+
+
+async def _rewrite_katalon_parsed_files_with_ai(
+    parsed_files: list[ParsedFile],
+    platform: str,
+    api_key: str,
+    model: str,
+) -> None:
+    if not api_key:
+        return
+    sem = asyncio.Semaphore(4)
+
+    async def one(pf: ParsedFile) -> None:
+        if pf.error or pf.extension not in (".groovy", ".java"):
+            return
+        raw = (pf.raw_text or "").strip()
+        if not raw:
+            return
+        async with sem:
+            fallback = list(pf.test_cases)
+            ai_cases, ai_notes = await _ai_parse_katalon_source(raw, platform, pf.path, api_key, model, fallback)
+        if ai_cases:
+            pf.test_cases = ai_cases
+            pf.warnings.extend(ai_notes)
+            if not any("parsed with AI" in w for w in pf.warnings):
+                pf.warnings.append("Katalon steps parsed with AI — verify selectors on a real device.")
+
+    await asyncio.gather(*(one(pf) for pf in parsed_files))
+
+
+def _sheet_fallback_chunk(chunk: list[dict]) -> list[dict]:
+    return [
+        {
+            "name": r["name"],
+            "steps": sheet_row_combined_steps(r),
+            "acceptance_criteria": r.get("expected", "") or "",
+            "import": True,
+        }
+        for r in chunk
+    ]
+
+
+async def _ai_complete_sheet_rows(rows: list, platform: str, api_key: str, model: str) -> list[dict]:
+    if not rows:
+        return []
+    if not api_key:
+        return _sheet_fallback_chunk(rows)
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    CHUNK = 12
+    all_out: list[dict] = []
+
+    for i in range(0, len(rows), CHUNK):
+        chunk = rows[i : i + CHUNK]
+        n = len(chunk)
+        instruction = (
+            f"Platform: {platform}. Convert manual test sheet rows into Appium mobile test steps (JSON).\n"
+            f"Input: exactly {n} rows in order. Each row uses:\n"
+            "- name: test case title\n"
+            "- steps_description: free-text steps (may be multi-line)\n"
+            "- expected: expected result (must drive a final assertion when it describes an outcome)\n"
+            "- selector_value / selector_strategy / input_value: optional locators\n\n"
+            "Output ONLY valid JSON:\n"
+            '{"test_cases":[{"name":"...","steps":[...],"acceptance_criteria":"..."}]}\n\n'
+            f"Rules:\n"
+            f"- test_cases MUST have exactly {n} entries in the SAME ORDER as the rows below.\n"
+            "- For each row, set acceptance_criteria from the Expected column (expected).\n"
+            "- Expand steps_description into atomic steps: tap, type, wait, waitForVisible, assertText, assertVisible, swipe, hideKeyboard, keyboardAction.\n"
+            "- Include selector_value in the right steps when it clearly identifies a control.\n"
+            "- End with assertText or assertVisible reflecting the Expected outcome when applicable.\n"
+            "- Each step: {\"type\":\"...\",\"selector\":{\"using\":\"accessibilityId|id|xpath\",\"value\":\"...\"},\"text\",\"ms\",\"expect\"}\n\n"
+            "Rows JSON:\n" + json.dumps(chunk, indent=2)
+        )
+        body = {
+            "contents": [{"parts": [{"text": instruction}]}],
+            "generationConfig": {"temperature": 0.25, "responseMimeType": "application/json"},
+        }
+        parsed_ok = False
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(url, json=body)
+            if resp.status_code == 200:
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(text)
+                cases = parsed.get("test_cases")
+                if isinstance(cases, list) and len(cases) == n:
+                    for tc, row in zip(cases, chunk):
+                        tc["name"] = row["name"]
+                        steps = tc.get("steps")
+                        if not isinstance(steps, list) or not steps:
+                            tc["steps"] = sheet_row_combined_steps(row)
+                        tc["acceptance_criteria"] = (tc.get("acceptance_criteria") or row.get("expected") or "") or ""
+                        tc["import"] = True
+                    all_out.extend(cases)
+                    parsed_ok = True
+        except (KeyError, IndexError, json.JSONDecodeError, TypeError, httpx.HTTPError, Exception):
+            pass
+        if not parsed_ok:
+            all_out.extend(_sheet_fallback_chunk(chunk))
+
+    return all_out
+
+
+@app.post("/api/projects/{project_id}/import/script")
+async def import_script(
+    project_id: int,
+    suite_id: int,
+    platform: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Parse script; return preview test cases. Client calls confirm to persist."""
+    content = await file.read()
+    filename = (file.filename or "").lower()
+    source = content.decode("utf-8", errors="replace")
+
+    s = _load_settings()
+    api_key, model = _ai_creds(s)
+
+    katalon_import_mode: str | None = None
+    katalon_import_notes: list[str] = []
+    if filename.endswith(".groovy") or filename.endswith(".java"):
+        raw_steps = parse_groovy(source)
+        fallback_cases = group_steps_into_test_cases(raw_steps, file.filename or "script")
+        if api_key:
+            ai_cases, ai_notes = await _ai_parse_katalon_source(
+                source, platform, file.filename or "script", api_key, model, fallback_cases
+            )
+            katalon_import_notes.extend(ai_notes)
+            if ai_cases:
+                test_cases = ai_cases
+                katalon_import_mode = "ai"
+            else:
+                test_cases = fallback_cases
+                katalon_import_mode = "heuristic"
+        else:
+            test_cases = fallback_cases
+            katalon_import_mode = "heuristic"
+    elif filename.endswith(".feature"):
+        raw_steps = parse_gherkin(source)
+        test_cases = await _ai_complete_gherkin(raw_steps, platform, source, api_key, model)
+    elif filename.endswith(".py"):
+        test_cases = await _ai_parse_python_script(source, platform, api_key, model)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type (use .groovy, .java, .feature, .py)")
+
+    _ = suite_id  # reserved for validation / future use
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    warn = _validate_test_cases(test_cases) + katalon_import_notes
+    out: dict[str, Any] = {
+        "test_cases": test_cases,
+        "filename": file.filename or "",
+        "warnings": warn,
+    }
+    if katalon_import_mode is not None:
+        out["katalon_import_mode"] = katalon_import_mode
+    return out
+
+
+@app.post("/api/projects/{project_id}/import/script/confirm")
+def confirm_script_import(project_id: int, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Persist selected test cases after user reviews the parsed preview."""
+    suite_id = payload.get("suite_id")
+    if suite_id is not None:
+        try:
+            suite_id = int(suite_id)
+        except (TypeError, ValueError):
+            suite_id = None
+    selected_cases = payload.get("test_cases", [])
+
+    created: list[dict] = []
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        for tc in selected_cases:
+            if not tc.get("import", True):
+                continue
+            name = tc.get("name")
+            steps = tc.get("steps")
+            if not name or not isinstance(steps, list):
+                continue
+            if steps and all(s.get("type") == "python_raw" for s in steps):
+                continue
+            st = list(steps)
+            t = TestDefinition(
+                project_id=project_id,
+                suite_id=suite_id,
+                name=str(name)[:200],
+                steps=st,
+                platform_steps={"android": st, "ios_sim": []},
+                acceptance_criteria=tc.get("acceptance_criteria") or None,
+            )
+            db.add(t)
+            db.flush()
+            created.append({"id": t.id, "name": t.name})
+        db.commit()
+
+    return {"created": len(created), "tests": created}
+
+
+@app.post("/api/projects/{project_id}/import/sheet")
+async def import_sheet(
+    project_id: int,
+    suite_id: int,
+    platform: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Parse Excel/CSV: structured steps from Steps + Expected columns, plus Katalon Groovy per case."""
+    content = await file.read()
+    filename = file.filename or ""
+
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    fn_lower = filename.lower()
+    if not (fn_lower.endswith(".csv") or fn_lower.endswith(".xlsx")):
+        raise HTTPException(status_code=400, detail="Unsupported file (use .csv or .xlsx)")
+
+    try:
+        rows = parse_test_sheet(content, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    s = _load_settings()
+    api_key, model = _ai_creds(s)
+
+    test_cases = await _ai_complete_sheet_rows(rows, platform, api_key, model)
+    scripts = _groovy_scripts_for_sheet_cases(test_cases, filename)
+    _ = suite_id
+    warnings = _validate_test_cases(test_cases)
+    return {
+        "test_cases": test_cases,
+        "scripts": scripts,
+        "filename": filename,
+        "row_count": len(rows),
+        "warnings": warnings,
+    }
+
+
+@app.post("/api/projects/{project_id}/import/zip")
+async def import_zip(
+    project_id: int,
+    platform: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    """Parse a ZIP of scripts; preview grouped by folder (suite). Does not persist."""
+    with SessionLocal() as db:
+        if not db.query(Project).filter(Project.id == project_id).first():
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    content = await file.read()
+    fn = (file.filename or "").lower()
+    if not fn.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Expected a .zip file")
+
+    parsed_files = parse_zip(content)
+    s = _load_settings()
+    zip_ai_key, zip_model = _ai_creds(s)
+    await _rewrite_katalon_parsed_files_with_ai(parsed_files, platform, zip_ai_key, zip_model)
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    warnings: list[str] = []
+    total_cases = 0
+
+    for pf in parsed_files:
+        suite_name = extract_folder_name(pf.path)
+        groups.setdefault(suite_name, [])
+        for tc in pf.test_cases:
+            steps = tc.get("steps") or []
+            if any(s.get("type") == "python_raw" for s in steps):
+                warnings.append(f"{pf.path}: Python script needs AI completion")
+                tc["import"] = False
+            else:
+                tc.setdefault("import", True)
+            tc["source_file"] = pf.path
+            tc["suggested_suite"] = suite_name
+            groups[suite_name].append(tc)
+            total_cases += 1
+        if pf.error:
+            warnings.append(f"{pf.path}: {pf.error}")
+        warnings.extend(pf.warnings)
+
+    return {
+        "groups": groups,
+        "total_cases": total_cases,
+        "total_files": len(parsed_files),
+        "warnings": warnings,
+        "files": [
+            {
+                "path": pf.path,
+                "cases_count": len(pf.test_cases),
+                "status": "error" if pf.error else ("warn" if pf.warnings else "ok"),
+            }
+            for pf in parsed_files
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/import/folder")
+async def import_folder(
+    project_id: int,
+    platform: str,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Multiple files from webkitdirectory upload."""
+    with SessionLocal() as db:
+        if not db.query(Project).filter(Project.id == project_id).first():
+            raise HTTPException(status_code=404, detail="Project not found")
+
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail="No files received. Each part must use the multipart field name 'files' (folder picker).",
+        )
+
+    file_data: list[tuple[str, bytes]] = []
+    for f in files:
+        raw = await f.read()
+        rel = f.filename or "file"
+        file_data.append((rel, raw))
+
+    parsed_files = parse_folder_files(file_data)
+    s = _load_settings()
+    folder_ai_key, folder_model = _ai_creds(s)
+    await _rewrite_katalon_parsed_files_with_ai(parsed_files, platform, folder_ai_key, folder_model)
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    warnings: list[str] = []
+    total_cases = 0
+
+    for pf in parsed_files:
+        suite_name = extract_folder_name(pf.path)
+        groups.setdefault(suite_name, [])
+        for tc in pf.test_cases:
+            steps = tc.get("steps") or []
+            if any(s.get("type") == "python_raw" for s in steps):
+                warnings.append(f"{pf.path}: Python script needs AI completion")
+                tc["import"] = False
+            else:
+                tc.setdefault("import", True)
+            tc["source_file"] = pf.path
+            tc["suggested_suite"] = suite_name
+            groups[suite_name].append(tc)
+            total_cases += 1
+        if pf.error:
+            warnings.append(f"{pf.path}: {pf.error}")
+        warnings.extend(pf.warnings)
+
+    return {
+        "groups": groups,
+        "total_cases": total_cases,
+        "total_files": len(parsed_files),
+        "warnings": warnings,
+        "files": [
+            {
+                "path": pf.path,
+                "cases_count": len(pf.test_cases),
+                "status": "error" if pf.error else ("warn" if pf.warnings else "ok"),
+            }
+            for pf in parsed_files
+        ],
+    }
+
+
+@app.post("/api/projects/{project_id}/import/zip/confirm")
+def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Persist ZIP/folder preview. Optional suite_map, auto-create suites under module_id."""
+    suite_map_raw = payload.get("suite_map") or {}
+    suite_map: dict[str, int] = {}
+    for k, v in suite_map_raw.items():
+        if v is None:
+            continue
+        try:
+            suite_map[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+
+    mod_raw = payload.get("module_id")
+    module_id: int | None = None
+    if mod_raw is not None:
+        try:
+            module_id = int(mod_raw)
+        except (TypeError, ValueError):
+            module_id = None
+
+    test_cases: list[dict[str, Any]] = payload.get("test_cases", [])
+    created_suites: dict[str, int] = {}
+    created_tests: list[dict[str, Any]] = []
+
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        for tc in test_cases:
+            if not tc.get("import", True):
+                continue
+            steps = tc.get("steps")
+            if not isinstance(steps, list) or not steps:
+                continue
+            if all(s.get("type") == "python_raw" for s in steps):
+                continue
+            name = tc.get("name") or "Imported test"
+            suite_name = str(tc.get("suggested_suite", "Imported"))[:200]
+
+            suite_id = suite_map.get(suite_name)
+            if suite_id is None:
+                suite_id = created_suites.get(suite_name)
+
+            if suite_id is None and module_id is not None:
+                new_suite = TestSuite(module_id=module_id, name=suite_name)
+                db.add(new_suite)
+                db.flush()
+                created_suites[suite_name] = new_suite.id
+                suite_id = new_suite.id
+
+            ac = tc.get("acceptance_criteria")
+            st = list(steps)
+            t = TestDefinition(
+                project_id=project_id,
+                suite_id=suite_id,
+                name=str(name)[:200],
+                steps=st,
+                platform_steps={"android": st, "ios_sim": []},
+                acceptance_criteria=str(ac) if ac else None,
+            )
+            db.add(t)
+            db.flush()
+            created_tests.append({"id": t.id, "name": t.name, "suite": suite_name})
+
+        db.commit()
+
+    return {
+        "created": len(created_tests),
+        "created_suites": list(created_suites.keys()),
+        "tests": created_tests,
+    }
+
+
+@app.post("/api/projects/{project_id}/generate/katalon-zip")
+def generate_katalon_zip_endpoint(project_id: int, payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    """Build Katalon project ZIP from saved test IDs and/or inline test case dicts."""
+    test_case_ids = payload.get("test_case_ids") or []
+    inline_cases = payload.get("test_cases") or []
+    project_name = str(payload.get("project_name") or "QA_Project")
+
+    cases_to_export: list[dict[str, Any]] = list(inline_cases)
+
+    with SessionLocal() as db:
+        for tc_id in test_case_ids:
+            try:
+                tid = int(tc_id)
+            except (TypeError, ValueError):
+                continue
+            t = (
+                db.query(TestDefinition)
+                .filter(TestDefinition.id == tid, TestDefinition.project_id == project_id)
+                .first()
+            )
+            if not t:
+                continue
+            suite_name = "Exported"
+            if t.suite_id:
+                su = db.query(TestSuite).filter(TestSuite.id == t.suite_id).first()
+                if su:
+                    suite_name = su.name
+            cases_to_export.append(
+                {
+                    "name": t.name,
+                    "steps": _steps_for_platform_record(t, "android"),
+                    "acceptance_criteria": t.acceptance_criteria or "",
+                    "suite_name": suite_name,
+                }
+            )
+
+    if not cases_to_export:
+        raise HTTPException(status_code=400, detail="No test cases to export")
+
+    zip_bytes = generate_katalon_zip(project_name, cases_to_export)
+    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", project_name)[:80] or "katalon"
+
+    return StreamingResponse(
+        BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}_katalon.zip"'},
+    )
+
+
+@app.get("/api/projects/{project_id}/reports/hierarchy")
+def reports_hierarchy(project_id: int) -> dict[str, Any]:
+    """Collection → suite → test → recent runs for reports UI."""
+    with SessionLocal() as db:
+        modules = db.query(Module).filter(Module.project_id == project_id).all()
+        mod_ids = [m.id for m in modules]
+        all_suites = db.query(TestSuite).filter(TestSuite.module_id.in_(mod_ids)).all() if mod_ids else []
+        all_tests = db.query(TestDefinition).filter(TestDefinition.project_id == project_id).all()
+        all_runs = (
+            db.query(Run)
+            .filter(Run.project_id == project_id)
+            .order_by(Run.id.desc())
+            .limit(500)
+            .all()
+        )
+
+    runs_by_test: dict[int, list[Run]] = {}
+    for r in all_runs:
+        if r.test_id is not None:
+            runs_by_test.setdefault(r.test_id, []).append(r)
+
+    def run_out(r: Run) -> dict[str, Any]:
+        arts = r.artifacts or {}
+        summary = r.summary or {}
+        step_results = summary.get("stepResults", []) or []
+        step_defs = summary.get("stepDefinitions", []) or []
+        total_steps = len(step_defs) if step_defs else len(step_results)
+        dur: float | None = None
+        if r.finished_at and r.started_at:
+            dur = round((r.finished_at - r.started_at).total_seconds(), 1)
+        return {
+            "id": r.id,
+            "status": r.status,
+            "platform": r.platform,
+            "device_target": r.device_target,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+            "duration_s": dur,
+            "error_message": r.error_message,
+            "screenshots": arts.get("screenshots", []),
+            "video": arts.get("video"),
+            "step_results": step_results,
+            "passed_steps": sum(1 for s in step_results if s and s.get("status") == "passed"),
+            "total_steps": total_steps,
+        }
+
+    def test_out(t: TestDefinition) -> dict[str, Any]:
+        test_runs = runs_by_test.get(t.id, [])[:5]
+        latest = test_runs[0] if test_runs else None
+        n_and = len(_steps_for_platform_record(t, "android"))
+        n_ios = len(_steps_for_platform_record(t, "ios_sim"))
+        return {
+            "id": t.id,
+            "name": t.name,
+            "steps_count": max(n_and, n_ios),
+            "acceptance_criteria": t.acceptance_criteria,
+            "latest_status": latest.status if latest else "not_run",
+            "latest_run_id": latest.id if latest else None,
+            "runs": [run_out(r) for r in test_runs],
+        }
+
+    def suite_out(s: TestSuite) -> dict[str, Any]:
+        tests = [t for t in all_tests if t.suite_id == s.id]
+        test_outs = [test_out(t) for t in tests]
+        passed = sum(1 for t in test_outs if t["latest_status"] == "passed")
+        run_count = sum(1 for t in test_outs if t["latest_status"] != "not_run")
+        return {
+            "id": s.id,
+            "name": s.name,
+            "tests": test_outs,
+            "total_tests": len(tests),
+            "passed_count": passed,
+            "failed_count": sum(1 for t in test_outs if t["latest_status"] in ("failed", "error")),
+            "not_run_count": len(tests) - run_count,
+            "pass_rate": round(passed / run_count * 100) if run_count > 0 else 0,
+        }
+
+    def module_out(m: Module) -> dict[str, Any]:
+        suites = [s for s in all_suites if s.module_id == m.id]
+        suite_outs = [suite_out(s) for s in suites]
+        total = sum(s["total_tests"] for s in suite_outs)
+        passed = sum(s["passed_count"] for s in suite_outs)
+        run = total - sum(s["not_run_count"] for s in suite_outs)
+        return {
+            "id": m.id,
+            "name": m.name,
+            "suites": suite_outs,
+            "total_tests": total,
+            "passed_count": passed,
+            "failed_count": sum(s["failed_count"] for s in suite_outs),
+            "not_run_count": sum(s["not_run_count"] for s in suite_outs),
+            "pass_rate": round(passed / run * 100) if run > 0 else 0,
+        }
+
+    collections = [module_out(m) for m in modules]
+    total = sum(c["total_tests"] for c in collections)
+    passed = sum(c["passed_count"] for c in collections)
+    run = total - sum(c["not_run_count"] for c in collections)
+
+    return {
+        "collections": collections,
+        "summary": {
+            "total_tests": total,
+            "executed": run,
+            "passed": passed,
+            "failed": sum(c["failed_count"] for c in collections),
+            "not_run": total - run,
+            "pass_rate": round(passed / run * 100) if run > 0 else 0,
+        },
+    }
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────

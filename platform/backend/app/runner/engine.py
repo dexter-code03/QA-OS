@@ -13,6 +13,7 @@ from ..events import RunEvent, event_bus
 from ..settings import settings
 from .appium_service import ensure_appium_running
 from .artifacts import ensure_run_dir, save_page_source, save_screenshot
+from .debug_listener import wrap_driver_with_debug
 from .executor import run_steps
 from .recording_android import start_screenrecord, stop_and_pull
 from .recording_ios_sim import start_recording as start_ios_recording, stop as stop_ios_recording
@@ -103,7 +104,9 @@ class RunEngine:
             build_meta = b.build_metadata if b else {}
             platform = self._platform_for_run(run_id)
             device_target = self._device_for_run(run_id)
-            driver = create_driver(SessionConfig(platform=platform, device_target=device_target, app_path=app_path, build_meta=build_meta or {}))
+            raw_driver = create_driver(SessionConfig(platform=platform, device_target=device_target, app_path=app_path, build_meta=build_meta or {}))
+            loop = asyncio.get_running_loop()
+            driver = wrap_driver_with_debug(raw_driver, run_id, loop)
 
             if platform == "android":
                 rec = start_screenrecord(device_target)
@@ -138,7 +141,7 @@ class RunEngine:
                     )
                 )
 
-            summary = run_steps(driver, steps, on_step=on_step, cancel_check=cancel_check)
+            summary = run_steps(driver, steps, on_step=on_step, cancel_check=cancel_check, run_id=run_id)
 
             # stop recording
             if rec:
@@ -207,11 +210,20 @@ class RunEngine:
             t = db.query(TestDefinition).filter(TestDefinition.id == r.test_id).first()
             if not t:
                 return []
-            steps = list(t.steps or [])
+
+            platform = (r.platform or "android").strip() or "android"
+
+            def resolve_steps(test: TestDefinition) -> list[dict]:
+                ps = getattr(test, "platform_steps", None) or {}
+                if isinstance(ps, dict) and platform in ps and ps[platform]:
+                    return list(ps[platform])
+                return list(test.steps or [])
+
+            steps = resolve_steps(t)
             if t.prerequisite_test_id and t.prerequisite_test_id != t.id:
                 prereq = db.query(TestDefinition).filter(TestDefinition.id == t.prerequisite_test_id).first()
-                if prereq and prereq.steps:
-                    steps = list(prereq.steps) + steps
+                if prereq:
+                    steps = resolve_steps(prereq) + steps
             return steps
 
 

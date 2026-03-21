@@ -55,7 +55,8 @@ class BuildOut(BaseModel):
 
 class TestCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    steps: list[dict[str, Any]]
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    platform_steps: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     suite_id: Optional[int] = None
     prerequisite_test_id: Optional[int] = None
     acceptance_criteria: Optional[str] = None
@@ -64,6 +65,8 @@ class TestCreate(BaseModel):
 class TestUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     steps: Optional[list[dict[str, Any]]] = None
+    platform_steps: Optional[dict[str, list[dict[str, Any]]]] = None
+    platform: Optional[str] = None  # android | ios_sim — which slot steps update applies to
     suite_id: Optional[int] = None
     prerequisite_test_id: Optional[int] = None
     acceptance_criteria: Optional[str] = None
@@ -76,6 +79,7 @@ class TestOut(BaseModel):
     prerequisite_test_id: Optional[int] = None
     name: str
     steps: list[dict[str, Any]]
+    platform_steps: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     acceptance_criteria: Optional[str] = None
     fix_history: list[dict[str, Any]] = Field(default_factory=list)
     created_at: datetime

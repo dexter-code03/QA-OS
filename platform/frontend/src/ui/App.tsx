@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { DndContext, closestCenter, DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TestDef } from "./api";
+import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef } from "./api";
 import { XmlElementTree, simplifyXmlForAI } from "./XmlElementTree";
 
 /* ── Toast ─────────────────────────────────────────── */
@@ -30,7 +30,142 @@ type Page = "dashboard" | "execution" | "library" | "reports" | "builds" | "sett
 function guessModule(n: string) { const p = n.split(/[_\s-]+/); return p.length >= 2 ? p[0][0].toUpperCase() + p[0].slice(1) : "General"; }
 function statusDot(s: string) { return s === "passed" ? "dot-green" : s === "failed" || s === "error" ? "dot-danger" : s === "running" ? "dot-warn" : "dot-gray"; }
 function statusIcon(s: string) { return s === "passed" ? "si-pass" : s === "failed" || s === "error" ? "si-fail" : s === "running" ? "si-run" : "si-skip"; }
-function ago(d: string | null) { if (!d) return "—"; const m = Math.round((Date.now() - new Date(d).getTime()) / 60000); return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; }
+/** Backend sends naive UTC ISO timestamps; parse as UTC so relative times match server clock. */
+function parseApiDate(iso: string | null | undefined): Date | null {
+  if (!iso) return null;
+  const t = String(iso).trim();
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(t) && !/[zZ]$/.test(t) && !/[+-]\d{2}:?\d{2}$/.test(t)) {
+    return new Date(t + "Z");
+  }
+  const d = new Date(t);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function ago(d: string | null) {
+  const dt = parseApiDate(d);
+  if (!dt) return "—";
+  const sec = Math.floor((Date.now() - dt.getTime()) / 1000);
+  if (sec < 45) return "just now";
+  if (sec < 0) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 14) return day === 1 ? "1 day ago" : `${day} days ago`;
+  return dt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function buildDailyDigestText(
+  project: Project,
+  tests: TestDef[],
+  runs: Run[],
+  builds: Build[],
+  modules: ModuleDef[],
+  suites: SuiteDef[],
+  hierarchy: any | null,
+): string {
+  const lines: string[] = [];
+  const now = new Date();
+  const dateStr = now.toLocaleString(undefined, { dateStyle: "full", timeStyle: "short" });
+  lines.push(`Subject: [QA Daily Status] ${project.name} — ${now.toLocaleDateString()}`);
+  lines.push("");
+  lines.push("DAILY TESTING STATUS");
+  lines.push(`Project: ${project.name}`);
+  lines.push(`Generated: ${dateStr}`);
+  lines.push("");
+
+  const latestByTest = new Map<number, Run>();
+  for (const r of runs) {
+    if (r.test_id == null) continue;
+    if (!latestByTest.has(r.test_id)) latestByTest.set(r.test_id, r);
+  }
+  let passedTc = 0;
+  let failedTc = 0;
+  let otherTc = 0;
+  for (const t of tests) {
+    const lr = latestByTest.get(t.id);
+    if (!lr) otherTc++;
+    else if (lr.status === "passed") passedTc++;
+    else if (lr.status === "failed" || lr.status === "error") failedTc++;
+    else otherTc++;
+  }
+  lines.push("— Test cases (latest result per test) —");
+  lines.push(`Total definitions: ${tests.length}`);
+  lines.push(`Last run passed: ${passedTc} · last run failed/error: ${failedTc} · never run / queued / cancelled / running: ${otherTc}`);
+  lines.push("");
+
+  const pRuns = runs.filter(r => r.status === "passed").length;
+  const fRuns = runs.filter(r => r.status === "failed" || r.status === "error").length;
+  lines.push("— All executions (run count) —");
+  lines.push(`Total runs: ${runs.length} · passed: ${pRuns} · failed/error: ${fRuns} · other: ${runs.length - pRuns - fRuns}`);
+  lines.push("");
+
+  lines.push("— Builds in use —");
+  if (builds.length === 0) lines.push("(none uploaded)");
+  else {
+    builds.slice(0, 12).forEach(b => {
+      const meta = (b.metadata || {}) as Record<string, unknown>;
+      const vn = meta.version_name != null ? String(meta.version_name) : "";
+      lines.push(`· ${b.file_name} (${b.platform})${vn ? ` v${vn}` : ""}`);
+    });
+  }
+  lines.push("");
+
+  lines.push("— Bugs / failures (recent failed or error runs) —");
+  const fails = runs.filter(r => r.status === "failed" || r.status === "error").slice(0, 30);
+  if (fails.length === 0) lines.push("(none in current history)");
+  else {
+    fails.forEach(r => {
+      const tn = tests.find(te => te.id === r.test_id)?.name ?? `Test #${r.test_id}`;
+      const err = (r.error_message || "").replace(/\s+/g, " ").trim().slice(0, 800);
+      lines.push(`• Run #${r.id} · ${tn}`);
+      lines.push(`  Platform: ${r.platform} · Device: ${r.device_target || "—"} · Status: ${r.status}`);
+      if (err) lines.push(`  Detail: ${err}`);
+      const sum = r.summary as Record<string, unknown> | undefined;
+      const sr = sum?.stepResults as Array<{ status?: string; details?: unknown }> | undefined;
+      if (Array.isArray(sr)) {
+        const failedStep = sr.find(s => s?.status === "failed");
+        if (failedStep?.details != null && typeof failedStep.details === "object") {
+          const det = (failedStep.details as { error?: string }).error;
+          if (det) lines.push(`  Step failure: ${String(det).slice(0, 400)}`);
+        }
+      }
+      lines.push("");
+    });
+  }
+
+  if (hierarchy?.summary && typeof hierarchy.summary === "object") {
+    const s = hierarchy.summary as Record<string, number>;
+    lines.push("— Reports summary (library hierarchy) —");
+    lines.push(`Pass rate: ${s.pass_rate ?? "—"}% · Failed tests (latest): ${s.failed ?? "—"} · Not run: ${s.not_run ?? "—"} · Total: ${s.total_tests ?? "—"}`);
+    lines.push("");
+  }
+
+  lines.push("— Structure: collections & suites —");
+  for (const m of modules) {
+    const ms = suites.filter(x => x.module_id === m.id);
+    lines.push(`▸ ${m.name} — ${ms.length} suite(s)`);
+    for (const su of ms) {
+      const tc = tests.filter(t => t.suite_id === su.id);
+      lines.push(`   · ${su.name}: ${tc.length} test case(s)`);
+    }
+  }
+  lines.push("");
+  lines.push("—");
+  lines.push("Tip: Copy everything after the Subject line into your email body, or paste Subject into your mail client's subject field.");
+  return lines.join("\n");
+}
+
+/** Steps for a run / platform: iOS list falls back to Android until populated. */
+function stepsForPlatform(test: TestDef | undefined | null, pf: Run["platform"] | "android" | "ios_sim"): any[] {
+  if (!test) return [];
+  const ps = test.platform_steps;
+  const android = (ps?.android?.length ? ps.android : test.steps) ?? [];
+  const ios = ps?.ios_sim ?? [];
+  if (pf === "ios_sim") return ios.length ? ios : android;
+  return android;
+}
 
 /* ── App ───────────────────────────────────────────── */
 export function App() {
@@ -190,10 +325,21 @@ export function App() {
 
         {/* ── MAIN ── */}
         <div className="main-content">
-          {page === "dashboard" && <DashboardView project={project} tests={tests} runs={runs} builds={builds} onNav={setPage} onOpenRun={id => { setActiveRunId(id); setPage("execution"); }} />}
+          {page === "dashboard" && (
+            <DashboardView
+              project={project}
+              tests={tests}
+              runs={runs}
+              builds={builds}
+              modules={modules}
+              suites={suites}
+              onNav={setPage}
+              onOpenRun={id => { setActiveRunId(id); setPage("execution"); }}
+            />
+          )}
           {page === "execution" && <ExecutionView project={project} tests={tests} builds={builds} runs={runs} devices={devices} modules={modules} suites={suites} activeRunId={activeRunId} onRunCreated={id => { setActiveRunId(id); refresh(); }} onRefresh={refresh} />}
           {page === "library" && <LibraryView project={project} tests={tests} runs={runs} modules={modules} suites={suites} onRefresh={refresh} />}
-          {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} />}
+          {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} onRefresh={refresh} />}
           {page === "builds" && <BuildsView project={project} builds={builds} runs={runs} onRefresh={refresh} />}
           {page === "settings" && <SettingsView />}
         </div>
@@ -486,64 +632,256 @@ function Onboarding({ onDone }: { onDone: (p: Project) => void }) {
 }
 
 /* ── Dashboard ─────────────────────────────────────── */
-function DashboardView({ project, tests, runs, builds, onNav, onOpenRun }: { project: Project; tests: TestDef[]; runs: Run[]; builds: Build[]; onNav: (p: Page) => void; onOpenRun: (id: number) => void }) {
-  const passed = runs.filter(r => r.status === "passed").length;
-  const failed = runs.filter(r => r.status === "failed" || r.status === "error").length;
-  const total = runs.length;
-  const rate = total > 0 ? ((passed / total) * 100).toFixed(1) : "0";
-  const modules = [...new Set(tests.map(t => guessModule(t.name)))];
+function DashboardView({
+  project,
+  tests,
+  runs,
+  builds,
+  modules,
+  suites,
+  onNav,
+  onOpenRun,
+}: {
+  project: Project;
+  tests: TestDef[];
+  runs: Run[];
+  builds: Build[];
+  modules: ModuleDef[];
+  suites: SuiteDef[];
+  onNav: (p: Page) => void;
+  onOpenRun: (id: number) => void;
+}) {
+  const [digestBusy, setDigestBusy] = useState(false);
 
-  const moduleStats = modules.map(m => {
-    const mTests = tests.filter(t => guessModule(t.name) === m);
-    const ids = new Set(mTests.map(t => t.id));
-    const mRuns = runs.filter(r => r.test_id && ids.has(r.test_id));
-    const mp = mRuns.filter(r => r.status === "passed").length;
-    return { module: m, total: mRuns.length, passed: mp, rate: mRuns.length > 0 ? Math.round((mp / mRuns.length) * 100) : 0 };
+  const runsPassed = runs.filter(r => r.status === "passed").length;
+  const runsFailed = runs.filter(r => r.status === "failed" || r.status === "error").length;
+  const runsRunning = runs.filter(r => r.status === "running").length;
+  const totalRuns = runs.length;
+  const runPassRate = totalRuns > 0 ? ((runsPassed / totalRuns) * 100).toFixed(1) : "0";
+
+  const latestByTest = new Map<number, Run>();
+  for (const r of runs) {
+    if (r.test_id == null) continue;
+    if (!latestByTest.has(r.test_id)) latestByTest.set(r.test_id, r);
+  }
+  let tcLatestPassed = 0;
+  let tcLatestFailed = 0;
+  let tcPending = 0;
+  for (const t of tests) {
+    const lr = latestByTest.get(t.id);
+    if (!lr) tcPending++;
+    else if (lr.status === "passed") tcLatestPassed++;
+    else if (lr.status === "failed" || lr.status === "error") tcLatestFailed++;
+    else tcPending++;
+  }
+  const tcHealthRate = tests.length > 0 ? ((tcLatestPassed / tests.length) * 100).toFixed(1) : "0";
+
+  const collectionStats: Array<{ id: number | string; name: string; rate: number; latestPass: number; latestFail: number; pending: number }> = modules.map(m => {
+    const suiteIds = new Set(suites.filter(s => s.module_id === m.id).map(s => s.id));
+    const mTests = tests.filter(t => t.suite_id != null && suiteIds.has(t.suite_id));
+    let lp = 0;
+    let lf = 0;
+    let pend = 0;
+    for (const t of mTests) {
+      const lr = latestByTest.get(t.id);
+      if (!lr) pend++;
+      else if (lr.status === "passed") lp++;
+      else if (lr.status === "failed" || lr.status === "error") lf++;
+      else pend++;
+    }
+    const n = mTests.length;
+    const rate = n > 0 ? Math.round((lp / n) * 100) : 0;
+    return { id: m.id, name: m.name, latestPass: lp, latestFail: lf, pending: pend, rate };
   });
+  const unassignedTests = tests.filter(t => !t.suite_id);
+  if (unassignedTests.length > 0) {
+    let lp = 0;
+    let lf = 0;
+    let pend = 0;
+    for (const t of unassignedTests) {
+      const lr = latestByTest.get(t.id);
+      if (!lr) pend++;
+      else if (lr.status === "passed") lp++;
+      else if (lr.status === "failed" || lr.status === "error") lf++;
+      else pend++;
+    }
+    const n = unassignedTests.length;
+    collectionStats.push({
+      id: "unassigned",
+      name: "Unassigned",
+      rate: n > 0 ? Math.round((lp / n) * 100) : 0,
+      latestPass: lp,
+      latestFail: lf,
+      pending: pend,
+    });
+  }
+
+  const downloadDailyDraft = async () => {
+    setDigestBusy(true);
+    try {
+      const hier = await api.getReportsHierarchy(project.id).catch(() => null);
+      const text = buildDailyDigestText(project, tests, runs, builds, modules, suites, hier);
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const a = document.createElement("a");
+      const safe = project.name.replace(/[^\w\-]+/g, "_").slice(0, 60) || "qa_project";
+      a.href = URL.createObjectURL(blob);
+      a.download = `${safe}_daily_status_${new Date().toISOString().slice(0, 10)}.txt`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      toast("Daily status draft downloaded — open in a text editor and paste into email", "success");
+    } catch (e: any) {
+      toast(e.message || String(e), "error");
+    } finally {
+      setDigestBusy(false);
+    }
+  };
+
+  const failingTests = [...latestByTest.entries()]
+    .filter(([, r]) => r.status === "failed" || r.status === "error")
+    .slice(0, 6)
+    .map(([tid, r]) => ({ test: tests.find(t => t.id === tid), run: r }));
 
   return (
     <>
-      <div className="section-head">
-        <div><div className="section-title">Dashboard</div><div className="section-sub">{project.name} · overview</div></div>
-        <button className="run-now-btn" onClick={() => onNav("execution")}>▶ Run Tests</button>
+        <div className="section-head">
+        <div>
+          <div className="section-title">Dashboard</div>
+          <div className="section-sub">{project.name} · test cases, runs, and collections</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button type="button" className="btn-ghost btn-sm" disabled={digestBusy} onClick={downloadDailyDraft} title="Plain-text draft with runs, failures, and structure">
+            {digestBusy ? "…" : "📧 Daily status draft"}
+          </button>
+          <button type="button" className="run-now-btn" onClick={() => onNav("execution")}>
+            ▶ Run Tests
+          </button>
+        </div>
       </div>
+
+      <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>Test case row = latest result per definition. Run row = every execution.</div>
+
       <div className="metrics-row">
-        <div className="metric-card"><div className="metric-val">{rate}%</div><div className="metric-label">Pass Rate</div></div>
-        <div className="metric-card blue"><div className="metric-val">{total}</div><div className="metric-label">Tests Run</div></div>
-        <div className="metric-card danger"><div className="metric-val">{failed}</div><div className="metric-label">Failed</div></div>
-        <div className="metric-card warn"><div className="metric-val">{tests.length}</div><div className="metric-label">Test Cases</div></div>
-        <div className="metric-card purple"><div className="metric-val">{builds.length}</div><div className="metric-label">Builds</div></div>
+        <div className="metric-card">
+          <div className="metric-val">{tcHealthRate}%</div>
+          <div className="metric-label">Cases last passed</div>
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>{tcLatestPassed}/{tests.length} tests</div>
+        </div>
+        <div className="metric-card danger">
+          <div className="metric-val">{tcLatestFailed}</div>
+          <div className="metric-label">Cases last failed</div>
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>latest run error</div>
+        </div>
+        <div className="metric-card warn">
+          <div className="metric-val">{tcPending}</div>
+          <div className="metric-label">No pass / not run</div>
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>queued · running · none</div>
+        </div>
+        <div className="metric-card">
+          <div className="metric-val">{runPassRate}%</div>
+          <div className="metric-label">Run pass rate</div>
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>all executions</div>
+        </div>
+        <div className="metric-card blue">
+          <div className="metric-val">{totalRuns}</div>
+          <div className="metric-label">Total runs</div>
+          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>{runsFailed} fail · {runsRunning} live</div>
+        </div>
+        <div className="metric-card purple">
+          <div className="metric-val">{builds.length}</div>
+          <div className="metric-label">Builds</div>
+        </div>
       </div>
+
       <div className="runs-grid">
         <div className="panel">
-          <div className="panel-header"><div className="panel-title">Recent Runs</div><div style={{ fontSize: 11, color: "var(--muted)", cursor: "pointer" }} onClick={() => onNav("execution")}>View all →</div></div>
+          <div className="panel-header">
+            <div className="panel-title">Recent runs</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", cursor: "pointer" }} onClick={() => onNav("execution")}>
+              View all →
+            </div>
+          </div>
           <div className="panel-body">
             {runs.slice(0, 5).map(r => (
               <div key={r.id} className="run-row" onClick={() => onOpenRun(r.id)}>
                 <div className={`status-icon ${statusIcon(r.status)}`} />
-                <div><div className="run-name">{tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}</div><div className="run-meta">{r.device_target || "default"} · {r.platform}</div></div>
+                <div>
+                  <div className="run-name">{tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}</div>
+                  <div className="run-meta">
+                    {r.device_target || "default"} · {r.platform}
+                  </div>
+                </div>
                 <div className={`run-pct ${r.status === "passed" ? "pct-pass" : "pct-fail"}`}>{r.status}</div>
                 <div className="run-tag">{r.platform}</div>
                 <div className="run-dur">{ago(r.finished_at || r.started_at)}</div>
               </div>
             ))}
-            {runs.length === 0 && <div style={{ padding: 18, color: "var(--muted)", fontSize: 12 }}>No runs yet. Create a test and start a run.</div>}
+            {runs.length === 0 && (
+              <div style={{ padding: 18, color: "var(--muted)", fontSize: 12 }}>No runs yet. Create a test and start a run.</div>
+            )}
           </div>
         </div>
+
         <div className="panel">
-          <div className="panel-header"><div className="panel-title">Pass rate by collection</div></div>
-          <div className="chart-bar-group">
-            {moduleStats.map(ms => (
-              <div key={ms.module} className="bar-row">
-                <div className="bar-label">{ms.module}</div>
-                <div className="bar-track"><div className="bar-fill" style={{ width: `${ms.rate}%`, background: ms.rate >= 90 ? "var(--accent)" : ms.rate >= 70 ? "var(--warn)" : "var(--danger)" }} /></div>
+          <div className="panel-header">
+            <div className="panel-title">Collections — test case health</div>
+          </div>
+          <div className="chart-bar-group" style={{ paddingBottom: 8 }}>
+            {collectionStats.map(ms => (
+              <div key={ms.id} className="bar-row">
+                <div className="bar-label" title={`${ms.latestPass} pass · ${ms.latestFail} fail · ${ms.pending} other`}>
+                  {ms.name}
+                  <span style={{ fontSize: 9, color: "var(--muted)", display: "block" }}>
+                    {ms.latestPass}✓ {ms.latestFail}✗ {ms.pending}···
+                  </span>
+                </div>
+                <div className="bar-track">
+                  <div
+                    className="bar-fill"
+                    style={{
+                      width: `${ms.rate}%`,
+                      background: ms.rate >= 90 ? "var(--accent)" : ms.rate >= 70 ? "var(--warn)" : "var(--danger)",
+                    }}
+                  />
+                </div>
                 <div className="bar-val">{ms.rate}%</div>
               </div>
             ))}
-            {moduleStats.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Create tests to see collection breakdown</div>}
+            {collectionStats.length === 0 && (
+              <div style={{ color: "var(--muted)", fontSize: 12 }}>Add collections in Test Library to group tests</div>
+            )}
           </div>
         </div>
       </div>
+
+      {failingTests.length > 0 && (
+        <div className="panel" style={{ marginTop: 14 }}>
+          <div className="panel-header">
+            <div className="panel-title">Open issues — latest failing test cases</div>
+            <div style={{ fontSize: 11, color: "var(--muted)", cursor: "pointer" }} onClick={() => onNav("reports")}>
+              Reports →
+            </div>
+          </div>
+          <div className="panel-body">
+            {failingTests.map(({ test, run: r }) => (
+              <div
+                key={`${r.id}-${test?.id}`}
+                className="run-row"
+                onClick={() => onOpenRun(r.id)}
+                style={{ cursor: "pointer" }}
+              >
+                <div className={`status-icon ${statusIcon(r.status)}`} />
+                <div style={{ flex: 1 }}>
+                  <div className="run-name">{test?.name || `Test #${r.test_id}`}</div>
+                  <div className="run-meta" style={{ fontSize: 10, color: "var(--danger)", maxHeight: 36, overflow: "hidden" }}>
+                    {(r.error_message || "").slice(0, 180) || "See run for details"}
+                  </div>
+                </div>
+                <div className="run-dur">{ago(r.finished_at || r.started_at)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -591,23 +929,29 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     if (!activeRunId) { setRun(null); setStepResults([]); setSelShot(null); return; }
     loadRun(activeRunId);
     wsRef.current?.close();
-    const ws = new WebSocket(`ws://${location.host}/ws/runs/${activeRunId}`);
-    wsRef.current = ws;
-    ws.onmessage = msg => {
-      const ev = JSON.parse(msg.data);
-      if (ev.type === "step") {
-        const p = ev.payload;
-        setStepResults(prev => { const n = [...prev]; n[p.idx] = { idx: p.idx, status: p.status, details: p.details, screenshot: p.screenshot, pageSource: p.pageSource }; return n; });
-        if (p.screenshot) setSelShot(p.screenshot);
-        if (p.pageSource) {
-          setLiveXmlName(p.pageSource);
-          fetch(`/api/artifacts/${project.id}/${activeRunId}/${p.pageSource}`).then(r => r.ok ? r.text() : "").then(setLiveXml).catch(() => {});
+    let cancelled = false;
+    (async () => {
+      const token = await api.bootstrapAuth();
+      if (cancelled) return;
+      const url = `ws://${location.host}/ws/runs/${activeRunId}${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      ws.onmessage = msg => {
+        const ev = JSON.parse(msg.data);
+        if (ev.type === "step") {
+          const p = ev.payload;
+          setStepResults(prev => { const n = [...prev]; n[p.idx] = { idx: p.idx, status: p.status, details: p.details, screenshot: p.screenshot, pageSource: p.pageSource }; return n; });
+          if (p.screenshot) setSelShot(p.screenshot);
+          if (p.pageSource) {
+            setLiveXmlName(p.pageSource);
+            fetch(`/api/artifacts/${project.id}/${activeRunId}/${p.pageSource}`).then(r => r.ok ? r.text() : "").then(setLiveXml).catch(() => {});
+          }
         }
-      }
-      if (ev.type === "finished") { loadRun(activeRunId); onRefresh(); }
-    };
-    pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
-    return () => { ws.close(); if (pollRef.current) clearInterval(pollRef.current); };
+        if (ev.type === "finished") { loadRun(activeRunId); onRefresh(); }
+      };
+      pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
+    })();
+    return () => { cancelled = true; wsRef.current?.close(); wsRef.current = null; if (pollRef.current) clearInterval(pollRef.current); };
   }, [activeRunId, loadRun, onRefresh]);
 
   const waitForRunComplete = async (runId: number): Promise<Run> => {
@@ -664,7 +1008,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       if (passedSteps < bestPassed && iter > 0) {
         const failedIdxRevert = stepResultsArr.findIndex((s: any) => s?.status === "failed");
         const prereqForRevert = currentTest.prerequisite_test_id ? freshTests.find(t => t.id === currentTest.prerequisite_test_id) : null;
-        const targetForRevert = prereqForRevert && failedIdxRevert < (prereqForRevert.steps || []).length ? prereqForRevert : currentTest;
+        const targetForRevert = prereqForRevert && failedIdxRevert < stepsForPlatform(prereqForRevert, platform).length ? prereqForRevert : currentTest;
         lastFailedFix = (targetForRevert.fix_history as any[])?.slice(-1) ?? [];
         addAgentLog(`Fix regressed (${passedSteps} < ${bestPassed}). Reverting and requesting different solution...`);
         toast(`Agent: fix regressed — reverting and asking AI for a different approach`, "info");
@@ -683,11 +1027,11 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       const failedIdx = stepResultsArr.findIndex((s: any) => s?.status === "failed");
       if (failedIdx < 0) return;
       setAgentStatus(`Applying AI fix for step ${failedIdx + 1}...`);
-      addAgentLog(`Failed at step ${failedIdx + 1}. Requesting AI fix...`);
+      addAgentLog(`Failed at step ${failedIdx + 1}. Requesting AI fix (tap diagnosis runs on server)...`);
       const prereq = currentTest.prerequisite_test_id ? testsForFix.find(t => t.id === currentTest.prerequisite_test_id) : null;
-      const mergedSteps = prereq ? [...(prereq.steps || []), ...(currentTest.steps || [])] : (currentTest.steps || []);
-      const targetTest = prereq && failedIdx < (prereq.steps || []).length ? prereq : currentTest;
-      const prereqLen = prereq ? (prereq.steps || []).length : 0;
+      const mergedSteps = prereq ? [...stepsForPlatform(prereq, platform), ...stepsForPlatform(currentTest, platform)] : stepsForPlatform(currentTest, platform);
+      const targetTest = prereq && failedIdx < stepsForPlatform(prereq, platform).length ? prereq : currentTest;
+      const prereqLen = prereq ? stepsForPlatform(prereq, platform).length : 0;
       let failXml = "";
       const artifacts = (completed.artifacts as any) || {};
       const pageSources = artifacts.pageSources || [];
@@ -714,6 +1058,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       try {
         const fixRes = await api.fixSteps({
           platform,
+          target_platform: completed.platform,
           original_steps: mergedSteps,
           step_results: stepResultsArr.map((s: any) => s ? { status: s.status, details: s.details } : { status: "pending" }),
           failed_step_index: failedIdx,
@@ -725,14 +1070,32 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
           acceptance_criteria: targetTest.acceptance_criteria || "",
           app_context: appContextAgent,
         });
+        if (fixRes.tap_diagnosis) {
+          const d = fixRes.tap_diagnosis;
+          const causeLabels: Record<string, string> = {
+            wrong_selector: "wrong selector strategy",
+            timing_race: "timing — element not ready yet",
+            scrolled_off: "element scrolled off screen",
+            overlay_blocking: "overlay blocking element",
+            element_disabled: "element disabled",
+            wrong_screen: "app on wrong screen",
+            element_missing: "element not in page source",
+          };
+          addAgentLog(
+            `Tap diagnosis: ${causeLabels[d.root_cause] || d.root_cause}` +
+              (d.suggestions?.[0] ? ` → try ${d.suggestions[0].strategy}=${d.suggestions[0].value}` : "")
+          );
+          if (d.recommended_wait_ms) addAgentLog(`Diagnosis: add ~${d.recommended_wait_ms}ms wait before tap if needed`);
+        }
         addAgentLog(`AI fix applied: ${fixRes.changes.length} change(s). Updating test...`);
         setRun(completed);
         setStepResults(stepResultsArr);
         setFixResult(fixRes);
+        setTapDiagnosis(fixRes.tap_diagnosis ?? null);
         setShowFixPanel(true);
         const fixedForTarget = prereq ? (failedIdx < prereqLen ? fixRes.fixed_steps.slice(0, prereqLen) : fixRes.fixed_steps.slice(prereqLen)) : fixRes.fixed_steps;
-        await api.updateTest(targetTest.id, { steps: fixedForTarget });
-        await api.appendFixHistory(targetTest.id, { analysis: fixRes.analysis, fixed_steps: fixedForTarget, changes: fixRes.changes, run_id: completed.id, steps_before_fix: targetTest.steps });
+        await api.updateTest(targetTest.id, { steps: fixedForTarget, platform: completed.platform });
+        await api.appendFixHistory(targetTest.id, { analysis: fixRes.analysis, fixed_steps: fixedForTarget, changes: fixRes.changes, run_id: completed.id, steps_before_fix: stepsForPlatform(targetTest, completed.platform), target_platform: completed.platform });
         onRefresh();
         lastFailedFix = [];
         addAgentLog(`Fix saved. Rerunning...`);
@@ -759,6 +1122,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         setAgentProgressLog([]);
         setShowFixPanel(false);
         setFixResult(null);
+        setTapDiagnosis(null);
         for (let i = 0; i < toRun.length; i++) {
           if (agentPausedRef.current) break;
           setAgentStatus(`Test ${i + 1}/${toRun.length}: ${toRun[i].name}`);
@@ -798,6 +1162,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   // AI Fix state
   const [fixBusy, setFixBusy] = useState(false);
   const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[] } | null>(null);
+  const [tapDiagnosis, setTapDiagnosis] = useState<TapDiagnosisOut | null>(null);
   const [showFixPanel, setShowFixPanel] = useState(false);
   const [fixSuggestion, setFixSuggestion] = useState("");
   const [relatedTests, setRelatedTests] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
@@ -807,7 +1172,8 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   const pageSources = ((run?.artifacts as any)?.pageSources || []) as string[];
   const testForRun = run?.test_id ? tests.find(t => t.id === run.test_id) : null;
   const prereq = testForRun?.prerequisite_test_id ? tests.find(t => t.id === testForRun.prerequisite_test_id) : null;
-  const mergedSteps = prereq ? [...(prereq.steps || []), ...(testForRun?.steps || [])] : (testForRun?.steps || []);
+  const runPf = (run?.platform ?? platform) as Run["platform"];
+  const mergedSteps = prereq ? [...stepsForPlatform(prereq, runPf), ...stepsForPlatform(testForRun, runPf)] : stepsForPlatform(testForRun, runPf);
   const stepDefs = ((run?.summary as any)?.stepDefinitions as any[]) || mergedSteps;
   const completedSteps = stepResults.filter(s => s?.status).length;
   const passedSteps = stepResults.filter(s => s?.status === "passed").length;
@@ -841,7 +1207,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
 
   const aiFixRun = async () => {
     if (!run || !testForRun || failedIdx < 0) return;
-    setFixBusy(true); setFixResult(null); setShowFixPanel(true);
+    setFixBusy(true); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(true);
     toast("AI is analyzing screenshot, XML, and error logs...", "info");
 
     // Fetch page source XML from the failed step
@@ -872,7 +1238,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     const failDetails = stepResults[failedIdx]?.details;
     const errMsg = run.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
 
-    const prereqStepsLen = prereq ? (prereq.steps || []).length : 0;
+    const prereqStepsLen = prereq ? stepsForPlatform(prereq, run.platform).length : 0;
     const failureInPrereq = prereq && failedIdx < prereqStepsLen;
     const targetTest = failureInPrereq ? prereq : testForRun;
     const testNameWithContext = prereq
@@ -885,6 +1251,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     try {
       const res = await api.fixSteps({
         platform: run.platform,
+        target_platform: run.platform,
         original_steps: stepDefs,
         step_results: stepResults.map(s => s ? { status: s.status, details: s.details } : { status: "pending" }),
         failed_step_index: failedIdx,
@@ -897,6 +1264,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         app_context: appContext,
       });
       setFixResult(res);
+      setTapDiagnosis(res.tap_diagnosis ?? null);
       setRelatedTests(null);
       if (targetTest) {
         try { const rel = await api.getRelatedTests(targetTest.id); setRelatedTests(rel); } catch {}
@@ -911,6 +1279,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   const refineFixRun = async () => {
     if (!run || !testForRun || !fixResult || !fixSuggestion.trim()) return;
     setFixBusy(true);
+    setTapDiagnosis(null);
     toast("AI is refining the fix with your suggestion...", "info");
     let failXml = "";
     const failPs = pageSources[failedIdx] || stepResults[failedIdx]?.pageSource;
@@ -933,7 +1302,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     }
     const failDetails = stepResults[failedIdx]?.details;
     const errMsg = run.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
-    const prereqStepsLenR = prereq ? (prereq.steps || []).length : 0;
+    const prereqStepsLenR = prereq ? stepsForPlatform(prereq, run.platform).length : 0;
     const failureInPrereqR = prereq && failedIdx < prereqStepsLenR;
     const targetTestR = failureInPrereqR ? prereq : testForRun;
     const testNameWithContextR = prereq
@@ -945,6 +1314,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     try {
       const res = await api.refineFix({
         platform: run.platform,
+        target_platform: run.platform,
         original_steps: stepDefs,
         step_results: stepResults.map(s => s ? { status: s.status, details: s.details } : { status: "pending" }),
         failed_step_index: failedIdx,
@@ -961,6 +1331,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         user_suggestion: fixSuggestion.trim(),
       });
       setFixResult(res);
+      setTapDiagnosis(res.tap_diagnosis ?? null);
       setFixSuggestion("");
       toast("Fix refined", "success");
     } catch (e: any) {
@@ -968,7 +1339,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     } finally { setFixBusy(false); }
   };
 
-  const prereqStepsLenApply = prereq ? (prereq.steps || []).length : 0;
+  const prereqStepsLenApply = prereq ? stepsForPlatform(prereq, run?.platform ?? platform).length : 0;
   const failureInPrereqApply = prereq && failedIdx >= 0 && failedIdx < prereqStepsLenApply;
   const targetTestApply = failureInPrereqApply && prereq ? prereq : testForRun;
   const fixedStepsForTarget = prereq && fixResult
@@ -980,15 +1351,17 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     setBusy(true);
     try {
       if (mode === "update") {
-        await api.updateTest(targetTestApply.id, { steps: fixedStepsForTarget });
-        await api.appendFixHistory(targetTestApply.id, { analysis: fixResult.analysis, fixed_steps: fixedStepsForTarget, changes: fixResult.changes, run_id: run.id, steps_before_fix: targetTestApply.steps });
+        await api.updateTest(targetTestApply.id, { steps: fixedStepsForTarget, platform: run.platform });
+        await api.appendFixHistory(targetTestApply.id, { analysis: fixResult.analysis, fixed_steps: fixedStepsForTarget, changes: fixResult.changes, run_id: run.id, steps_before_fix: stepsForPlatform(targetTestApply, run.platform), target_platform: run.platform });
         toast(failureInPrereqApply ? `Prerequisite "${targetTestApply.name}" updated with fixed steps` : "Test updated with fixed steps", "success");
       } else {
-        await api.createTest(project.id, { name: `${targetTestApply.name} (fixed)`, steps: fixedStepsForTarget, acceptance_criteria: targetTestApply.acceptance_criteria || null });
+        const psNew = run.platform === "ios_sim" ? { android: [] as any[], ios_sim: fixedStepsForTarget } : { android: fixedStepsForTarget, ios_sim: [] as any[] };
+        await api.createTest(project.id, { name: `${targetTestApply.name} (fixed)`, steps: run.platform === "android" ? fixedStepsForTarget : [], platform_steps: psNew, acceptance_criteria: targetTestApply.acceptance_criteria || null });
         toast("New test created with fixed steps", "success");
       }
       setShowFixPanel(false);
       setFixResult(null);
+      setTapDiagnosis(null);
       setRelatedTests(null);
       onRefresh();
     } catch (e: any) { toast(e.message, "error"); }
@@ -1003,20 +1376,22 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     }
     if (!relatedTests?.similar?.length) return;
     const mainFailedIdx = prereq ? failedIdx - prereqStepsLenApply : failedIdx;
-    const prefixLen = Math.min(mainFailedIdx + 1, testForRun.steps.length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
+    const prefixLen = Math.min(mainFailedIdx + 1, stepsForPlatform(testForRun, run.platform).length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
     if (prefixLen < 2) return;
     setBusy(true);
     try {
       const stepsToApply = prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps;
-      await api.updateTest(testForRun.id, { steps: stepsToApply });
-      await api.appendFixHistory(testForRun.id, { analysis: fixResult.analysis, fixed_steps: stepsToApply, changes: fixResult.changes, run_id: run.id, steps_before_fix: testForRun.steps });
+      await api.updateTest(testForRun.id, { steps: stepsToApply, platform: run.platform });
+      await api.appendFixHistory(testForRun.id, { analysis: fixResult.analysis, fixed_steps: stepsToApply, changes: fixResult.changes, run_id: run.id, steps_before_fix: stepsForPlatform(testForRun, run.platform), target_platform: run.platform });
       const res = await api.applyFixToRelated(testForRun.id, {
         fixed_steps: stepsToApply,
         prefix_length: prefixLen,
-        original_steps: testForRun.steps,
+        original_steps: stepsForPlatform(testForRun, run.platform),
+        target_platform: run.platform,
       });
       setShowFixPanel(false);
       setFixResult(null);
+      setTapDiagnosis(null);
       setRelatedTests(null);
       onRefresh();
       toast(`Fixed this test + ${res.updated_test_ids.length} related test${res.updated_test_ids.length !== 1 ? "s" : ""}`, "success");
@@ -1030,7 +1405,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     setTimeout(async () => {
       try {
         const r = await api.createRun({ project_id: run.project_id, build_id: run.build_id ?? undefined, test_id: testForRun.id, platform: run.platform, device_target: run.device_target });
-        setStepResults([]); setSelShot(null); setFixResult(null); setShowFixPanel(false);
+        setStepResults([]); setSelShot(null); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(false);
         onRunCreated(r.id);
         toast(`Rerun with fix → #${r.id}`, "success");
       } catch (e: any) { toast(e.message, "error"); }
@@ -1325,8 +1700,143 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                     <div className="panel-title" style={{ color: "#a78bfa" }}>🤖 AI Fix Analysis{agentRunning ? " (Agent auto-applied)" : ""}</div>
                     {agentRunning && <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 2 }}>Agent applied this fix and is rerunning the test</div>}
                   </div>
-                  <button className="btn-ghost btn-sm" onClick={() => { setShowFixPanel(false); setFixResult(null); setFixSuggestion(""); }} style={{ fontSize: 10 }} disabled={agentRunning}>✕ Close</button>
+                  <button className="btn-ghost btn-sm" onClick={() => { setShowFixPanel(false); setFixResult(null); setTapDiagnosis(null); setFixSuggestion(""); }} style={{ fontSize: 10 }} disabled={agentRunning}>✕ Close</button>
                 </div>
+                {tapDiagnosis && (
+                  <div
+                    style={{
+                      margin: "10px 14px 0",
+                      padding: "10px 12px",
+                      borderRadius: 8,
+                      border: "1px solid var(--border)",
+                      background: "var(--bg3)",
+                      fontSize: 11,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, fontFamily: "var(--sans)" }}>Tap diagnosis</span>
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "1px 7px",
+                          borderRadius: 20,
+                          fontWeight: 600,
+                          background:
+                            {
+                              wrong_selector: "rgba(255,176,32,.15)",
+                              timing_race: "rgba(99,102,241,.18)",
+                              scrolled_off: "rgba(255,176,32,.15)",
+                              overlay_blocking: "rgba(255,59,92,.12)",
+                              element_disabled: "rgba(255,59,92,.12)",
+                              wrong_screen: "rgba(255,176,32,.15)",
+                              element_missing: "rgba(255,59,92,.15)",
+                            }[tapDiagnosis.root_cause] || "var(--bg2)",
+                          color:
+                            tapDiagnosis.root_cause === "element_missing" || tapDiagnosis.root_cause === "overlay_blocking" || tapDiagnosis.root_cause === "element_disabled"
+                              ? "var(--danger)"
+                              : "var(--warn)",
+                        }}
+                      >
+                        {{
+                          wrong_selector: "wrong selector",
+                          timing_race: "timing issue",
+                          scrolled_off: "scrolled off screen",
+                          overlay_blocking: "overlay blocking",
+                          element_disabled: "element disabled",
+                          wrong_screen: "wrong screen",
+                          element_missing: "element missing",
+                        }[tapDiagnosis.root_cause as string] || tapDiagnosis.root_cause}
+                      </span>
+                      {tapDiagnosis.found && (
+                        <span
+                          style={{
+                            fontSize: 10,
+                            padding: "1px 7px",
+                            borderRadius: 20,
+                            background: "rgba(0,229,160,.12)",
+                            color: "var(--accent)",
+                            fontWeight: 600,
+                          }}
+                        >
+                          element in hierarchy
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ color: "var(--muted)", lineHeight: 1.6, marginBottom: 8 }}>{tapDiagnosis.root_cause_detail}</div>
+                    {tapDiagnosis.suggestions?.length > 0 && (
+                      <div style={{ border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden", marginBottom: 8 }}>
+                        <div
+                          style={{
+                            fontSize: 9,
+                            color: "var(--muted)",
+                            padding: "4px 8px",
+                            textTransform: "uppercase",
+                            letterSpacing: ".6px",
+                            borderBottom: "1px solid var(--border)",
+                            background: "var(--bg2)",
+                          }}
+                        >
+                          Working selectors — ranked
+                        </div>
+                        {tapDiagnosis.suggestions.slice(0, 3).map((s, i) => (
+                          <div
+                            key={i}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              padding: "5px 8px",
+                              borderBottom: i < 2 ? "1px solid var(--border)" : "none",
+                              background: i === 0 ? "rgba(0,229,160,.04)" : "transparent",
+                            }}
+                          >
+                            <span style={{ fontSize: 10, minWidth: 80, fontFamily: "var(--mono)", color: i === 0 ? "var(--accent)" : "var(--muted)" }}>{s.strategy}</span>
+                            <span
+                              style={{
+                                fontSize: 10,
+                                flex: 1,
+                                fontFamily: "var(--mono)",
+                                color: i === 0 ? "var(--accent)" : "var(--text)",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                              title={s.value}
+                            >
+                              {s.value}
+                            </span>
+                            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+                              <span
+                                style={{
+                                  fontSize: 9,
+                                  fontWeight: 600,
+                                  color: s.score >= 80 ? "var(--accent)" : s.score >= 50 ? "var(--warn)" : "var(--muted)",
+                                }}
+                              >
+                                {s.score}%
+                              </span>
+                              <div style={{ width: 48, height: 3, background: "var(--bg2)", borderRadius: 2, overflow: "hidden" }}>
+                                <div
+                                  style={{
+                                    height: "100%",
+                                    borderRadius: 2,
+                                    width: `${Math.min(100, s.score)}%`,
+                                    background: s.score >= 80 ? "var(--accent)" : s.score >= 50 ? "var(--warn)" : "var(--muted)",
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {tapDiagnosis.recommended_wait_ms > 0 && (
+                      <div style={{ fontSize: 11, color: "var(--accent2)", fontStyle: "italic" }}>
+                        Suggested wait: ~{tapDiagnosis.recommended_wait_ms}ms before the tap — timing may be the issue; the AI prompt includes this.
+                      </div>
+                    )}
+                  </div>
+                )}
                 {fixBusy && (
                   <div style={{ padding: 24, textAlign: "center" }}>
                     <div className="spinner" style={{ margin: "0 auto 12px" }} />
@@ -1506,50 +2016,6 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
               </div>
             </div>
 
-            {/* Analytics Events */}
-            <div className="panel">
-              <div className="panel-header">
-                <div className="panel-title">Analytics Events</div>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>assertion tracking</div>
-              </div>
-              <div>
-                {(() => {
-                  const events = (run?.summary as any)?.events || [];
-                  const assertSteps = stepDefs.map((s: any, i: number) => ({ s, i })).filter(({ s }) => s.type === "assertText" || s.type === "assertVisible" || s.type?.includes("analytics") || s.type?.includes("assert"));
-                  if (events.length > 0) {
-                    return events.map((ev: any, i: number) => (
-                      <div key={i} className="event-row" style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, fontSize: 11 }}>
-                        <div style={{ fontSize: 10, color: "var(--muted)", minWidth: 28 }}>S{ev.step + 1}</div>
-                        <div style={{ background: "rgba(99,102,241,.15)", color: "#a78bfa", fontSize: 9, padding: "1px 5px", borderRadius: 3 }}>{ev.type}</div>
-                        <div style={{ color: "var(--accent2)", flex: 1, fontFamily: "var(--mono)" }}>{ev.name}</div>
-                        {ev.expected && <div style={{ color: "var(--muted)", fontSize: 10 }}>expect: {ev.expected}</div>}
-                        {ev.actual && <div style={{ color: "var(--muted)", fontSize: 10 }}>got: {ev.actual}</div>}
-                        {ev.status === "passed" && <div style={{ background: "rgba(0,229,160,.15)", color: "var(--accent)", fontSize: 10, padding: "1px 6px", borderRadius: 3 }}>✓ fired</div>}
-                        {ev.status === "failed" && <div style={{ background: "rgba(255,59,92,.15)", color: "var(--danger)", fontSize: 10, padding: "1px 6px", borderRadius: 3 }}>✕ {ev.error || "failed"}</div>}
-                      </div>
-                    ));
-                  }
-                  if (assertSteps.length > 0) {
-                    return assertSteps.map(({ s, i }: any) => {
-                      const res = stepResults[i];
-                      const st = res?.status;
-                      const evName = s.selector?.value || s.expect || s.text || `step_${i}`;
-                      return (
-                        <div key={i} className="event-row" style={{ padding: "8px 14px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 10, fontSize: 11 }}>
-                          <div style={{ fontSize: 10, color: "var(--muted)", minWidth: 28 }}>S{i + 1}</div>
-                          <div style={{ background: "rgba(99,102,241,.15)", color: "#a78bfa", fontSize: 9, padding: "1px 5px", borderRadius: 3 }}>{s.type}</div>
-                          <div style={{ color: "var(--accent2)", flex: 1, fontFamily: "var(--mono)" }}>{evName}</div>
-                          {st === "passed" && <div style={{ background: "rgba(0,229,160,.15)", color: "var(--accent)", fontSize: 10, padding: "1px 6px", borderRadius: 3 }}>✓ fired</div>}
-                          {st === "failed" && <div style={{ background: "rgba(255,59,92,.15)", color: "var(--danger)", fontSize: 10, padding: "1px 6px", borderRadius: 3 }}>✕ failed</div>}
-                          {!st && <div style={{ background: "rgba(255,176,32,.15)", color: "var(--warn)", fontSize: 10, padding: "1px 6px", borderRadius: 3 }}>pending</div>}
-                        </div>
-                      );
-                    });
-                  }
-                  return <div style={{ padding: 14, color: "var(--muted)", fontSize: 11 }}>No analytics assertions in this test. Add assertText or assertVisible steps to track events.</div>;
-                })()}
-              </div>
-            </div>
           </div>
         </div>
       )}
@@ -1630,6 +2096,8 @@ function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onP
 
 function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { project: Project; tests: TestDef[]; runs: Run[]; modules: ModuleDef[]; suites: SuiteDef[]; onRefresh: () => void }) {
   const [busy, setBusy] = useState(false);
+  /** Upload % when set, or null = indeterminate (AI / server processing). */
+  const [taskProgress, setTaskProgress] = useState<{ label: string; pct: number | null } | null>(null);
   const [platform, setPlatform] = useState<"android" | "ios_sim">("android");
 
   // Create test state
@@ -1645,7 +2113,18 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   // Edit test state
   const [editId, setEditId] = useState<number | null>(null);
   const [editName, setEditName] = useState("");
-  const [editSteps, setEditSteps] = useState<any[]>([]);
+  const [editPfTab, setEditPfTab] = useState<"android" | "ios_sim">("android");
+  const [editStepsAndroid, setEditStepsAndroid] = useState<any[]>([]);
+  const [editStepsIos, setEditStepsIos] = useState<any[]>([]);
+  const editSteps = editPfTab === "android" ? editStepsAndroid : editStepsIos;
+  const setEditSteps = useCallback(
+    (u: any[] | ((prev: any[]) => any[])) => {
+      const apply = (prev: any[]) => (typeof u === "function" ? (u as (p: any[]) => any[])(prev) : u);
+      if (editPfTab === "android") setEditStepsAndroid(apply);
+      else setEditStepsIos(apply);
+    },
+    [editPfTab],
+  );
   const [editSuiteId, setEditSuiteId] = useState<number | null>(null);
   const [editPrerequisiteId, setEditPrerequisiteId] = useState<number | null>(null);
   const [editAcceptanceCriteria, setEditAcceptanceCriteria] = useState("");
@@ -1663,6 +2142,30 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const [genSuiteTargetId, setGenSuiteTargetId] = useState<number | null>(null);
   const [genSuiteStatus, setGenSuiteStatus] = useState("");
 
+  // Import script / sheet (preview → confirm)
+  const [showImport, setShowImport] = useState(false);
+  const [importSuiteId, setImportSuiteId] = useState<number | null>(null);
+  const [importPreview, setImportPreview] = useState<{
+    test_cases: any[];
+    warnings: string[];
+    filename: string;
+    row_count?: number;
+    scripts?: { name: string; content: string }[];
+  } | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [importTab, setImportTab] = useState<"single" | "bulk">("single");
+  const [importGroovyIdx, setImportGroovyIdx] = useState(0);
+  const [bulkImportResult, setBulkImportResult] = useState<{
+    groups: Record<string, any[]>;
+    total_cases: number;
+    total_files: number;
+    warnings: string[];
+    files: { path: string; cases_count: number; status: string }[];
+  } | null>(null);
+  const [bulkModuleId, setBulkModuleId] = useState<number | null>(null);
+  const [bulkFlatCases, setBulkFlatCases] = useState<any[]>([]);
+  const zipImportRef = useRef<HTMLInputElement>(null);
+  const folderImportRef = useRef<HTMLInputElement>(null);
   // Filters for test table: null = all suites, [] = none, [id,...] = these suites
   const [filterCollectionId, setFilterCollectionId] = useState<number | null>(null);
   const [filterSuiteIds, setFilterSuiteIds] = useState<number[] | null>(null);
@@ -1678,44 +2181,114 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
 
   const aiGenerate = async () => {
     if (!aiPrompt.trim()) { toast("Describe the test", "error"); return; }
-    setBusy(true); setAiStatus("Generating...");
+    setBusy(true);
+    setTaskProgress({ label: "Capturing page source (Appium)…", pct: null });
+    setAiStatus("Generating...");
     let xml = "";
-    try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
-    try { const res = await api.generateSteps(platform, aiPrompt, xml); setNewSteps(res.steps); setNewAcceptanceCriteria(prev => prev || aiPrompt); setAiStatus(`Generated ${res.steps.length} steps`); toast(`AI generated ${res.steps.length} steps`, "success"); }
-    catch (e: any) { setAiStatus(""); toast(e.message, "error"); }
-    finally { setBusy(false); }
+    try {
+      try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      setTaskProgress({ label: "AI is generating steps — usually 15–45s…", pct: null });
+      const res = await api.generateSteps(platform === "ios_sim" ? "ios_sim" : "android", aiPrompt, xml);
+      setNewSteps(res.steps);
+      setNewAcceptanceCriteria(prev => prev || aiPrompt);
+      setAiStatus(`Generated ${res.steps.length} steps`);
+      toast(`AI generated ${res.steps.length} steps`, "success");
+    } catch (e: any) {
+      setAiStatus("");
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+      setTaskProgress(null);
+    }
   };
 
   const saveNew = async () => {
     if (!newName.trim()) { toast("Enter test name", "error"); return; }
     if (!newSteps.length) { toast("Add steps", "error"); return; }
     setBusy(true);
-    try { await api.createTest(project.id, { name: newName.trim(), steps: newSteps, suite_id: newSuiteId, prerequisite_test_id: newPrerequisiteId, acceptance_criteria: newAcceptanceCriteria.trim() || null }); toast("Test saved", "success"); setNewName(""); setNewSteps([]); setNewPrerequisiteId(null); setNewAcceptanceCriteria(""); setNewXml(null); setNewSelectorPickStepIndex(null); setShowCreate(false); onRefresh(); }
+    const ps =
+      platform === "ios_sim"
+        ? { android: [] as any[], ios_sim: [...newSteps] }
+        : { android: [...newSteps], ios_sim: [] as any[] };
+    try {
+      await api.createTest(project.id, {
+        name: newName.trim(),
+        steps: platform === "android" ? newSteps : [],
+        platform_steps: ps,
+        suite_id: newSuiteId,
+        prerequisite_test_id: newPrerequisiteId,
+        acceptance_criteria: newAcceptanceCriteria.trim() || null,
+      });
+      toast("Test saved", "success");
+      setNewName("");
+      setNewSteps([]);
+      setNewPrerequisiteId(null);
+      setNewAcceptanceCriteria("");
+      setNewXml(null);
+      setNewSelectorPickStepIndex(null);
+      setShowCreate(false);
+      onRefresh();
+    }
     catch (e: any) { toast(e.message, "error"); }
     finally { setBusy(false); }
   };
 
   const openEdit = (t: TestDef) => {
-    setEditId(t.id); setEditName(t.name); setEditSteps([...t.steps]); setEditSuiteId(t.suite_id); setEditPrerequisiteId(t.prerequisite_test_id ?? null); setEditAcceptanceCriteria(t.acceptance_criteria ?? ""); setAiEditPrompt(""); setAiEditStatus("");
+    setEditId(t.id);
+    setEditName(t.name);
+    setEditStepsAndroid([...stepsForPlatform(t, "android")]);
+    setEditStepsIos([...stepsForPlatform(t, "ios_sim")]);
+    setEditPfTab("android");
+    setEditSuiteId(t.suite_id);
+    setEditPrerequisiteId(t.prerequisite_test_id ?? null);
+    setEditAcceptanceCriteria(t.acceptance_criteria ?? "");
+    setAiEditPrompt("");
+    setAiEditStatus("");
     setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null);
     api.getRelatedTests(t.id).then(setEditRelated).catch(() => {});
   };
-  const cancelEdit = () => { setEditId(null); setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null); };
+  const cancelEdit = () => { setEditId(null); setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null); setEditStepsAndroid([]); setEditStepsIos([]); };
 
   const saveEdit = async () => {
     if (!editId || !editName.trim()) return;
     setBusy(true);
-    try { await api.updateTest(editId, { name: editName, steps: editSteps, suite_id: editSuiteId, prerequisite_test_id: editPrerequisiteId, acceptance_criteria: editAcceptanceCriteria.trim() || null }); toast("Test updated", "success"); setEditId(null); onRefresh(); }
+    try {
+      const androidOut = editPfTab === "android" ? editSteps : editStepsAndroid;
+      const iosOut = editPfTab === "ios_sim" ? editSteps : editStepsIos;
+      await api.updateTest(editId, {
+        name: editName,
+        platform_steps: { android: androidOut, ios_sim: iosOut },
+        suite_id: editSuiteId,
+        prerequisite_test_id: editPrerequisiteId,
+        acceptance_criteria: editAcceptanceCriteria.trim() || null,
+      });
+      toast("Test updated", "success");
+      setEditId(null);
+      setEditStepsAndroid([]);
+      setEditStepsIos([]);
+      onRefresh();
+    }
     catch (e: any) { toast(e.message, "error"); }
     finally { setBusy(false); }
   };
 
   const aiEditRun = async () => {
     if (!aiEditPrompt.trim()) { toast("Describe the change", "error"); return; }
-    setBusy(true); setAiEditStatus("AI editing...");
-    try { const res = await api.editSteps(platform, editSteps, aiEditPrompt); setEditSteps(res.steps); setAiEditStatus(res.summary || `Applied — ${res.steps.length} steps`); toast("AI applied edits", "success"); }
-    catch (e: any) { setAiEditStatus(""); toast(e.message, "error"); }
-    finally { setBusy(false); }
+    setBusy(true);
+    setTaskProgress({ label: "AI is editing steps…", pct: null });
+    setAiEditStatus("AI editing...");
+    try {
+      const res = await api.editSteps(editPfTab, editSteps, aiEditPrompt);
+      setEditSteps(res.steps);
+      setAiEditStatus(res.summary || `Applied — ${res.steps.length} steps`);
+      toast("AI applied edits", "success");
+    } catch (e: any) {
+      setAiEditStatus("");
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+      setTaskProgress(null);
+    }
   };
 
   const createMod = async () => {
@@ -1737,18 +2310,26 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const aiGenerateSuite = async () => {
     if (!genSuitePrompt.trim()) { toast("Describe the feature to test", "error"); return; }
     if (!genSuiteTargetId) { toast("Select a Test Suite", "error"); return; }
-    setBusy(true); setGenSuiteStatus("Capturing page source...");
+    setBusy(true);
+    setTaskProgress({ label: "Capturing page source (Appium)…", pct: null });
+    setGenSuiteStatus("Capturing page source...");
     let xml = "";
-    try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
-    setGenSuiteStatus("AI generating test cases...");
     try {
+      try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
+      setTaskProgress({ label: "AI is generating multiple test cases — may take a minute…", pct: null });
+      setGenSuiteStatus("AI generating test cases...");
       const res = await api.generateSuite(platform, genSuitePrompt, project.id, genSuiteTargetId, xml);
       setGenSuiteStatus(`Created ${res.created} test cases`);
       toast(`Generated ${res.created} test cases`, "success");
       setGenSuitePrompt("");
       onRefresh();
-    } catch (e: any) { setGenSuiteStatus(""); toast(e.message, "error"); }
-    finally { setBusy(false); }
+    } catch (e: any) {
+      setGenSuiteStatus("");
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+      setTaskProgress(null);
+    }
   };
 
   const lastRunStatus = (testId: number) => { const r = runs.find(r => r.test_id === testId); return r ? r.status : null; };
@@ -1764,12 +2345,13 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
     if (!lastRun?.summary) return undefined;
     const stepResults = (lastRun.summary as any)?.stepResults as any[] | undefined;
     if (!Array.isArray(stepResults)) return undefined;
+    const rp = (lastRun.platform || "android") as Run["platform"];
     if (lastRunForTest) {
       const prereq = editTest.prerequisite_test_id ? tests.find(t => t.id === editTest!.prerequisite_test_id) : null;
-      const prereqLen = prereq ? (prereq.steps || []).length : 0;
+      const prereqLen = prereq ? stepsForPlatform(prereq, rp).length : 0;
       return stepResults.slice(prereqLen).map((s: any) => s?.status).filter(Boolean);
     }
-    return stepResults.slice(0, editTest.steps?.length ?? 0).map((s: any) => s?.status).filter(Boolean);
+    return stepResults.slice(0, stepsForPlatform(editTest, rp).length).map((s: any) => s?.status).filter(Boolean);
   })();
 
   const undoLastFix = async () => {
@@ -1777,7 +2359,10 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
     setBusy(true);
     try {
       const res = await api.undoLastFix(editId);
-      setEditSteps(res.steps);
+      const tp = (res.target_platform === "ios_sim" ? "ios_sim" : "android") as "android" | "ios_sim";
+      if (tp === "ios_sim") setEditStepsIos(res.steps);
+      else setEditStepsAndroid(res.steps);
+      setEditPfTab(tp);
       toast("Reverted to steps before last AI fix", "success");
       onRefresh();
     } catch (e: any) { toast(e.message, "error"); }
@@ -1799,16 +2384,356 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
       <div className="section-head">
         <div><div className="section-title">Test Library</div><div className="section-sub">{tests.length} test cases · {modules.length} collections · {suites.length} suites</div></div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn-ghost btn-sm" onClick={() => {
+            const opening = !showImport;
+            setShowImport(opening);
+            if (opening) setImportTab("single");
+            setImportPreview(null);
+            setBulkImportResult(null);
+            setBulkFlatCases([]);
+            setImportGroovyIdx(0);
+          }}>{showImport ? "Close" : "⬆ Import"}</button>
           <button className="btn-ghost btn-sm" onClick={() => setShowGenerateSuite(!showGenerateSuite)}>{showGenerateSuite ? "Close" : "✨ Generate Suite"}</button>
           <button className="btn-ghost btn-sm" onClick={() => setShowCreate(!showCreate)}>{showCreate ? "Close" : "+ New Test"}</button>
         </div>
       </div>
 
+      {taskProgress && (
+        <div className="library-task-progress library-task-progress--sticky" aria-live="polite">
+          <div className="library-task-progress-label">{taskProgress.label}</div>
+          <div className="progress-bar-track">
+            {taskProgress.pct == null ? (
+              <div className="progress-bar-indeterminate-wrap">
+                <div className="indeterminate-fill" />
+              </div>
+            ) : (
+              <div className="progress-fill" style={{ width: `${taskProgress.pct}%` }} />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Import Katalon / Gherkin / Python / sheet / ZIP / folder */}
+      {showImport && (
+        <div className="panel" style={{ padding: 18, marginBottom: 16, border: "1px solid rgba(0,229,160,.25)" }}>
+          <div style={{ fontFamily: "var(--sans)", fontWeight: 600, marginBottom: 8 }}>⬆ Import tests</div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>
+            Single file (including .csv / .xlsx): rows become steps from the Steps + Expected columns, each case gets a Katalon Groovy preview. Folder/ZIP for bulk scripts.
+          </div>
+
+          <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+            <button type="button" className={importTab === "single" ? "btn-primary btn-sm" : "btn-ghost btn-sm"} onClick={() => setImportTab("single")}>Single file</button>
+            <button type="button" className={importTab === "bulk" ? "btn-primary btn-sm" : "btn-ghost btn-sm"} onClick={() => setImportTab("bulk")}>Folder / ZIP</button>
+          </div>
+
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
+            <select value={platform} onChange={e => setPlatform(e.target.value as any)}><option value="android">Android</option><option value="ios_sim">iOS</option></select>
+            {importTab === "single" && (
+              <select value={importSuiteId ?? ""} onChange={e => setImportSuiteId(e.target.value ? Number(e.target.value) : null)} style={{ minWidth: 220 }}>
+                <option value="">Select target suite (required)</option>
+                {modules.map(m => suites.filter(s => s.module_id === m.id).map(s => <option key={s.id} value={s.id}>{m.name} / {s.name}</option>))}
+              </select>
+            )}
+            {importTab === "bulk" && (
+              <select value={bulkModuleId ?? ""} onChange={e => setBulkModuleId(e.target.value ? Number(e.target.value) : null)} style={{ minWidth: 220 }}>
+                <option value="">Collection for new suites (optional)</option>
+                {modules.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            )}
+          </div>
+
+          {importTab === "single" && (
+            <>
+              <input ref={importFileRef} type="file" accept=".groovy,.java,.feature,.py,.csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv" style={{ display: "none" }} onChange={async (e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (!f) return;
+                if (!importSuiteId) { toast("Select a target suite first", "error"); return; }
+                const n = f.name.toLowerCase();
+                setBusy(true);
+                setImportPreview(null);
+                setTaskProgress({ label: `Uploading ${f.name}…`, pct: 0 });
+                const onUp = (p: number | null) => {
+                  setTaskProgress({
+                    label: p == null ? `Uploading ${f.name}…` : p >= 100 ? `Processing ${f.name} on server…` : `Uploading ${f.name} — ${p}%`,
+                    pct: p != null && p < 100 ? p : null,
+                  });
+                };
+                try {
+                  if (n.endsWith(".csv") || n.endsWith(".xlsx")) {
+                    const r = await api.importSheet(project.id, importSuiteId, platform, f, { onUploadProgress: onUp });
+                    setImportGroovyIdx(0);
+                    setImportPreview({
+                      test_cases: (r.test_cases || []).map((tc: any) => ({ ...tc, import: tc.import !== false })),
+                      warnings: r.warnings || [],
+                      filename: r.filename,
+                      row_count: r.row_count,
+                      scripts: r.scripts,
+                    });
+                    toast(`Parsed ${r.row_count} row(s) · ${(r.scripts?.length ?? 0)} Groovy script(s)`, "success");
+                  } else {
+                    const r = await api.importScript(project.id, importSuiteId, platform, f, { onUploadProgress: onUp });
+                    setImportPreview({ test_cases: (r.test_cases || []).map((tc: any) => ({ ...tc, import: tc.import !== false })), warnings: r.warnings || [], filename: r.filename });
+                    const km = r.katalon_import_mode;
+                    toast(
+                      km === "ai"
+                        ? `Preview: ${r.test_cases?.length ?? 0} case(s) — Katalon script parsed with AI (verify selectors on device).`
+                        : km === "heuristic"
+                          ? `Preview: ${r.test_cases?.length ?? 0} case(s) — heuristic Katalon parse (set AI API key in Settings for Gemini parsing).`
+                          : `Preview: ${r.test_cases?.length ?? 0} test case(s)`,
+                      "success",
+                    );
+                  }
+                } catch (err: any) { toast(err.message || String(err), "error"); }
+                finally { setBusy(false); setTaskProgress(null); }
+              }} />
+              <button className="btn-primary btn-sm" disabled={busy || !importSuiteId} onClick={() => importFileRef.current?.click()}>{busy ? "…" : "Choose file"}</button>
+              {importPreview && (
+                <div style={{ borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                  <div style={{ fontSize: 12, marginBottom: 8, color: "var(--text)" }}><strong>{importPreview.filename}</strong>{importPreview.row_count != null ? ` · ${importPreview.row_count} rows` : ""}</div>
+                  {importPreview.warnings.length > 0 && (
+                    <div style={{ fontSize: 11, color: "var(--warn)", marginBottom: 10 }}>
+                      {importPreview.warnings.map((w, i) => <div key={i}>{w}</div>)}
+                    </div>
+                  )}
+                  <div style={{ maxHeight: 280, overflowY: "auto", marginBottom: 12, border: "1px solid var(--border)", borderRadius: 8 }}>
+                    {importPreview.test_cases.map((tc, idx) => (
+                      <div key={idx} style={{ padding: 10, borderBottom: "1px solid var(--border)", display: "grid", gridTemplateColumns: "28px 1fr auto", gap: 8, alignItems: "start" }}>
+                        <input type="checkbox" checked={!!tc.import} onChange={() => setImportPreview(p => !p ? null : { ...p, test_cases: p.test_cases.map((t, j) => j === idx ? { ...t, import: !t.import } : t) })} />
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: 12 }}>{tc.name || `Case ${idx + 1}`}</div>
+                          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>{Array.isArray(tc.steps) ? `${tc.steps.length} steps` : "—"} · {tc.acceptance_criteria ? String(tc.acceptance_criteria).slice(0, 120) : ""}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {(importPreview.scripts?.length ?? 0) > 0 && (
+                    <div style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: "var(--muted)" }}>Katalon Groovy (from sheet steps)</div>
+                      <select value={Math.min(importGroovyIdx, (importPreview.scripts?.length ?? 1) - 1)} onChange={e => setImportGroovyIdx(Number(e.target.value))} style={{ marginBottom: 8, fontSize: 11, minWidth: 240 }}>
+                        {importPreview.scripts!.map((s, i) => <option key={i} value={i}>{s.name}</option>)}
+                      </select>
+                      <pre style={{ maxHeight: 220, overflow: "auto", fontSize: 10, padding: 10, borderRadius: 8, border: "1px solid var(--border)", margin: 0, whiteSpace: "pre-wrap" }}>{importPreview.scripts![Math.min(importGroovyIdx, importPreview.scripts!.length - 1)]?.content || ""}</pre>
+                      <button type="button" className="btn-ghost btn-sm" style={{ marginTop: 8 }} disabled={busy} onClick={() => {
+                        const i = Math.min(importGroovyIdx, (importPreview.scripts?.length ?? 1) - 1);
+                        const one = importPreview.scripts![i];
+                        if (!one) return;
+                        const blob = new Blob([one.content], { type: "text/plain" });
+                        const a = document.createElement("a");
+                        a.href = URL.createObjectURL(blob);
+                        a.download = one.name;
+                        a.click();
+                      }}>⬇ Selected .groovy</button>
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button className="run-now-btn" style={{ padding: "8px 16px", fontSize: 11 }} disabled={busy || !importSuiteId || !importPreview.test_cases.some((t: any) => t.import)} onClick={async () => {
+                      setBusy(true);
+                      setTaskProgress({ label: "Saving imported tests to the library…", pct: null });
+                      try {
+                        const res = await api.confirmScriptImport(project.id, { suite_id: importSuiteId, test_cases: importPreview.test_cases });
+                        toast(`Imported ${res.created} test(s)`, "success");
+                        setImportPreview(null);
+                        setImportGroovyIdx(0);
+                        setShowImport(false);
+                        onRefresh();
+                      } catch (e: any) { toast(e.message, "error"); }
+                      finally { setBusy(false); setTaskProgress(null); }
+                    }}>✓ Import selected</button>
+                    <button type="button" className="btn-ghost btn-sm" disabled={busy || !importPreview.test_cases.some((t: any) => t.import)} onClick={async () => {
+                      setBusy(true);
+                      setTaskProgress({ label: "Building Katalon ZIP…", pct: null });
+                      try {
+                        await api.downloadKatalonZip(project.id, {
+                          test_cases: importPreview.test_cases.filter((t: any) => t.import),
+                          project_name: project.name,
+                        });
+                        toast("Katalon ZIP downloaded", "success");
+                      } catch (e: any) { toast(e.message || String(e), "error"); }
+                      finally { setBusy(false); setTaskProgress(null); }
+                    }}>⬇ Katalon ZIP</button>
+                    <button className="btn-ghost btn-sm" onClick={() => { setImportPreview(null); setImportGroovyIdx(0); }}>Clear preview</button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+          {importTab === "bulk" && (
+            <>
+              <input ref={zipImportRef} type="file" accept=".zip,application/zip" style={{ display: "none" }} onChange={async (e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (!f) return;
+                setBusy(true);
+                setTaskProgress({ label: `Uploading ${f.name}…`, pct: 0 });
+                const onUp = (p: number | null) => {
+                  setTaskProgress({
+                    label: p == null ? `Uploading ${f.name}…` : p >= 100 ? `Importing ${f.name} on server…` : `Uploading ZIP — ${p}%`,
+                    pct: p != null && p < 100 ? p : null,
+                  });
+                };
+                try {
+                  const res = await api.importZip(project.id, platform, f, { onUploadProgress: onUp });
+                  setBulkImportResult(res);
+                  setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
+                  toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
+                } catch (err: any) { toast(err.message || String(err), "error"); }
+                finally { setBusy(false); setTaskProgress(null); }
+              }} />
+              <input
+                ref={folderImportRef}
+                type="file"
+                style={{ display: "none" }}
+                multiple
+                {...({ webkitdirectory: "", directory: "" } as React.InputHTMLAttributes<HTMLInputElement>)}
+                onChange={async (e) => {
+                  const picked = Array.from(e.target.files || []);
+                  e.target.value = "";
+                  if (!picked.length) return;
+                  setBusy(true);
+                  const nFiles = picked.length;
+                  setTaskProgress({ label: `Uploading folder (${nFiles} files)…`, pct: 0 });
+                  const onUp = (p: number | null) => {
+                    setTaskProgress({
+                      label: p == null ? `Uploading folder (${nFiles} files)…` : p >= 100 ? `Processing folder on server…` : `Uploading folder — ${p}%`,
+                      pct: p != null && p < 100 ? p : null,
+                    });
+                  };
+                  try {
+                    const res = await api.importFolder(project.id, platform, picked, { onUploadProgress: onUp });
+                    setBulkImportResult(res);
+                    setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
+                    toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
+                  } catch (err: any) { toast(err.message || String(err), "error"); }
+                  finally { setBusy(false); setTaskProgress(null); }
+                }} />
+              {!bulkImportResult ? (
+                <div
+                  style={{ border: "1.5px dashed var(--border2)", borderRadius: 10, padding: 24, textAlign: "center", cursor: "pointer" }}
+                  onDragOver={e => { e.preventDefault(); }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    const file = e.dataTransfer.files[0];
+                    if (!file?.name.toLowerCase().endsWith(".zip")) {
+                      toast("Drop a .zip here, or use Browse folder", "error");
+                      return;
+                    }
+                    setBusy(true);
+                    setTaskProgress({ label: `Uploading ${file.name}…`, pct: 0 });
+                    (async () => {
+                      const onUp = (p: number | null) => {
+                        setTaskProgress({
+                          label: p == null ? `Uploading ${file.name}…` : p >= 100 ? `Importing on server…` : `Uploading ZIP — ${p}%`,
+                          pct: p != null && p < 100 ? p : null,
+                        });
+                      };
+                      try {
+                        const res = await api.importZip(project.id, platform, file, { onUploadProgress: onUp });
+                        setBulkImportResult(res);
+                        setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
+                        toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
+                      } catch (err: any) { toast(err.message || String(err), "error"); }
+                      finally { setBusy(false); setTaskProgress(null); }
+                    })();
+                  }}
+                >
+                  <div style={{ fontSize: 12, marginBottom: 12, color: "var(--muted)" }}>
+                    Bulk import — drop a <strong>.zip</strong>, or select an entire folder at once (browser folder picker).
+                  </div>
+                  <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+                    <button type="button" className="btn-ghost btn-sm" disabled={busy} onClick={() => folderImportRef.current?.click()}>Browse folder</button>
+                    <button type="button" className="btn-ghost btn-sm" disabled={busy} onClick={() => zipImportRef.current?.click()}>Upload .zip</button>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                  {bulkImportResult.warnings.length > 0 && (
+                    <div style={{ fontSize: 11, color: "var(--warn)", marginBottom: 10, maxHeight: 120, overflowY: "auto" }}>
+                      {bulkImportResult.warnings.slice(0, 80).map((w, i) => <div key={i}>{w}</div>)}
+                      {bulkImportResult.warnings.length > 80 && <div>… and {bulkImportResult.warnings.length - 80} more</div>}
+                    </div>
+                  )}
+                  {(bulkImportResult.files?.length ?? 0) > 0 && (
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, maxHeight: 120, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}>
+                      {bulkImportResult.files!.map((ff, i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 10 }}>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={ff.path}>{ff.path}</span>
+                          <span style={{ flexShrink: 0 }}>{ff.cases_count} · {ff.status}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ maxHeight: 280, overflowY: "auto", marginBottom: 12, border: "1px solid var(--border)", borderRadius: 8 }}>
+                    {Object.entries(
+                      bulkFlatCases.reduce<Record<string, { tc: any; idx: number }[]>>((acc, tc, idx) => {
+                        const k = String(tc.suggested_suite || "Imported");
+                        if (!acc[k]) acc[k] = [];
+                        acc[k].push({ tc, idx });
+                        return acc;
+                      }, {}),
+                    ).map(([suiteName, rows]) => (
+                      <div key={suiteName}>
+                        <div style={{ padding: "8px 10px", background: "rgba(99,102,241,.12)", fontWeight: 600, fontSize: 11 }}>{suiteName}</div>
+                        {rows.map(({ tc, idx }) => (
+                          <div key={idx} style={{ padding: 10, borderBottom: "1px solid var(--border)", display: "grid", gridTemplateColumns: "28px 1fr", gap: 8, alignItems: "start", opacity: tc.import === false ? 0.5 : 1 }}>
+                            <input type="checkbox" checked={!!tc.import} onChange={() => setBulkFlatCases(p => p.map((t, j) => j === idx ? { ...t, import: !t.import } : t))} />
+                            <div>
+                              <div style={{ fontWeight: 600, fontSize: 12 }}>{tc.name || `Case ${idx + 1}`}</div>
+                              <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>
+                                {Array.isArray(tc.steps) ? `${tc.steps.length} steps` : "—"} · {tc.source_file ? String(tc.source_file) : ""}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button type="button" className="run-now-btn" style={{ padding: "8px 16px", fontSize: 11 }} disabled={busy || !bulkFlatCases.some(t => t.import)} onClick={async () => {
+                      setBusy(true);
+                      setTaskProgress({ label: "Saving bulk import to the library…", pct: null });
+                      try {
+                        const r = await api.confirmZipImport(project.id, {
+                          module_id: bulkModuleId ?? undefined,
+                          test_cases: bulkFlatCases.filter(t => t.import),
+                          platform,
+                        });
+                        toast(`Imported ${r.created} test(s) · ${(r.created_suites ?? []).length} new suite(s)`, "success");
+                        setBulkImportResult(null);
+                        setBulkFlatCases([]);
+                        setShowImport(false);
+                        onRefresh();
+                      } catch (e: any) { toast(e.message || String(e), "error"); }
+                      finally { setBusy(false); setTaskProgress(null); }
+                    }}>✓ Import selected</button>
+                    <button type="button" className="btn-ghost btn-sm" disabled={busy || !bulkFlatCases.some(t => t.import)} onClick={async () => {
+                      setBusy(true);
+                      setTaskProgress({ label: "Building Katalon ZIP…", pct: null });
+                      try {
+                        await api.downloadKatalonZip(project.id, {
+                          test_cases: bulkFlatCases.filter(t => t.import),
+                          project_name: project.name,
+                        });
+                        toast("Katalon ZIP downloaded", "success");
+                      } catch (e: any) { toast(e.message || String(e), "error"); }
+                      finally { setBusy(false); setTaskProgress(null); }
+                    }}>⬇ Katalon ZIP</button>
+                    <button type="button" className="btn-ghost btn-sm" onClick={() => { setBulkImportResult(null); setBulkFlatCases([]); }}>Clear</button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+
+        </div>
+      )}
+
       {/* Generate Test Suite (bulk) */}
       {showGenerateSuite && (
         <div className="panel" style={{ padding: 18, marginBottom: 16, border: "1px solid rgba(99,102,241,.3)" }}>
           <div style={{ fontFamily: "var(--sans)", fontWeight: 600, marginBottom: 14 }}>✨ Generate Test Suite</div>
-          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>Same inputs as single test: platform, prompt, optional page source. AI generates multiple test cases for the selected suite.</div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12 }}>Same inputs as single test: platform, prompt, optional page source. AI generates multiple test cases for the selected suite. A progress bar appears under the Test Library header while this runs.</div>
           <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
             <select value={platform} onChange={e => setPlatform(e.target.value as any)}><option value="android">Android</option><option value="ios_sim">iOS</option></select>
             <select value={genSuiteTargetId ?? ""} onChange={e => setGenSuiteTargetId(e.target.value ? Number(e.target.value) : null)} style={{ fontSize: 11, minWidth: 200 }}>
@@ -1853,7 +2778,8 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
             <button className="btn-primary btn-sm" onClick={aiGenerate} disabled={busy}>AI Generate</button>
             <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setNewXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium">📄 Capture XML</button>
           </div>
-          {aiStatus && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>{aiStatus}</div>}
+            {aiStatus && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>{aiStatus}</div>}
+            <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>While AI Generate runs, a progress bar appears under the Test Library title above.</div>
           <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Test name" className="form-input" style={{ width: "100%", marginBottom: 10 }} />
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: "var(--muted)" }}>Acceptance criteria (source of truth for AI Fix)</div>
@@ -1906,9 +2832,15 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
               {editRelated.similar.length > 0 && <div style={{ color: "var(--muted)", marginTop: 4 }}>{editRelated.similar.length} test{editRelated.similar.length !== 1 ? "s" : ""} share similar steps: {editRelated.similar.map(s => s.test.name).join(", ")}. When fixing via AI in Execution, use &quot;Fix all related&quot; to update them.</div>}
             </div>
           )}
+          <div style={{ display: "flex", gap: 0, marginBottom: 12, borderRadius: 8, overflow: "hidden", border: "1px solid var(--border)" }}>
+            {(["android", "ios_sim"] as const).map(p => (
+              <button key={p} type="button" onClick={() => setEditPfTab(p)} style={{ flex: 1, padding: "8px 6px", fontSize: 11, border: "none", cursor: "pointer", background: editPfTab === p ? "var(--accent)" : "rgba(99,102,241,.12)", color: editPfTab === p ? "#042" : "var(--muted)", fontFamily: "var(--mono)" }}>
+                {p === "android" ? "Android" : "iOS Simulator"} <span style={{ fontSize: 10, opacity: 0.85 }}>{(p === "android" ? editStepsAndroid : editStepsIos).length} steps</span>
+              </button>
+            ))}
+          </div>
           <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
-            <select value={platform} onChange={e => setPlatform(e.target.value as any)} style={{ fontSize: 11 }}><option value="android">Android</option><option value="ios_sim">iOS</option></select>
-            <input value={aiEditPrompt} onChange={e => setAiEditPrompt(e.target.value)} className="form-input" placeholder="AI instruction: e.g. 'add login step before step 3'" style={{ flex: 1 }} />
+            <input value={aiEditPrompt} onChange={e => setAiEditPrompt(e.target.value)} className="form-input" placeholder={`AI edit · ${editPfTab === "android" ? "Android" : "iOS"} steps`} style={{ flex: 1 }} />
             <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiEditRun} disabled={busy}>🤖 AI Edit</button>
             <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setEditXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium (device must be connected)">📄 Capture XML</button>
           </div>
@@ -1985,7 +2917,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
                   <td>{t.name}</td>
                   <td style={{ fontSize: 11, color: "var(--accent2)" }}>{moduleName(t.suite_id) || guessModule(t.name)}</td>
                   <td style={{ fontSize: 11, color: "var(--muted)" }}>{suiteName(t.suite_id)}</td>
-                  <td style={{ fontSize: 11, color: "var(--muted)" }}>{t.steps.length}</td>
+                  <td style={{ fontSize: 11, color: "var(--muted)" }}>{Math.max(stepsForPlatform(t, "android").length, stepsForPlatform(t, "ios_sim").length)}</td>
                   <td>{st ? <div className="tc-status"><div className={`dot ${statusDot(st)}`} />{st}</div> : <span style={{ color: "var(--muted)", fontSize: 11 }}>—</span>}</td>
                   <td onClick={e => e.stopPropagation()}>
                     <div style={{ display: "flex", gap: 4 }}>
@@ -2005,115 +2937,238 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
 }
 
 /* ── Reports ───────────────────────────────────────── */
-function ReportsView({ project, runs, tests }: { project: Project; runs: Run[]; tests: TestDef[] }) {
-  const passed = runs.filter(r => r.status === "passed").length;
-  const failed = runs.filter(r => r.status === "failed" || r.status === "error").length;
-  const total = runs.length;
-  const rate = total > 0 ? ((passed / total) * 100).toFixed(1) : "0";
-  const mods = [...new Set(tests.map(t => guessModule(t.name)))];
-  const moduleStats = mods.map(m => { const mT = tests.filter(t => guessModule(t.name) === m); const ids = new Set(mT.map(t => t.id)); const mR = runs.filter(r => r.test_id && ids.has(r.test_id)); const mp = mR.filter(r => r.status === "passed").length; return { module: m, tests: mT, runs: mR, total: mR.length, passed: mp, failed: mR.filter(r => r.status === "failed" || r.status === "error").length, rate: mR.length > 0 ? Math.round((mp / mR.length) * 100) : 0 }; });
+function ReportsView({ project, runs, tests, onRefresh }: { project: Project; runs: Run[]; tests: TestDef[]; onRefresh?: () => void }) {
+  const [hier, setHier] = useState<any>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [exp, setExp] = useState<Record<string, boolean>>({});
 
-  const exportModuleReport = async (mod: typeof moduleStats[0]) => {
+  const passedFlat = runs.filter(r => r.status === "passed").length;
+  const failedFlat = runs.filter(r => r.status === "failed" || r.status === "error").length;
+  const totalFlat = runs.length;
+  const rateFlat = totalFlat > 0 ? ((passedFlat / totalFlat) * 100).toFixed(1) : "0";
+
+  const loadHierarchy = useCallback(() => {
+    setLoadErr(null);
+    api.getReportsHierarchy(project.id).then(setHier).catch((e: Error) => setLoadErr(e.message || String(e)));
+  }, [project.id]);
+
+  useEffect(() => { loadHierarchy(); }, [loadHierarchy]);
+
+  const toggle = (key: string) => setExp(e => ({ ...e, [key]: !e[key] }));
+
+  const exportRunHtml = (run: any, testName: string) => {
+    const steps = (run.step_results || []) as any[];
+    const rows = steps.map((s, i) => `<tr><td>${i + 1}</td><td>${(s?.status || "").toString()}</td><td>${String(JSON.stringify(s?.details || "")).slice(0, 400)}</td></tr>`).join("");
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Run #${run.id}</title><style>body{font-family:system-ui;background:#080b0f;color:#e8eaed;padding:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:8px;font-size:12px}</style></head><body><h1>Run #${run.id} — ${testName}</h1><p>Status: ${run.status} · ${run.platform} · ${run.device_target || ""}</p>${run.error_message ? `<pre style="color:#f66;white-space:pre-wrap">${run.error_message}</pre>` : ""}<h2>Steps</h2><table><thead><tr><th>#</th><th>Status</th><th>Details</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+    a.download = `run_${run.id}_report.html`;
+    a.click();
+  };
+
+  const exportCollectionFromHierarchy = async (col: any) => {
+    const flat: { r: any; testName: string }[] = [];
+    for (const su of col.suites || []) {
+      for (const te of su.tests || []) {
+        for (const r of te.runs || []) {
+          flat.push({ r, testName: te.name });
+        }
+      }
+    }
     const shotEntries: { runId: number; testName: string; shots: { idx: number; status: string; b64: string }[] }[] = [];
-    for (const r of mod.runs.slice(0, 10)) {
-      const arts = (r.artifacts as any)?.screenshots || [];
-      const summary = (r.summary as any)?.stepResults || [];
+    for (const { r, testName } of flat.slice(0, 15)) {
+      const arts = r.screenshots || [];
+      const summary = r.step_results || [];
       const runShots: typeof shotEntries[0]["shots"] = [];
       for (let i = 0; i < Math.min(arts.length, 4); i++) {
         try {
-          const resp = await fetch(`/api/artifacts/${r.project_id}/${r.id}/${arts[i]}`);
-          if (resp.ok) { const blob = await resp.blob(); const b64: string = await new Promise(res => { const rd = new FileReader(); rd.onloadend = () => res(rd.result as string); rd.readAsDataURL(blob); }); runShots.push({ idx: i, status: summary[i]?.status || "unknown", b64 }); }
-        } catch {}
+          const resp = await fetch(`/api/artifacts/${project.id}/${r.id}/${encodeURIComponent(arts[i])}`);
+          if (resp.ok) {
+            const blob = await resp.blob();
+            const b64: string = await new Promise(res => { const rd = new FileReader(); rd.onloadend = () => res(rd.result as string); rd.readAsDataURL(blob); });
+            runShots.push({ idx: i, status: summary[i]?.status || "unknown", b64 });
+          }
+        } catch { /* ignore */ }
       }
-      shotEntries.push({ runId: r.id, testName: tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`, shots: runShots });
+      shotEntries.push({ runId: r.id, testName, shots: runShots });
     }
 
-    const runsHtml = mod.runs.map(r => {
-      const t = tests.find(t => t.id === r.test_id);
+    const runsHtml = flat.map(({ r, testName }) => {
       const bg = r.status === "passed" ? "#0a2a1a" : r.status === "failed" || r.status === "error" ? "#2a0a0f" : "#151a20";
       const color = r.status === "passed" ? "#00e5a0" : r.status === "failed" ? "#ff3b5c" : "#8a8f98";
-      return `<tr style="background:${bg}"><td>#${r.id}</td><td>${t?.name || "—"}</td><td style="color:${color};font-weight:700">${r.status.toUpperCase()}</td><td>${r.platform}</td><td>${r.device_target || "default"}</td><td style="font-size:11px;color:#8a8f98">${r.error_message || ""}</td></tr>`;
+      return `<tr style="background:${bg}"><td>#${r.id}</td><td>${testName}</td><td style="color:${color};font-weight:700">${String(r.status).toUpperCase()}</td><td>${r.platform}</td><td>${r.device_target || "default"}</td><td style="font-size:11px;color:#8a8f98">${r.error_message || ""}</td></tr>`;
     }).join("");
 
-    const failedRunsDetail = mod.runs.filter(r => r.status === "failed" || r.status === "error").map(r => {
-      const t = tests.find(t => t.id === r.test_id);
-      const steps = (r.summary as any)?.stepResults || [];
+    const failedRunsDetail = flat.filter(({ r }) => r.status === "failed" || r.status === "error").map(({ r, testName }) => {
+      const steps = r.step_results || [];
       const failIdx = steps.findIndex((s: any) => s?.status === "failed");
-      const stepsHtml = (t?.steps || []).map((s: any, i: number) => {
-        const sr = steps[i]; const st = sr?.status || "pending";
+      const stepsHtml = steps.map((sr: any, i: number) => {
+        const st = sr?.status || "pending";
         const c = st === "passed" ? "#00e5a0" : st === "failed" ? "#ff3b5c" : "#8a8f98";
-        return `<div style="padding:4px 8px;border-bottom:1px solid #1e2430;font-size:11px;display:flex;gap:8px"><span style="color:${c};min-width:24px;font-weight:700">${i + 1}</span><span>${s.type}</span><span style="color:#7dd3fc;font-family:monospace;font-size:10px">${s.selector ? `${s.selector.using}=${s.selector.value}` : ""}</span>${st === "failed" ? `<span style="color:#ff3b5c;margin-left:auto">${typeof sr?.details === "string" ? sr.details : sr?.details?.error || "Failed"}</span>` : ""}</div>`;
+        return `<div style="padding:4px 8px;border-bottom:1px solid #1e2430;font-size:11px;display:flex;gap:8px"><span style="color:${c};min-width:24px;font-weight:700">${i + 1}</span><span>${st}</span>${st === "failed" ? `<span style="color:#ff3b5c;margin-left:auto">${typeof sr?.details === "string" ? sr.details : sr?.details?.error || "Failed"}</span>` : ""}</div>`;
       }).join("");
-
       const entry = shotEntries.find(e => e.runId === r.id);
       const shotsHtml = entry?.shots.map(s => `<img src="${s.b64}" style="width:120px;border-radius:6px;border:2px solid ${s.status === "failed" ? "#ff3b5c" : "#00e5a0"}" />`).join("") || "";
-
-      return `<div style="margin-bottom:20px;border:1px solid rgba(255,59,92,.3);border-radius:8px;overflow:hidden"><div style="background:rgba(255,59,92,.08);padding:12px;font-weight:600">#${r.id} — ${t?.name || "Unknown"} — FAILED at step ${failIdx >= 0 ? failIdx + 1 : "?"}</div><div style="padding:12px">${r.error_message ? `<div style="background:rgba(255,59,92,.1);padding:10px;border-radius:6px;font-family:monospace;font-size:11px;color:#ff3b5c;margin-bottom:12px">${r.error_message}</div>` : ""}<div style="border:1px solid #1e2430;border-radius:6px;margin-bottom:12px">${stepsHtml}</div>${shotsHtml ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${shotsHtml}</div>` : ""}</div></div>`;
+      return `<div style="margin-bottom:20px;border:1px solid rgba(255,59,92,.3);border-radius:8px;overflow:hidden"><div style="background:rgba(255,59,92,.08);padding:12px;font-weight:600">#${r.id} — ${testName} — FAILED at step ${failIdx >= 0 ? failIdx + 1 : "?"}</div><div style="padding:12px">${r.error_message ? `<div style="background:rgba(255,59,92,.1);padding:10px;border-radius:6px;font-family:monospace;font-size:11px;color:#ff3b5c;margin-bottom:12px">${r.error_message}</div>` : ""}<div style="border:1px solid #1e2430;border-radius:6px;margin-bottom:12px">${stepsHtml}</div>${shotsHtml ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${shotsHtml}</div>` : ""}</div></div>`;
     }).join("");
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Collection Report — ${mod.module}</title>
+    const total = flat.length;
+    const passed = flat.filter(({ r }) => r.status === "passed").length;
+    const failed = flat.filter(({ r }) => r.status === "failed" || r.status === "error").length;
+    const rate = total > 0 ? Math.round((passed / total) * 100) : 0;
+
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Collection Report — ${col.name}</title>
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',system-ui,sans-serif;background:#080b0f;color:#e8eaed;padding:32px;line-height:1.6}h1{font-size:22px;color:#00e5a0;margin-bottom:4px}h2{font-size:16px;color:#a78bfa;margin:28px 0 12px;border-bottom:1px solid #1e2430;padding-bottom:8px}.meta{font-size:12px;color:#8a8f98;margin-bottom:24px}.card{background:#0d1117;border:1px solid #1e2430;border-radius:8px;padding:16px;margin-bottom:16px}table{width:100%;border-collapse:collapse;font-size:12px}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px;text-align:left;padding:8px 10px;border-bottom:1px solid #1e2430}td{padding:8px 10px;border-bottom:1px solid #151a20}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center;margin-bottom:20px}.stat-val{font-size:28px;font-weight:700}.stat-lbl{font-size:10px;text-transform:uppercase;color:#8a8f98;margin-top:4px}</style></head><body>
-<h1>📁 Collection Report — ${mod.module}</h1>
+<h1>📁 Collection Report — ${col.name}</h1>
 <div class="meta">${project.name} · Generated ${new Date().toLocaleString()}</div>
-<div class="stats"><div><div class="stat-val" style="color:${mod.rate >= 90 ? "#00e5a0" : mod.rate >= 70 ? "#ffb020" : "#ff3b5c"}">${mod.rate}%</div><div class="stat-lbl">Pass Rate</div></div><div><div class="stat-val">${mod.total}</div><div class="stat-lbl">Total Runs</div></div><div><div class="stat-val" style="color:#00e5a0">${mod.passed}</div><div class="stat-lbl">Passed</div></div><div><div class="stat-val" style="color:#ff3b5c">${mod.failed}</div><div class="stat-lbl">Failed</div></div></div>
-<h2>All Runs (${mod.total})</h2>
+<div class="stats"><div><div class="stat-val" style="color:${rate >= 90 ? "#00e5a0" : rate >= 70 ? "#ffb020" : "#ff3b5c"}">${rate}%</div><div class="stat-lbl">Pass Rate (runs)</div></div><div><div class="stat-val">${total}</div><div class="stat-lbl">Total Runs</div></div><div><div class="stat-val" style="color:#00e5a0">${passed}</div><div class="stat-lbl">Passed</div></div><div><div class="stat-val" style="color:#ff3b5c">${failed}</div><div class="stat-lbl">Failed</div></div></div>
+<h2>All Runs (${total})</h2>
 <div class="card" style="padding:0;overflow:hidden"><table><thead><tr><th>ID</th><th>Test</th><th>Status</th><th>Platform</th><th>Device</th><th>Error</th></tr></thead><tbody>${runsHtml}</tbody></table></div>
 ${failedRunsDetail ? `<h2>Failed Runs — Detail</h2>${failedRunsDetail}` : ""}
-<div style="margin-top:32px;border-top:1px solid #1e2430;padding-top:16px;font-size:11px;color:#555">QA·OS Collection Report · ${project.name} · ${mod.module} · ${new Date().toISOString()}</div>
+<div style="margin-top:32px;border-top:1px solid #1e2430;padding-top:16px;font-size:11px;color:#555">QA·OS Collection Report · ${project.name} · ${col.name} · ${new Date().toISOString()}</div>
 </body></html>`;
 
-    const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([html], { type: "text/html" })); a.download = `collection_report_${mod.module}.html`; a.click();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+    a.download = `collection_report_${col.name.replace(/\s+/g, "_")}.html`;
+    a.click();
   };
 
   const exportAll = () => {
     const rows = runs.map(r => `<tr><td>#${r.id}</td><td>${tests.find(t => t.id === r.test_id)?.name || "—"}</td><td style="color:${r.status === "passed" ? "#00e5a0" : "#ff3b5c"};font-weight:700">${r.status}</td><td>${r.platform}</td><td>${r.device_target || "default"}</td><td>${r.finished_at || "—"}</td><td style="font-size:11px;color:#8a8f98">${r.error_message || ""}</td></tr>`).join("");
-    const html = `<!DOCTYPE html><html><head><title>QA Report - ${project.name}</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui;padding:32px;background:#080b0f;color:#e8eaed}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid #1e2430;padding:8px;text-align:left}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px}h1{color:#00e5a0;margin-bottom:12px}</style></head><body><h1>${project.name} — Full Test Report</h1><p style="color:#8a8f98;margin-bottom:20px">Generated: ${new Date().toLocaleString()} | Total: ${total} | Passed: ${passed} | Failed: ${failed} | Pass Rate: ${rate}%</p><table><thead><tr><th>ID</th><th>Test</th><th>Status</th><th>Platform</th><th>Device</th><th>Finished</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+    const html = `<!DOCTYPE html><html><head><title>QA Report - ${project.name}</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui;padding:32px;background:#080b0f;color:#e8eaed}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid #1e2430;padding:8px;text-align:left}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px}h1{color:#00e5a0;margin-bottom:12px}</style></head><body><h1>${project.name} — Full Test Report</h1><p style="color:#8a8f98;margin-bottom:20px">Generated: ${new Date().toLocaleString()} | Total: ${totalFlat} | Passed: ${passedFlat} | Failed: ${failedFlat} | Pass Rate: ${rateFlat}%</p><table><thead><tr><th>ID</th><th>Test</th><th>Status</th><th>Platform</th><th>Device</th><th>Finished</th><th>Error</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([html], { type: "text/html" })); a.download = `qa_report_${project.name}.html`; a.click();
   };
+
+  const sum = hier?.summary;
 
   return (
     <>
       <div className="section-head">
-        <div><div className="section-title">Reports</div><div className="section-sub">{project.name} · all runs</div></div>
-        <div style={{ display: "flex", gap: 10 }}><button className="btn-ghost btn-sm" onClick={exportAll}>⬇ Full Report</button></div>
+        <div>
+          <div className="section-title">Reports</div>
+          <div className="section-sub">{project.name} · hierarchy · last 5 runs per test</div>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button className="btn-ghost btn-sm" onClick={() => { onRefresh?.(); loadHierarchy(); }}>↻ Refresh</button>
+          <button className="btn-ghost btn-sm" onClick={exportAll}>⬇ Full Report (flat)</button>
+        </div>
       </div>
 
+      {loadErr && <div className="error-box" style={{ marginBottom: 12 }}>{loadErr}</div>}
+
       <div className="report-grid">
-        <div className="panel" style={{ gridColumn: "span 2" }}>
-          <div className="panel-header"><div className="panel-title">Summary</div></div>
-          <div style={{ padding: 20, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 16 }}>
-            <div><div style={{ fontSize: 28, fontFamily: "var(--sans)", fontWeight: 700 }}>{rate}%</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Pass Rate</div></div>
-            <div><div style={{ fontSize: 28, fontFamily: "var(--sans)", fontWeight: 700 }}>{total}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Total Runs</div></div>
-            <div><div style={{ fontSize: 28, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--accent)" }}>{passed}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Passed</div></div>
-            <div><div style={{ fontSize: 28, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--danger)" }}>{failed}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Failed</div></div>
-          </div>
-        </div>
-        <div className="panel">
-          <div className="panel-header"><div className="panel-title">By Collection</div></div>
-          <div className="chart-bar-group">
-            {moduleStats.map(ms => (
-              <div key={ms.module} className="bar-row" style={{ cursor: "pointer" }} onClick={() => exportModuleReport(ms)}>
-                <div className="bar-label">{ms.module}</div>
-                <div className="bar-track"><div className="bar-fill" style={{ width: `${ms.rate}%`, background: ms.rate >= 90 ? "var(--accent)" : ms.rate >= 70 ? "var(--warn)" : "var(--danger)" }} /></div>
-                <div className="bar-val">{ms.rate}%</div>
-                <div style={{ fontSize: 10, color: "var(--accent2)", cursor: "pointer" }} title="Download collection report">📋</div>
-              </div>
-            ))}
-            {moduleStats.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Create tests to see collection breakdown</div>}
+        <div className="panel" style={{ gridColumn: "span 3" }}>
+          <div className="panel-header"><div className="panel-title">Summary (tests)</div></div>
+          <div style={{ padding: 20, display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 16 }}>
+            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700 }}>{sum ? `${sum.pass_rate}%` : rateFlat + "%"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Pass rate</div></div>
+            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700 }}>{sum?.total_tests ?? "—"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Tests</div></div>
+            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--accent2)" }}>{sum?.executed ?? "—"}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Executed</div></div>
+            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--accent)" }}>{sum?.passed ?? passedFlat}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Passed</div></div>
+            <div><div style={{ fontSize: 26, fontFamily: "var(--sans)", fontWeight: 700, color: "var(--danger)" }}>{sum?.failed ?? failedFlat}</div><div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase" }}>Failed</div></div>
           </div>
         </div>
       </div>
 
       <div className="panel">
-        <div className="panel-header"><div className="panel-title">All Runs</div></div>
+        <div className="panel-header">
+          <div className="panel-title">Collections → suites → tests → runs</div>
+          <div style={{ fontSize: 11, color: "var(--muted)" }}>Expand rows · proof thumbnails · per-run download</div>
+        </div>
+        <div style={{ padding: 12 }}>
+          {!hier?.collections?.length && <div style={{ color: "var(--muted)", fontSize: 12 }}>No collections yet. Create a collection and suites in Test Library.</div>}
+          {(hier?.collections || []).map((col: any) => (
+            <div key={col.id} style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => toggle(`c-${col.id}`)}
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`c-${col.id}`); } }}
+                style={{ padding: "10px 14px", background: "var(--bg3)", display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}
+              >
+                <span style={{ fontSize: 14, color: "var(--muted)", width: 18 }}>{exp[`c-${col.id}`] ? "▼" : "▶"}</span>
+                <div style={{ flex: 1, fontFamily: "var(--sans)", fontWeight: 600 }}>📁 {col.name}</div>
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>{col.total_tests} tests · {col.pass_rate}% pass · {col.failed_count} fail</div>
+                <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={e => { e.stopPropagation(); exportCollectionFromHierarchy(col); }} title="Download HTML report">⬇</button>
+              </div>
+              {exp[`c-${col.id}`] && (
+                <div style={{ padding: "8px 12px 12px", background: "var(--bg2)" }}>
+                  {(col.suites || []).map((su: any) => (
+                    <div key={su.id} style={{ marginTop: 8, marginLeft: 8, borderLeft: "2px solid rgba(0,229,160,.25)", paddingLeft: 10 }}>
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => toggle(`s-${su.id}`)}
+                        onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`s-${su.id}`); } }}
+                        style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "6px 0" }}
+                      >
+                        <span style={{ fontSize: 12, color: "var(--muted)", width: 16 }}>{exp[`s-${su.id}`] ? "▼" : "▶"}</span>
+                        <span style={{ fontWeight: 600, fontSize: 12 }}>📋 {su.name}</span>
+                        <span style={{ fontSize: 10, color: "var(--muted)" }}>{su.total_tests} tests · {su.pass_rate}%</span>
+                      </div>
+                      {exp[`s-${su.id}`] && (
+                        <div style={{ marginLeft: 12 }}>
+                          {(su.tests || []).map((te: any) => (
+                            <div key={te.id} style={{ marginTop: 8, border: "1px solid var(--border)", borderRadius: 6, overflow: "hidden" }}>
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => toggle(`t-${te.id}`)}
+                                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(`t-${te.id}`); } }}
+                                style={{ padding: "8px 10px", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", background: "rgba(0,0,0,.15)" }}
+                              >
+                                <span style={{ fontSize: 11, color: "var(--muted)", width: 14 }}>{exp[`t-${te.id}`] ? "▼" : "▶"}</span>
+                                <div style={{ flex: 1, fontSize: 12 }}>{te.name}</div>
+                                <div className={`dot ${te.latest_status === "passed" ? "dot-green" : te.latest_status === "failed" || te.latest_status === "error" ? "dot-danger" : te.latest_status === "not_run" ? "dot-gray" : "dot-warn"}`} />
+                                <span style={{ fontSize: 10, color: "var(--muted)" }}>{te.latest_status} · {te.steps_count} steps</span>
+                              </div>
+                              {exp[`t-${te.id}`] && (
+                                <div style={{ padding: 8, fontSize: 11 }}>
+                                  {(te.runs || []).length === 0 && <div style={{ color: "var(--muted)" }}>No runs yet</div>}
+                                  {(te.runs || []).map((run: any) => (
+                                    <div key={run.id} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, padding: "8px 6px", borderBottom: "1px solid var(--border)" }}>
+                                      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                                        <span style={{ fontFamily: "var(--mono)", color: "var(--accent2)" }}>#{run.id}</span>
+                                        <span className={`run-pct ${run.status === "passed" ? "pct-pass" : "pct-fail"}`} style={{ fontSize: 11 }}>{run.status}</span>
+                                        <span style={{ color: "var(--muted)" }}>{run.platform} · {run.device_target || "default"}</span>
+                                        {run.duration_s != null && <span style={{ color: "var(--muted)" }}>{run.duration_s}s</span>}
+                                        {run.passed_steps != null && run.total_steps != null && (
+                                          <span style={{ color: "var(--muted)" }}>{run.passed_steps}/{run.total_steps} steps</span>
+                                        )}
+                                        <div style={{ display: "flex", gap: 4 }}>
+                                          {(run.screenshots || []).slice(0, 4).map((name: string, i: number) => (
+                                            <img key={i} src={`/api/artifacts/${project.id}/${run.id}/${encodeURIComponent(name)}`} alt="" style={{ width: 40, height: 72, objectFit: "cover", borderRadius: 4, border: "1px solid var(--border)" }} />
+                                          ))}
+                                        </div>
+                                      </div>
+                                      <button className="btn-ghost btn-sm" style={{ fontSize: 10, alignSelf: "start" }} onClick={() => exportRunHtml(run, te.name)}>⬇ Run</button>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-header"><div className="panel-title">Recent runs (flat)</div></div>
         <div className="panel-body">
-          {runs.map(r => (
+          {runs.slice(0, 50).map(r => (
             <div key={r.id} className="run-row">
               <div className={`status-icon ${statusIcon(r.status)}`} />
               <div><div className="run-name">{tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}</div><div className="run-meta">{r.device_target || "default"} · {r.platform}</div></div>
               <div className={`run-pct ${r.status === "passed" ? "pct-pass" : "pct-fail"}`}>{r.status}</div>
               <div className="run-tag">{r.platform}</div>
-              <div className="run-dur">{ago(r.finished_at)}</div>
+              <div className="run-dur">{ago(r.finished_at || r.started_at)}</div>
             </div>
           ))}
         </div>
