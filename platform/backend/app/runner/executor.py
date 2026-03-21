@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -8,7 +9,23 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from ..events import RunEvent, event_bus
 from .steps import Step
+
+
+def _debug(run_id: int | None, name: str, category: str, **kwargs: Any) -> None:
+    """Fire a debug event from within synchronous executor code."""
+    if run_id is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    payload = {"name": name, "category": category, "ts": round(time.time() * 1000), **kwargs}
+    asyncio.run_coroutine_threadsafe(
+        event_bus.publish(RunEvent(run_id=run_id, type="debug", payload=payload)),
+        loop,
+    )
 
 _KEYBOARD_KEYS = {"return", "done", "go", "next", "search", "send", "enter"}
 
@@ -31,7 +48,7 @@ def _is_keyboard_target(step: Step) -> bool:
     return False
 
 
-def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_check: callable | None = None) -> dict[str, Any]:
+def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_check: callable | None = None, run_id: int | None = None) -> dict[str, Any]:
     passed = 0
     failed = 0
     step_results: list[dict[str, Any]] = []
@@ -97,6 +114,7 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
 
             elif step.type == "keyboardAction":
                 action = (step.text or step.meta.get("action", "done") if step.meta else "done").lower()
+                _debug(run_id, "keyboard_action", "action", key=action, method="mobile:pressButton")
                 try:
                     driver.execute_script("mobile: pressButton", {"name": action})
                 except Exception:
@@ -106,6 +124,7 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
                         driver.hide_keyboard()
 
             elif step.type == "hideKeyboard":
+                _debug(run_id, "hide_keyboard", "action")
                 try:
                     driver.hide_keyboard()
                 except Exception:
@@ -113,6 +132,7 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
 
             elif step.type == "swipe":
                 direction = (step.text or "up").lower()
+                _debug(run_id, "swipe", "action", direction=direction)
                 try:
                     driver.execute_script("mobile: swipe", {"direction": direction})
                 except Exception:
@@ -124,7 +144,7 @@ def run_steps(driver: WebDriver, steps: list[Step], on_step: callable, cancel_ch
                     TouchAction(driver).press(x=cx, y=cy).move_to(x=cx + dx, y=cy + dy).release().perform()
 
             elif step.type == "takeScreenshot":
-                pass
+                _debug(run_id, "take_screenshot", "capture")
 
             else:
                 raise ValueError(f"Unknown step type: {step.type}")

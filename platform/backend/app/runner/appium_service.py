@@ -26,12 +26,17 @@ class AppiumHandle:
     port: int
 
 
-def ensure_appium_running(timeout_s: int = 15) -> Optional[AppiumHandle]:
+def ensure_appium_running(
+    timeout_s: int = 15,
+    host: str | None = None,
+    port: int | None = None,
+) -> Optional[AppiumHandle]:
     """
     If Appium is already running on APPIUM_HOST:APPIUM_PORT, do nothing.
     Otherwise attempt to spawn `appium` as a subprocess (requires global install).
     """
-    host, port = settings.appium_host, settings.appium_port
+    host = host or settings.appium_host
+    port = port or settings.appium_port
     if _is_port_open(host, port):
         return None
 
@@ -53,4 +58,3 @@ def ensure_appium_running(timeout_s: int = 15) -> Optional[AppiumHandle]:
     except Exception:
         pass
     return None
-
