@@ -24,3 +24,8 @@ Backend health: `GET http://127.0.0.1:9001/api/health`
   `uv run python scripts/reprocess_recording.py --project-id <pid> --run-id <rid>`  
   or `uv run python scripts/reprocess_recording.py --path /path/to/run.mp4` (also supports **`run.mov`** → **`run.mp4`** next to it).
 
+### Screen Library capture session (Appium)
+
+- **Start build** opens one long-lived Appium session per `(project, platform, device, build)`; **Capture** only reads hierarchy + screenshot until you **Stop** or the session times out.
+- Sessions live **in memory** in this process. After **`uvicorn --reload`**, a hot reload, or multiple workers, you must tap **Start build** again. Use a **single worker** if you rely on sticky sessions.
+- **Manual QA (10+ captures):** Start build once → Capture 10+ times while navigating in-app → confirm the emulator stays in the app without reinstall loops → Stop → Start again → one capture.

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 
-SelectorStrategy = Literal["accessibilityId", "id", "xpath", "className"]
+SelectorStrategy = Literal["accessibilityId", "id", "xpath", "className", "-android uiautomator"]
 
 
 @dataclass(frozen=True)

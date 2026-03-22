@@ -2241,7 +2241,7 @@ function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStep
       {hasSelector && (
         <>
           <select value={s.selector?.using || "accessibilityId"} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; })} style={{ width: 110 }}>
-            {["accessibilityId", "id", "xpath", "className"].map(u => <option key={u}>{u}</option>)}
+            {["accessibilityId", "id", "xpath", "className", "-android uiautomator"].map(u => <option key={u}>{u}</option>)}
           </select>
           <input
             value={s.selector?.value || ""}
@@ -2326,6 +2326,25 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
   const [newFolderName, setNewFolderName] = useState("");
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [captureDeviceId, setCaptureDeviceId] = useState("");
+  const [screenSessionActive, setScreenSessionActive] = useState(false);
+  const lastScreenSessionRef = useRef<{ build_id: number; device_target: string; platform: "android" | "ios_sim" } | null>(null);
+
+  const stopScreenSessionIfAny = useCallback(async () => {
+    const prev = lastScreenSessionRef.current;
+    if (!prev) return;
+    try {
+      await api.stopScreenSession({
+        project_id: project.id,
+        build_id: prev.build_id,
+        platform: prev.platform,
+        ...(prev.device_target.trim() ? { device_target: prev.device_target.trim() } : {}),
+      });
+    } catch {
+      /* ignore */
+    }
+    lastScreenSessionRef.current = null;
+    setScreenSessionActive(false);
+  }, [project.id]);
 
   const loadScreenFolders = useCallback(async () => {
     try { setScreenFolders(await api.listScreenFolders(project.id)); } catch {}
@@ -2357,8 +2376,43 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     }
   }, [devices, devicePickerPlatform]);
 
+  useEffect(() => {
+    if (libTab !== "screens" || !showCapture || screenBuildFilter == null) {
+      return;
+    }
+    const selectedBuild = builds.find(b => b.id === screenBuildFilter);
+    if (!selectedBuild) return;
+    let cancelled = false;
+    const tick = () => {
+      api
+        .screenSessionStatus({
+          project_id: project.id,
+          build_id: screenBuildFilter,
+          platform: selectedBuild.platform,
+          ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
+        })
+        .then((r) => {
+          if (!cancelled) setScreenSessionActive(r.active);
+        })
+        .catch(() => {
+          if (!cancelled) setScreenSessionActive(false);
+        });
+    };
+    tick();
+    const id = setInterval(tick, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [libTab, showCapture, screenBuildFilter, captureDeviceId, project.id, builds]);
+
   useEffect(() => { loadScreenFolders(); }, [loadScreenFolders]);
-  useEffect(() => { if (libTab === "screens") { loadScreens(); loadBuilds(); } }, [libTab, loadScreens, loadBuilds]);
+  useEffect(() => {
+    loadBuilds();
+  }, [loadBuilds]);
+  useEffect(() => {
+    if (libTab === "screens") loadScreens();
+  }, [libTab, loadScreens]);
 
   // Create test state
   const [showCreate, setShowCreate] = useState(false);
@@ -2402,6 +2456,10 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
   const [genSuiteTargetId, setGenSuiteTargetId] = useState<number | null>(null);
   const [genSuiteStatus, setGenSuiteStatus] = useState("");
   const [genSuiteFolderId, setGenSuiteFolderId] = useState<number | null>(null);
+  const [genAiFolderScreens, setGenAiFolderScreens] = useState<ScreenEntry[]>([]);
+  const [genAiBuildIds, setGenAiBuildIds] = useState<number[]>([]);
+  const [genSuiteFolderScreens, setGenSuiteFolderScreens] = useState<ScreenEntry[]>([]);
+  const [genSuiteBuildIds, setGenSuiteBuildIds] = useState<number[]>([]);
 
   // Import script / sheet (preview → confirm)
   const [showImport, setShowImport] = useState(false);
@@ -2454,8 +2512,84 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
   // Screen context for generation
   const [genFolderId, setGenFolderId] = useState<number | null>(null);
 
+  useEffect(() => {
+    if (!genFolderId) {
+      setGenAiFolderScreens([]);
+      setGenAiBuildIds([]);
+      return;
+    }
+    const pf = platform === "ios_sim" ? "ios_sim" : "android";
+    api
+      .listScreens(project.id, { folderId: genFolderId, platform: pf })
+      .then((rows) => {
+        setGenAiFolderScreens(rows);
+        const distinct = [
+          ...new Set(rows.map((s) => s.build_id).filter((id): id is number => id != null)),
+        ].sort((a, b) => a - b);
+        setGenAiBuildIds(distinct);
+      })
+      .catch(() => {
+        setGenAiFolderScreens([]);
+        setGenAiBuildIds([]);
+      });
+  }, [genFolderId, platform, project.id]);
+
+  useEffect(() => {
+    if (!genSuiteFolderId) {
+      setGenSuiteFolderScreens([]);
+      setGenSuiteBuildIds([]);
+      return;
+    }
+    const pf = platform === "ios_sim" ? "ios_sim" : "android";
+    api
+      .listScreens(project.id, { folderId: genSuiteFolderId, platform: pf })
+      .then((rows) => {
+        setGenSuiteFolderScreens(rows);
+        const distinct = [
+          ...new Set(rows.map((s) => s.build_id).filter((id): id is number => id != null)),
+        ].sort((a, b) => a - b);
+        setGenSuiteBuildIds(distinct);
+      })
+      .catch(() => {
+        setGenSuiteFolderScreens([]);
+        setGenSuiteBuildIds([]);
+      });
+  }, [genSuiteFolderId, platform, project.id]);
+
+  const toggleGenAiBuild = (bid: number) => {
+    setGenAiBuildIds((prev) =>
+      prev.includes(bid) ? prev.filter((x) => x !== bid) : [...prev, bid].sort((a, b) => a - b),
+    );
+  };
+  const toggleGenSuiteBuild = (bid: number) => {
+    setGenSuiteBuildIds((prev) =>
+      prev.includes(bid) ? prev.filter((x) => x !== bid) : [...prev, bid].sort((a, b) => a - b),
+    );
+  };
+
+  const genAiContextScreenCount = useMemo(() => {
+    const hasTagged = genAiFolderScreens.some((s) => s.build_id != null);
+    if (!hasTagged) return genAiFolderScreens.length;
+    if (genAiBuildIds.length === 0) return 0;
+    return genAiFolderScreens.filter((s) => s.build_id != null && genAiBuildIds.includes(s.build_id)).length;
+  }, [genAiFolderScreens, genAiBuildIds]);
+
+  const genSuiteContextScreenCount = useMemo(() => {
+    const hasTagged = genSuiteFolderScreens.some((s) => s.build_id != null);
+    if (!hasTagged) return genSuiteFolderScreens.length;
+    if (genSuiteBuildIds.length === 0) return 0;
+    return genSuiteFolderScreens.filter((s) => s.build_id != null && genSuiteBuildIds.includes(s.build_id)).length;
+  }, [genSuiteFolderScreens, genSuiteBuildIds]);
+
   const aiGenerate = async () => {
     if (!aiPrompt.trim()) { toast("Describe the test", "error"); return; }
+    if (genFolderId) {
+      const hasTagged = genAiFolderScreens.some((s) => s.build_id != null);
+      if (hasTagged && genAiBuildIds.length === 0) {
+        toast("Select at least one build for screen context", "error");
+        return;
+      }
+    }
     setBusy(true);
     setTaskProgress({ label: genFolderId ? "Generating with Screen Library context (XML + screenshots)…" : "Capturing page source (Appium)…", pct: null });
     setAiStatus("Generating...");
@@ -2465,7 +2599,13 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
         try { const ps = await api.capturePageSource(); if (ps.ok) xml = ps.xml; } catch {}
       }
       setTaskProgress({ label: "AI is generating steps — usually 15–45s…", pct: null });
-      const opts = genFolderId ? { folder_id: genFolderId, project_id: project.id, build_id: screenBuildFilter } : undefined;
+      const opts = genFolderId
+        ? {
+            folder_id: genFolderId,
+            project_id: project.id,
+            ...(genAiBuildIds.length > 0 ? { build_ids: genAiBuildIds } : {}),
+          }
+        : undefined;
       const res = await api.generateSteps(platform === "ios_sim" ? "ios_sim" : "android", aiPrompt, xml, opts);
       setNewSteps(res.steps);
       setNewAcceptanceCriteria(prev => prev || aiPrompt);
@@ -2589,6 +2729,13 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
   const aiGenerateSuite = async () => {
     if (!genSuitePrompt.trim()) { toast("Describe the feature to test", "error"); return; }
     if (!genSuiteTargetId) { toast("Select a Test Suite", "error"); return; }
+    if (genSuiteFolderId) {
+      const hasTagged = genSuiteFolderScreens.some((s) => s.build_id != null);
+      if (hasTagged && genSuiteBuildIds.length === 0) {
+        toast("Select at least one build for screen context", "error");
+        return;
+      }
+    }
     setBusy(true);
     setTaskProgress({ label: genSuiteFolderId ? "Generating with Screen Library context (XML + screenshots)…" : "Capturing page source (Appium)…", pct: null });
     setGenSuiteStatus(genSuiteFolderId ? "Generating with screen context..." : "Capturing page source...");
@@ -2599,7 +2746,15 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
       }
       setTaskProgress({ label: "AI is generating multiple test cases — may take a minute…", pct: null });
       setGenSuiteStatus("AI generating test cases...");
-      const res = await api.generateSuite(platform, genSuitePrompt, project.id, genSuiteTargetId, xml, genSuiteFolderId);
+      const res = await api.generateSuite(
+        platform,
+        genSuitePrompt,
+        project.id,
+        genSuiteTargetId,
+        xml,
+        genSuiteFolderId,
+        genSuiteBuildIds.length > 0 ? genSuiteBuildIds : undefined,
+      );
       setGenSuiteStatus(`Created ${res.created} test cases`);
       toast(`Generated ${res.created} test cases`, "success");
       setGenSuitePrompt("");
@@ -3043,7 +3198,29 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
               {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name} ({f.screen_count} screens)</option>)}
             </select>
           </div>
-          {genSuiteFolderId && <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8 }}>AI will use real selectors + screenshots from the selected folder.</div>}
+          {genSuiteFolderId && genSuiteFolderScreens.some(s => s.build_id != null) && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>Builds in folder (context)</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {[...new Set(genSuiteFolderScreens.map(s => s.build_id).filter((id): id is number => id != null))].sort((a, b) => a - b).map((bid) => {
+                  const b = builds.find(x => x.id === bid);
+                  return (
+                    <label key={bid} style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                      <input type="checkbox" checked={genSuiteBuildIds.includes(bid)} onChange={() => toggleGenSuiteBuild(bid)} />
+                      {b?.file_name ?? `Build #${bid}`}
+                    </label>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--accent2)", marginTop: 4 }}>{genSuiteContextScreenCount} screen(s) will be sent to AI</div>
+            </div>
+          )}
+          {genSuiteFolderId && !genSuiteFolderScreens.some(s => s.build_id != null) && genSuiteFolderScreens.length > 0 && (
+            <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>
+              {genSuiteFolderScreens.length} screen(s) in folder (no build id) — all will be sent to AI.
+            </div>
+          )}
+          {genSuiteFolderId && <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8 }}>AI will use real selectors + screenshots from the selected folder and builds above.</div>}
           <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder="Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..." rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
           {genSuiteStatus && <div style={{ fontSize: 11, color: "var(--accent2)", marginBottom: 8 }}>{genSuiteStatus}</div>}
           <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || !genSuitePrompt.trim() || !genSuiteTargetId}>{busy ? "Generating..." : "✨ Generate Test Suite"}</button>
@@ -3087,9 +3264,31 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                 {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name} ({f.screen_count} screens)</option>)}
               </select>
               {genFolderId
-                ? <span style={{ fontSize: 10, color: "var(--accent)" }}>AI will use real selectors + screenshots from this folder.</span>
+                ? <span style={{ fontSize: 10, color: "var(--accent)" }}>Pick folder + builds below for grounded AI.</span>
                 : <span style={{ fontSize: 10, color: "var(--muted)" }}>Select a screen folder for better accuracy.</span>}
             </div>
+            {genFolderId && genAiFolderScreens.some(s => s.build_id != null) && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>Builds in folder (context)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {[...new Set(genAiFolderScreens.map(s => s.build_id).filter((id): id is number => id != null))].sort((a, b) => a - b).map((bid) => {
+                    const b = builds.find(x => x.id === bid);
+                    return (
+                      <label key={bid} style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                        <input type="checkbox" checked={genAiBuildIds.includes(bid)} onChange={() => toggleGenAiBuild(bid)} />
+                        {b?.file_name ?? `Build #${bid}`}
+                      </label>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 10, color: "var(--accent2)", marginTop: 4 }}>{genAiContextScreenCount} screen(s) will be sent to AI</div>
+              </div>
+            )}
+            {genFolderId && !genAiFolderScreens.some(s => s.build_id != null) && genAiFolderScreens.length > 0 && (
+              <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>
+                {genAiFolderScreens.length} screen(s) in folder (no build id) — all will be sent to AI.
+              </div>
+            )}
             {aiStatus && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>{aiStatus}</div>}
             <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8 }}>While AI Generate runs, a progress bar appears under the Test Library title above.</div>
           <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="Test name" className="form-input" style={{ width: "100%", marginBottom: 10 }} />
@@ -3287,14 +3486,91 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
           <div>
             {/* Capture panel */}
             {showCapture && (() => {
-              const selectedBuild = builds.find(b => b.id === screenBuildFilter) || builds[0] || null;
+              const selectedBuild =
+                screenBuildFilter != null ? builds.find(b => b.id === screenBuildFilter) ?? null : null;
               const capturePlatform = selectedBuild?.platform || platform;
               return (
               <div className="panel" style={{ padding: 16, marginBottom: 12, border: "1px solid rgba(139,92,246,.25)" }}>
                 <div style={{ fontFamily: "var(--sans)", fontWeight: 600, marginBottom: 4, fontSize: 13 }}>Capture Screen</div>
                 <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>
-                  <strong>First screen in an empty folder:</strong> the selected build is <strong>uninstalled and reinstalled</strong> so you start clean. <strong>If you change the Build</strong> while the folder already has screens from another build, QA·OS <strong>removes the old app(s)</strong> and <strong>installs the newly selected build</strong>. <strong>Later captures (same build):</strong> capture shows <strong>whatever is on screen</strong> (navigate first). QA·OS does <strong>not</strong> relaunch your app after capture (that was skipping onboarding); if you land on the home screen, open the app again. Pick the <strong>Device</strong> that matches your emulator.
+                  <strong>Start build</strong> runs install / first-folder / build-switch logic <strong>once</strong> and keeps one Appium session open. <strong>Capture</strong> only reads the UI tree and screenshot (no reinstall, no quit). Pick a <strong>specific build</strong> (not Latest) and the <strong>Device</strong> that matches your emulator. Changing build or device stops the previous session.
                 </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+                  <span style={{ fontSize: 11, color: screenSessionActive ? "var(--accent)" : "var(--muted)" }}>
+                    {screenSessionActive ? "● Session active" : "○ No session — Start build first"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-primary btn-sm"
+                    disabled={busy || !activeFolderId || screenBuildFilter == null}
+                    onClick={async () => {
+                      if (screenBuildFilter == null || !selectedBuild) return;
+                      setBusy(true);
+                      setCaptureStatus("Starting Appium session…");
+                      try {
+                        const res = await api.startScreenSession({
+                          project_id: project.id,
+                          folder_id: activeFolderId!,
+                          build_id: screenBuildFilter,
+                          platform: selectedBuild.platform,
+                          ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
+                        });
+                        lastScreenSessionRef.current = {
+                          build_id: screenBuildFilter,
+                          device_target: captureDeviceId,
+                          platform: selectedBuild.platform as "android" | "ios_sim",
+                        };
+                        setScreenSessionActive(true);
+                        const bits: string[] = [];
+                        if (res.reused) bits.push("reused existing session");
+                        if (res.flags?.fresh_install) bits.push("fresh reinstall (first screen in folder)");
+                        if (res.flags?.build_changed) bits.push("build switch — old app(s) removed");
+                        setCaptureStatus(
+                          `Session ready${bits.length ? ` — ${bits.join("; ")}` : ""}. Use Capture while you navigate; session stays open.`,
+                        );
+                      } catch (e: any) {
+                        setCaptureStatus(`Error: ${e?.message || e}`);
+                        setScreenSessionActive(false);
+                        lastScreenSessionRef.current = null;
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    Start build
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-ghost btn-sm"
+                    disabled={busy || screenBuildFilter == null || !selectedBuild}
+                    onClick={async () => {
+                      if (screenBuildFilter == null || !selectedBuild) return;
+                      setBusy(true);
+                      try {
+                        await api.stopScreenSession({
+                          project_id: project.id,
+                          build_id: screenBuildFilter,
+                          platform: selectedBuild.platform,
+                          ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
+                        });
+                        lastScreenSessionRef.current = null;
+                        setScreenSessionActive(false);
+                        setCaptureStatus("Session stopped.");
+                      } catch (e: any) {
+                        setCaptureStatus(`Error: ${e?.message || e}`);
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    Stop session
+                  </button>
+                </div>
+                {screenBuildFilter == null && (
+                  <div style={{ fontSize: 10, color: "var(--warn)", marginBottom: 8 }}>
+                    Select a specific build (not &quot;Latest&quot;) before Start build or Capture.
+                  </div>
+                )}
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
                   <div style={{ minWidth: 130 }}>
                     <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Folder</label>
@@ -3310,6 +3586,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                   <div>
                     <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Build</label>
                     <select value={screenBuildFilter ?? ""} onChange={e => {
+                      void stopScreenSessionIfAny();
                       const val = e.target.value ? Number(e.target.value) : null;
                       setScreenBuildFilter(val);
                       const b = builds.find(x => x.id === val);
@@ -3327,7 +3604,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                   </div>
                   <div style={{ minWidth: 160 }}>
                     <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Device</label>
-                    <select value={captureDeviceId} onChange={e => setCaptureDeviceId(e.target.value)} style={{ fontSize: 11, width: "100%", maxWidth: 220 }}>
+                    <select value={captureDeviceId} onChange={e => { void stopScreenSessionIfAny(); setCaptureDeviceId(e.target.value); }} style={{ fontSize: 11, width: "100%", maxWidth: 220 }}>
                       {capturePlatform === "ios_sim"
                         ? (devices.ios_simulators.length === 0
                           ? <option value="">No simulator — boot one in Xcode</option>
@@ -3344,31 +3621,42 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                     <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Notes</label>
                     <input type="text" value={captureNotes} onChange={e => setCaptureNotes(e.target.value)} placeholder="Optional" style={{ width: "100%", fontSize: 11, padding: "6px 8px" }} />
                   </div>
-                  <button className="btn-primary btn-sm" disabled={busy || !captureName.trim() || !activeFolderId} onClick={async () => {
-                    setBusy(true);
-                    setCaptureStatus("Capturing screen — first time may install the app (~20s), otherwise a few seconds...");
-                    try {
-                      const entry = await api.captureScreen({
-                        project_id: project.id,
-                        build_id: screenBuildFilter,
-                        folder_id: activeFolderId!,
-                        name: captureName.trim(),
-                        platform: capturePlatform,
-                        notes: captureNotes,
-                        ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
-                      });
-                      setCaptureStatus(
-                        `Captured "${entry.name}" — ${entry.xml_length.toLocaleString()} chars of XML` +
-                          (entry.fresh_install ? " · Fresh reinstall (first screen in this folder)" : "") +
-                          (entry.build_changed ? " · Switched build — old app removed, new build installed" : ""),
-                      );
-                      setCaptureName("");
-                      setCaptureNotes("");
-                      loadScreens(); loadScreenFolders();
-                    } catch (e: any) {
-                      setCaptureStatus(`Error: ${e?.message || e}`);
-                    } finally { setBusy(false); }
-                  }}>Capture</button>
+                  <button
+                    className="btn-primary btn-sm"
+                    disabled={
+                      busy ||
+                      !captureName.trim() ||
+                      !activeFolderId ||
+                      screenBuildFilter == null ||
+                      !screenSessionActive
+                    }
+                    onClick={async () => {
+                      if (screenBuildFilter == null) return;
+                      setBusy(true);
+                      setCaptureStatus("Capturing page source and screenshot…");
+                      try {
+                        const entry = await api.captureScreen({
+                          project_id: project.id,
+                          build_id: screenBuildFilter,
+                          folder_id: activeFolderId!,
+                          name: captureName.trim(),
+                          platform: capturePlatform,
+                          notes: captureNotes,
+                          ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
+                        });
+                        setCaptureStatus(`Captured "${entry.name}" — ${entry.xml_length.toLocaleString()} chars of XML`);
+                        setCaptureName("");
+                        setCaptureNotes("");
+                        loadScreens(); loadScreenFolders();
+                      } catch (e: any) {
+                        setCaptureStatus(`Error: ${e?.message || e}`);
+                      } finally {
+                        setBusy(false);
+                      }
+                    }}
+                  >
+                    Capture
+                  </button>
                 </div>
                 {!activeFolderId && <div style={{ marginTop: 8, fontSize: 10, color: "var(--warn)" }}>Select or create a folder first.</div>}
                 {captureStatus && (

@@ -55,6 +55,13 @@ export type AiFixResponse = {
   fixed_steps: any[];
   changes: any[];
   tap_diagnosis: TapDiagnosisOut | null;
+  failure_diagnosis?: {
+    cause?: string;
+    evidence?: string[];
+    recommended_fix?: string | null;
+    recommended_strategy?: string | null;
+    recommended_value?: string | null;
+  } | null;
 };
 
 let authBootstrapped = false;
@@ -426,15 +433,42 @@ export const api = {
     http<{ completed: boolean }>("/api/onboarding/complete", { method: "POST" }),
 
   // AI
-  generateSteps: (platform: string, prompt: string, pageSourceXml?: string, opts?: { screen_names?: string[]; folder_id?: number | null; project_id?: number; build_id?: number | null }) =>
+  generateSteps: (
+    platform: string,
+    prompt: string,
+    pageSourceXml?: string,
+    opts?: {
+      screen_names?: string[];
+      folder_id?: number | null;
+      project_id?: number;
+      build_id?: number | null;
+      build_ids?: number[];
+    },
+  ) =>
     http<{ steps: any[]; grounded?: boolean; screens_used?: number }>("/api/ai/generate-steps", {
       method: "POST",
       body: JSON.stringify({ platform, prompt, page_source_xml: pageSourceXml || "", ...(opts || {}) }),
     }),
-  generateSuite: (platform: string, prompt: string, projectId: number, suiteId: number, pageSourceXml?: string, folderId?: number | null) =>
+  generateSuite: (
+    platform: string,
+    prompt: string,
+    projectId: number,
+    suiteId: number,
+    pageSourceXml?: string,
+    folderId?: number | null,
+    buildIds?: number[],
+  ) =>
     http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[] }>("/api/ai/generate-suite", {
       method: "POST",
-      body: JSON.stringify({ platform, prompt, project_id: projectId, suite_id: suiteId, page_source_xml: pageSourceXml || "", ...(folderId ? { folder_id: folderId } : {}) }),
+      body: JSON.stringify({
+        platform,
+        prompt,
+        project_id: projectId,
+        suite_id: suiteId,
+        page_source_xml: pageSourceXml || "",
+        ...(folderId ? { folder_id: folderId } : {}),
+        ...(buildIds && buildIds.length > 0 ? { build_ids: buildIds } : {}),
+      }),
     }),
   editSteps: (platform: string, currentSteps: any[], instruction: string) =>
     http<{ steps: any[]; summary: string }>("/api/ai/edit-steps", {
@@ -513,9 +547,35 @@ export const api = {
   deleteScreenFolder: (id: number) =>
     http<{ ok: boolean }>(`/api/screen-folders/${id}`, { method: "DELETE" }),
 
+  startScreenSession: (body: {
+    project_id: number;
+    folder_id: number;
+    build_id: number;
+    platform: string;
+    device_target?: string;
+  }) =>
+    http<{ ok: boolean; started: boolean; reused?: boolean; flags: { fresh_install?: boolean; build_changed?: boolean } }>(
+      "/api/screens/session/start",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  stopScreenSession: (body: {
+    project_id: number;
+    build_id: number;
+    platform: string;
+    device_target?: string;
+  }) => http<{ ok: boolean; stopped: boolean }>("/api/screens/session/stop", { method: "POST", body: JSON.stringify(body) }),
+  screenSessionStatus: (q: { project_id: number; build_id: number; platform: string; device_target?: string }) => {
+    const params = new URLSearchParams({
+      project_id: String(q.project_id),
+      build_id: String(q.build_id),
+      platform: q.platform,
+    });
+    if (q.device_target) params.set("device_target", q.device_target);
+    return http<{ active: boolean; created_at?: string; last_used?: string }>(`/api/screens/session/status?${params}`);
+  },
   captureScreen: (body: {
     project_id: number;
-    build_id?: number | null;
+    build_id: number;
     folder_id: number;
     name: string;
     platform: string;

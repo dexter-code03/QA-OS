@@ -27,25 +27,31 @@ class AppiumHandle:
 
 
 def ensure_appium_running(
-    timeout_s: int = 15,
+    timeout_s: int = 60,
     host: str | None = None,
     port: int | None = None,
 ) -> Optional[AppiumHandle]:
     """
     If Appium is already running on APPIUM_HOST:APPIUM_PORT, do nothing.
-    Otherwise attempt to spawn `appium` as a subprocess (requires global install).
+    Otherwise attempt to spawn `appium server` (Appium 2+; requires CLI on PATH
+    for the same process that runs the backend).
     """
     host = host or settings.appium_host
     port = port or settings.appium_port
     if _is_port_open(host, port):
         return None
 
-    proc = subprocess.Popen(
-        ["appium", "--address", host, "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    # Never use PIPE here without draining: Appium logs can fill the buffer and
+    # block startup before the HTTP port opens.
+    try:
+        proc = subprocess.Popen(
+            ["appium", "server", "--address", host, "--port", str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None
 
     start = time.time()
     while time.time() - start < timeout_s:

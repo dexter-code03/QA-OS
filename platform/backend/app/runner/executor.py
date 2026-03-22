@@ -4,6 +4,7 @@ import asyncio
 import time
 from typing import Any
 
+from appium.webdriver.common.appiumby import AppiumBy
 from appium.webdriver.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 
@@ -63,6 +64,13 @@ _KEYBOARD_KEYS = {"return", "done", "go", "next", "search", "send", "enter"}
 
 
 def _by(selector_using: str) -> str:
+    norm = " ".join((selector_using or "").strip().lower().split())
+    norm_ns = norm.replace(" ", "")
+    if norm in ("-android uiautomator", "android uiautomator") or norm_ns in (
+        "-androiduiautomator",
+        "androiduiautomator",
+    ) or norm == "uiautomator":
+        return AppiumBy.ANDROID_UIAUTOMATOR
     if selector_using == "xpath":
         return By.XPATH
     if selector_using == "id":
