@@ -761,6 +761,7 @@ def _build_tap_diagnosis_for_ai(
     all_steps: list[dict[str, Any]],
     step_results: list[dict[str, Any]],
     page_source_xml: str,
+    page_source_xml_raw: str = "",
 ) -> tuple[dict[str, Any] | None, str]:
     tap_diagnosis: dict[str, Any] | None = None
     tap_diagnosis_text = ""
@@ -769,13 +770,14 @@ def _build_tap_diagnosis_for_ai(
     sel = failed_step.get("selector") or {}
     strategy = sel.get("using", "accessibilityId")
     value = (sel.get("value") or "").strip()
-    if not value or not page_source_xml:
+    diag_xml = (page_source_xml_raw or page_source_xml or "").strip()
+    if not value or not diag_xml:
         return tap_diagnosis, tap_diagnosis_text
 
     diag = diagnose_tap_failure(
         strategy=strategy,
         value=value,
-        page_source_xml=page_source_xml,
+        page_source_xml=diag_xml,
         step_index=failed_step_index,
         all_steps=all_steps,
         step_results=step_results,
@@ -802,6 +804,7 @@ def _build_tap_diagnosis_for_ai(
         "element_disabled": "DISABLED — element found but enabled=false",
         "wrong_screen": "WRONG SCREEN — the app navigated to an unexpected page",
         "element_missing": "MISSING — element not present in the page source at all",
+        "xml_parse_failed": "XML PARSE — hierarchy text was not valid strict XML for the rule-based debugger",
     }
     tap_diagnosis_text = (
         f"\n=== TAP DEBUGGER DIAGNOSIS (run BEFORE this prompt) ===\n"
@@ -832,7 +835,8 @@ class FixStepsRequest(BaseModel):
     step_results: list[dict[str, Any]]
     failed_step_index: int
     error_message: str = ""
-    page_source_xml: str = ""
+    page_source_xml: str = ""  # simplified for LLM; may not be strict XML
+    page_source_xml_raw: str = ""  # raw Appium XML for tap diagnosis (recommended)
     test_name: str = ""
     screenshot_base64: str = ""
     already_tried_fixes: list[dict[str, Any]] = []  # [{analysis, fixed_steps}, ...] from test.fix_history
@@ -857,6 +861,7 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         payload.original_steps,
         payload.step_results,
         payload.page_source_xml,
+        payload.page_source_xml_raw,
     )
 
     passed_steps = []
@@ -999,6 +1004,7 @@ class RefineFixRequest(BaseModel):
     failed_step_index: int
     error_message: str = ""
     page_source_xml: str = ""
+    page_source_xml_raw: str = ""
     test_name: str = ""
     screenshot_base64: str = ""
     acceptance_criteria: str = ""  # Source of truth
@@ -1040,6 +1046,7 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
         all_steps_for_diag,
         payload.step_results,
         payload.page_source_xml,
+        payload.page_source_xml_raw,
     )
 
     system_prompt = (
@@ -1317,6 +1324,8 @@ def _create_attach_driver(platform: str, device_target: str, server_url: str):
         opts.set_capability("appium:autoLaunch", False)
         opts.set_capability("appium:skipDeviceInitialization", True)
         opts.set_capability("appium:skipServerInstallation", True)
+        # Try to avoid tearing down the foreground app when the capture session ends (driver.quit).
+        opts.set_capability("appium:shouldTerminateApp", False)
         return webdriver.Remote(command_executor=server_url, options=opts)
 
     if platform in ("ios_sim", "ios"):
@@ -1346,46 +1355,137 @@ def _is_app_installed(device_target: str, package: str) -> bool:
         return False
 
 
-def _is_app_foreground(device_target: str, package: str) -> bool:
-    """Check if the app is currently in the foreground on the device."""
+def _adb_uninstall(device_target: str, package: str) -> None:
+    """Remove the package from the device (no-op if missing). Used before fresh reinstall."""
+    if not device_target or not package:
+        return
+    subprocess.run(
+        ["adb", "-s", device_target, "uninstall", package],
+        timeout=120,
+        capture_output=True,
+    )
+
+
+def _android_page_source_looks_like_launcher(xml: str) -> bool:
+    """True if page source is clearly the system launcher (not an in-app screen)."""
+    xl = (xml or "").lower()
+    markers = (
+        "com.android.launcher",
+        "com.google.android.apps.nexuslauncher",
+        "com.google.android.apps.launcher",
+        "launcher3",
+        "com.sec.android.app.launcher",
+        "com.miui.home",
+        "com.huawei.android.launcher",
+    )
+    return any(m in xl for m in markers)
+
+
+def _bring_android_app_foreground(device_target: str, package: str, activity: str = "") -> None:
+    """
+    After Appium driver.quit(), sometimes the user lands on the home screen.
+    Only used when the capture was of the launcher — never call this after an in-app capture,
+    because `am start` relaunches the app and can advance onboarding / skip the first screen.
+    """
+    if not device_target or not package:
+        return
+    act = (activity or "").strip()
+    if act:
+        if act.startswith("."):
+            comp = f"{package}/{act}"
+        elif "/" in act:
+            comp = act
+        else:
+            comp = f"{package}/{act}"
+        subprocess.run(
+            ["adb", "-s", device_target, "shell", "am", "start", "-n", comp],
+            timeout=20,
+            capture_output=True,
+        )
+        return
+    subprocess.run(
+        [
+            "adb", "-s", device_target, "shell", "am", "start",
+            "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER",
+            "-p", package,
+        ],
+        timeout=20,
+        capture_output=True,
+    )
+
+
+def _ios_sim_uninstall(udid: str, bundle_id: str) -> None:
+    """Remove app from booted simulator before fresh reinstall."""
+    if not udid or not bundle_id:
+        return
+    xcrun = "/usr/bin/xcrun" if os.path.exists("/usr/bin/xcrun") else "xcrun"
+    subprocess.run(
+        [xcrun, "simctl", "uninstall", udid, bundle_id],
+        timeout=120,
+        capture_output=True,
+    )
+
+
+def _adb_devices_online() -> list[str]:
+    """Serials of devices in `adb devices` state 'device'."""
     import subprocess
+
     try:
-        out = subprocess.check_output(
-            ["adb", "-s", device_target, "shell", "dumpsys", "activity", "recents"],
-            text=True, timeout=5,
-        )
-        for line in out.splitlines():
-            if "Recent #0" in line or "mFocusedApp" in line or "realActivity" in line:
-                if package in line:
-                    return True
-                break
-        out2 = subprocess.check_output(
-            ["adb", "-s", device_target, "shell", "dumpsys", "window", "windows"],
-            text=True, timeout=5,
-        )
-        for line in out2.splitlines():
-            if "mCurrentFocus" in line or "mFocusedApp" in line:
-                if package in line:
-                    return True
-        return False
+        adb_out = subprocess.check_output(["adb", "devices"], text=True, timeout=5)
     except Exception:
-        return False
+        return []
+    out: list[str] = []
+    for line in adb_out.strip().split("\n")[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            out.append(parts[0])
+    return out
 
 
-def _launch_app(device_target: str, package: str, activity: str = "") -> None:
-    """Launch an already-installed app on the device."""
-    import subprocess
-    if activity:
-        subprocess.run(
-            ["adb", "-s", device_target, "shell", "am", "start", "-n", f"{package}/{activity}"],
-            timeout=10, capture_output=True,
-        )
-    else:
-        subprocess.run(
-            ["adb", "-s", device_target, "shell", "monkey", "-p", package,
-             "-c", "android.intent.category.LAUNCHER", "1"],
-            timeout=10, capture_output=True,
-        )
+def _resolve_android_device(requested: str | None) -> str:
+    """Use requested serial if online; otherwise first device (legacy behavior)."""
+    online = _adb_devices_online()
+    if not online:
+        return ""
+    r = (requested or "").strip()
+    if r and r in online:
+        return r
+    if r:
+        for d in online:
+            if r == d or d.endswith(r) or r in d:
+                return d
+    return online[0]
+
+
+def _packages_from_other_builds_in_folder(folder_id: int, current_build_id: int) -> list[str]:
+    """Android package names from screens in this folder saved under a different build."""
+    out: set[str] = set()
+    with SessionLocal() as db:
+        for s in db.query(ScreenLibrary).filter(ScreenLibrary.folder_id == folder_id).all():
+            if s.build_id is None or s.build_id == current_build_id:
+                continue
+            b = db.query(Build).filter(Build.id == s.build_id).first()
+            if b and b.build_metadata:
+                p = (b.build_metadata or {}).get("package") or ""
+                if p.strip():
+                    out.add(p.strip())
+    return list(out)
+
+
+def _bundle_ids_from_other_builds_in_folder(folder_id: int, current_build_id: int) -> list[str]:
+    """iOS bundle IDs from screens in this folder saved under a different build."""
+    out: set[str] = set()
+    with SessionLocal() as db:
+        for s in db.query(ScreenLibrary).filter(ScreenLibrary.folder_id == folder_id).all():
+            if s.build_id is None or s.build_id == current_build_id:
+                continue
+            b = db.query(Build).filter(Build.id == s.build_id).first()
+            if b and b.build_metadata:
+                bid = (b.build_metadata or {}).get("bundle_id") or ""
+                if bid.strip():
+                    out.add(bid.strip())
+    return list(out)
 
 
 @app.post("/api/screens/capture")
@@ -1399,11 +1499,25 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
     name = (body.get("name") or "").strip()
     platform_val = body.get("platform", "android")
     notes = body.get("notes", "")
+    requested_device = (body.get("device_target") or "").strip()
 
     if not project_id or not name:
         raise HTTPException(status_code=400, detail="project_id and name are required")
     if not folder_id:
         raise HTTPException(status_code=400, detail="folder_id is required — select or create a folder first")
+
+    with SessionLocal() as db:
+        n_folder = db.query(ScreenLibrary).filter(ScreenLibrary.folder_id == folder_id).count()
+        first_capture_in_folder = n_folder == 0
+        # Reinstall once when introducing a *new* build into a folder that already has screens
+        # tied to another build (or legacy null build_id). Do not repeat on every capture while
+        # old rows still exist — that was reinstalling + new Appium session each time.
+        build_switch_reinstall = False
+        if not first_capture_in_folder and build_id is not None:
+            rows = db.query(ScreenLibrary).filter(ScreenLibrary.folder_id == folder_id).all()
+            has_this_build = any(s.build_id == build_id for s in rows)
+            has_other_or_legacy = any(s.build_id is None or s.build_id != build_id for s in rows)
+            build_switch_reinstall = (not has_this_build) and has_other_or_legacy
 
     s = _load_settings()
     host = s.get("appium_host", settings.appium_host)
@@ -1425,30 +1539,63 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
     shot_b64 = ""
     driver = None
     needs_install = False
+    fresh_install_for_folder = False
+    build_changed_reinstall = False
 
     try:
         await asyncio.get_event_loop().run_in_executor(None, ensure_appium_running)
 
         if platform_val == "android":
-            try:
-                import subprocess
-                adb_out = subprocess.check_output(["adb", "devices"], text=True, timeout=5)
-                for line in adb_out.strip().split("\n")[1:]:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1] == "device":
-                        device_target = parts[0]
-                        break
-            except Exception:
-                pass
+            device_target = await asyncio.get_event_loop().run_in_executor(
+                None, _resolve_android_device, requested_device or None
+            )
+
+        if platform_val in ("ios_sim", "ios"):
+            device_target = requested_device
 
         if not device_target and platform_val == "android":
             raise HTTPException(status_code=400, detail="No Android device or emulator found. Connect a device or start an emulator first.")
 
         pkg = build_meta.get("package", "")
+        bundle_id = (build_meta.get("bundle_id") or "").strip()
+
+        # First screen in a new folder: always uninstall + full reinstall (clean slate).
+        # Switching to a different build while the folder already has screens: uninstall old
+        # package(s) and reinstall the newly selected build.
+        # Otherwise: install only if missing; else attach (capture current device UI).
         if platform_val == "android" and pkg:
-            needs_install = not await asyncio.get_event_loop().run_in_executor(
-                None, _is_app_installed, device_target, pkg
-            )
+            if first_capture_in_folder and app_path:
+                await asyncio.get_event_loop().run_in_executor(None, _adb_uninstall, device_target, pkg)
+                needs_install = True
+                fresh_install_for_folder = True
+            elif build_switch_reinstall and app_path and build_id is not None:
+                for op in set(_packages_from_other_builds_in_folder(folder_id, build_id)):
+                    await asyncio.get_event_loop().run_in_executor(None, _adb_uninstall, device_target, op)
+                await asyncio.get_event_loop().run_in_executor(None, _adb_uninstall, device_target, pkg)
+                needs_install = True
+                build_changed_reinstall = True
+            else:
+                needs_install = not await asyncio.get_event_loop().run_in_executor(
+                    None, _is_app_installed, device_target, pkg
+                )
+
+        elif platform_val in ("ios_sim", "ios") and bundle_id and app_path:
+            if first_capture_in_folder and device_target:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _ios_sim_uninstall, device_target, bundle_id
+                )
+                needs_install = True
+                fresh_install_for_folder = True
+            elif build_switch_reinstall and device_target and build_id is not None:
+                for bid in set(_bundle_ids_from_other_builds_in_folder(folder_id, build_id)):
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _ios_sim_uninstall, device_target, bid
+                    )
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _ios_sim_uninstall, device_target, bundle_id
+                )
+                needs_install = True
+                build_changed_reinstall = True
 
         if needs_install and app_path:
             cfg = SessionConfig(
@@ -1463,15 +1610,6 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
                 raise HTTPException(status_code=502, detail=f"Failed to install & launch app: {e}")
             await asyncio.sleep(3)
         else:
-            if platform_val == "android" and pkg and not await asyncio.get_event_loop().run_in_executor(
-                None, _is_app_foreground, device_target, pkg
-            ):
-                activity = build_meta.get("main_activity", "")
-                await asyncio.get_event_loop().run_in_executor(
-                    None, _launch_app, device_target, pkg, activity
-                )
-                await asyncio.sleep(3)
-
             try:
                 driver = await asyncio.get_event_loop().run_in_executor(
                     None, _create_attach_driver, platform_val, device_target, base
@@ -1480,10 +1618,26 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
                 raise HTTPException(status_code=502, detail=f"Failed to create Appium session: {e}")
 
         try:
+            # Install path already waited 3s; attach-only needs a bit longer for session + UI to settle.
+            await asyncio.sleep(0.35 if (needs_install and app_path) else 0.9)
             xml = await asyncio.get_event_loop().run_in_executor(None, lambda: driver.page_source)
             shot_b64 = await asyncio.get_event_loop().run_in_executor(None, lambda: driver.get_screenshot_as_base64())
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Failed to capture screen: {e}")
+        finally:
+            try:
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+        # Only re-open the app when the capture was clearly the system launcher. Relaunching via
+        # `am start` after an in-app capture was restarting the root activity and advancing flows.
+        if platform_val == "android" and pkg and device_target and _android_page_source_looks_like_launcher(xml):
+            await asyncio.sleep(0.2)
+            main_act = (build_meta.get("main_activity") or "").strip()
+            await asyncio.get_event_loop().run_in_executor(
+                None, _bring_android_app_foreground, device_target, pkg, main_act
+            )
 
     except HTTPException:
         raise
@@ -1526,7 +1680,12 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
             existing.folder_id = folder_id or existing.folder_id
             db.commit()
             db.refresh(existing)
-            return _screen_to_dict(existing)
+            out = _screen_to_dict(existing)
+            if fresh_install_for_folder:
+                out["fresh_install"] = True
+            if build_changed_reinstall:
+                out["build_changed"] = True
+            return out
 
         entry = ScreenLibrary(
             project_id=project_id, build_id=build_id, name=name,
@@ -1537,7 +1696,12 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
         db.add(entry)
         db.commit()
         db.refresh(entry)
-        return _screen_to_dict(entry)
+        out = _screen_to_dict(entry)
+        if fresh_install_for_folder:
+            out["fresh_install"] = True
+        if build_changed_reinstall:
+            out["build_changed"] = True
+        return out
 
 
 @app.get("/api/screen-folders")
@@ -1645,7 +1809,11 @@ def screen_screenshot(screen_id: int):
         fpath = settings.artifacts_dir / str(s.project_id) / s.screenshot_path
         if not fpath.exists():
             raise HTTPException(status_code=404, detail="Screenshot file missing")
-        return FileResponse(fpath, media_type="image/png")
+        return FileResponse(
+            fpath,
+            media_type="image/png",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+        )
 
 
 # ── Triage ─────────────────────────────────────────────────────────────

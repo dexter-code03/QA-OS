@@ -14,6 +14,7 @@ RC_OVERLAY = "overlay_blocking"
 RC_DISABLED = "element_disabled"
 RC_WRONG_SCREEN = "wrong_screen"
 RC_MISSING = "element_missing"
+RC_XML_PARSE = "xml_parse_failed"
 
 
 @dataclass
@@ -169,8 +170,9 @@ def diagnose_tap_failure(
     except ET.ParseError:
         return TapDiagnosis(
             False,
-            RC_MISSING,
-            "Page source XML could not be parsed.",
+            RC_XML_PARSE,
+            "Page source could not be parsed as strict XML (often unescaped & or < in attributes). "
+            "Use raw Appium hierarchy for tap diagnosis, not a simplified export.",
             False,
             False,
             0,

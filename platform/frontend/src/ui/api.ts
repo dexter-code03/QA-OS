@@ -452,6 +452,8 @@ export const api = {
     failed_step_index: number;
     error_message: string;
     page_source_xml: string;
+    /** Raw Appium page source for server tap diagnosis (strict XML). */
+    page_source_xml_raw?: string;
     test_name: string;
     screenshot_base64: string;
     already_tried_fixes?: any[];
@@ -470,6 +472,7 @@ export const api = {
     failed_step_index: number;
     error_message: string;
     page_source_xml: string;
+    page_source_xml_raw?: string;
     test_name: string;
     screenshot_base64: string;
     acceptance_criteria?: string;
@@ -510,8 +513,16 @@ export const api = {
   deleteScreenFolder: (id: number) =>
     http<{ ok: boolean }>(`/api/screen-folders/${id}`, { method: "DELETE" }),
 
-  captureScreen: (body: { project_id: number; build_id?: number | null; folder_id: number; name: string; platform: string; notes?: string }) =>
-    http<ScreenEntry>("/api/screens/capture", { method: "POST", body: JSON.stringify(body) }),
+  captureScreen: (body: {
+    project_id: number;
+    build_id?: number | null;
+    folder_id: number;
+    name: string;
+    platform: string;
+    notes?: string;
+    /** Android serial or iOS simulator UDID — must match the device you are looking at */
+    device_target?: string;
+  }) => http<ScreenEntry>("/api/screens/capture", { method: "POST", body: JSON.stringify(body) }),
   listScreens: (projectId: number, opts?: { buildId?: number | null; folderId?: number | null; platform?: string }) => {
     const params = new URLSearchParams({ project_id: String(projectId) });
     if (opts?.buildId != null) params.set("build_id", String(opts.buildId));
@@ -523,7 +534,8 @@ export const api = {
   updateScreen: (id: number, body: { name?: string; notes?: string; folder_id?: number | null }) =>
     http<ScreenEntry>(`/api/screens/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteScreen: (id: number) => http<{ ok: boolean }>(`/api/screens/${id}`, { method: "DELETE" }),
-  screenScreenshotUrl: (id: number) => `/api/screens/${id}/screenshot`,
+  screenScreenshotUrl: (id: number, cacheBust?: string | null) =>
+    `/api/screens/${id}/screenshot${cacheBust != null && cacheBust !== "" ? `?v=${encodeURIComponent(cacheBust)}` : ""}`,
 
   // ── Reports v2 ──────────────────────────────────────
   getSuiteHealth: (suiteId: number, days = 14, platform = "") =>
@@ -667,6 +679,10 @@ export interface ScreenEntry {
   auto_captured: boolean;
   xml_length: number;
   stale?: boolean;
+  /** True when this was the first capture in an empty folder — backend uninstalled + reinstalled the build */
+  fresh_install?: boolean;
+  /** True when you selected a different build than existing screens in this folder — old app(s) removed and new build installed */
+  build_changed?: boolean;
 }
 
 export interface ScreenEntryFull extends ScreenEntry {

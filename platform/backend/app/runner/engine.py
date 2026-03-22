@@ -18,6 +18,7 @@ from .debug_listener import wrap_driver_with_debug
 from .executor import run_steps
 from .recording_android import start_screenrecord, stop_and_pull
 from .recording_ios_sim import start_recording as start_ios_recording, stop as stop_ios_recording
+from .video_compat import postprocess_mp4_for_broad_playback, transcode_mov_to_mp4
 from .session import SessionConfig, create_driver
 from .steps import parse_steps
 
@@ -167,10 +168,20 @@ class RunEngine:
                 ok = stop_and_pull(rec, run_dir / video_name)
                 if ok:
                     artifacts["video"] = video_name
+                    postprocess_mp4_for_broad_playback(run_dir / video_name)
             if ios_rec:
                 ok = stop_ios_recording(ios_rec)
                 if ok:
-                    artifacts["video"] = ios_rec.out_path.name
+                    mp4_path = run_dir / "run.mp4"
+                    if transcode_mov_to_mp4(ios_rec.out_path, mp4_path):
+                        try:
+                            ios_rec.out_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        artifacts["video"] = "run.mp4"
+                        postprocess_mp4_for_broad_playback(mp4_path)
+                    else:
+                        artifacts["video"] = ios_rec.out_path.name
 
             cancelled = self.is_cancelled(run_id)
             self.clear_cancel(run_id)

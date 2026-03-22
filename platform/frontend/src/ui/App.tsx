@@ -267,13 +267,36 @@ export function App() {
           <div className="sidebar-section">
             <div className="sidebar-label">Recent Runs</div>
             {runs.slice(0, 5).map(r => (
-              <div key={r.id} style={{ display: "flex", alignItems: "center" }}>
-                <button className={`sidebar-item${activeRunId === r.id ? " active" : ""}`} style={{ flex: 1 }} onClick={() => { setActiveRunId(r.id); setPage("execution"); }}>
-                  <div className={`dot ${statusDot(r.status)}`} />
-                  {tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}{r.status === "running" ? " · Live" : ""}
+              <div key={r.id} className="sidebar-run-row" style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
+                <button
+                  type="button"
+                  className={`sidebar-item${activeRunId === r.id ? " active" : ""}`}
+                  style={{ flex: 1, minWidth: 0 }}
+                  onClick={() => { setActiveRunId(r.id); setPage("execution"); }}
+                >
+                  <div className={`dot ${statusDot(r.status)}`} style={{ flexShrink: 0 }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                    {tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}{r.status === "running" ? " · Live" : ""}
+                  </span>
                 </button>
                 {r.status !== "running" && (
-                  <button style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 10, cursor: "pointer", padding: "2px 6px" }} title="Delete run" onClick={async (e) => { e.stopPropagation(); if (confirm(`Delete run #${r.id}?`)) { try { await api.deleteRun(r.id); if (activeRunId === r.id) setActiveRunId(null); refresh(); toast("Run deleted", "info"); } catch (err: any) { toast(err.message, "error"); } } }}>✕</button>
+                  <button
+                    type="button"
+                    className="sidebar-delete-btn"
+                    style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 10, cursor: "pointer", padding: "2px 8px", flexShrink: 0 }}
+                    title="Delete run"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      if (confirm(`Delete run #${r.id}?`)) {
+                        try {
+                          await api.deleteRun(r.id);
+                          if (activeRunId === r.id) setActiveRunId(null);
+                          refresh();
+                          toast("Run deleted", "info");
+                        } catch (err: any) { toast(err.message, "error"); }
+                      }
+                    }}
+                  >✕</button>
                 )}
               </div>
             ))}
@@ -316,21 +339,28 @@ export function App() {
                 const mSuites = suites.filter(s => s.module_id === m.id);
                 return (
                   <div key={m.id}>
-                    <div className="sidebar-item" style={{ fontWeight: 600, fontSize: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                      <span>📁 {m.name}</span>
-                      <span style={{ display: "flex", gap: 2 }}>
-                        <button style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Rename collection" onClick={async () => { const n = prompt("Rename collection:", m.name); if (n && n.trim()) { try { await api.renameModule(m.id, n.trim()); refresh(); toast("Renamed", "success"); } catch (e: any) { toast(e.message, "error"); } } }}>✏️</button>
-                        <button style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Delete collection" onClick={async () => { if (confirm(`Delete collection "${m.name}" and all its suites?`)) { try { await api.deleteModule(m.id); refresh(); toast("Deleted", "info"); } catch (e: any) { toast(e.message, "error"); } } }}>🗑</button>
+                    <div className="sidebar-item" style={{ fontWeight: 600, fontSize: 12, display: "flex", alignItems: "center", minWidth: 0 }}>
+                      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                        📁 {m.name}
+                      </span>
+                      <span style={{ display: "flex", gap: 2, flexShrink: 0, marginLeft: 4 }}>
+                        <button type="button" style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Rename collection" onClick={async () => { const n = prompt("Rename collection:", m.name); if (n && n.trim()) { try { await api.renameModule(m.id, n.trim()); refresh(); toast("Renamed", "success"); } catch (e: any) { toast(e.message, "error"); } } }}>✏️</button>
+                        <button type="button" style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Delete collection" onClick={async () => { if (confirm(`Delete collection "${m.name}" and all its suites?`)) { try { await api.deleteModule(m.id); refresh(); toast("Deleted", "info"); } catch (e: any) { toast(e.message, "error"); } } }}>🗑</button>
                       </span>
                     </div>
                     {mSuites.map(s => {
                       const sTests = tests.filter(t => t.suite_id === s.id);
                       return (
-                        <div key={s.id} style={{ paddingLeft: 16, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                          <div className="sidebar-item" style={{ fontSize: 11, color: "var(--accent2)", flex: 1 }}>📋 {s.name} ({sTests.length})</div>
-                          <span style={{ display: "flex", gap: 2 }}>
-                            <button style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Rename Test Suite" onClick={async () => { const n = prompt("Rename suite:", s.name); if (n && n.trim()) { try { await api.renameSuite(s.id, n.trim()); refresh(); toast("Renamed", "success"); } catch (e: any) { toast(e.message, "error"); } } }}>✏️</button>
-                            <button style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Delete suite" onClick={async () => { if (confirm(`Delete suite "${s.name}"?`)) { try { await api.deleteSuite(s.id); refresh(); toast("Deleted", "info"); } catch (e: any) { toast(e.message, "error"); } } }}>🗑</button>
+                        <div key={s.id} style={{ paddingLeft: 16, display: "flex", alignItems: "center", minWidth: 0 }}>
+                          <div className="sidebar-item" style={{ fontSize: 11, color: "var(--accent2)", flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{ flexShrink: 0 }}>📋</span>
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                              {s.name} ({sTests.length})
+                            </span>
+                          </div>
+                          <span style={{ display: "flex", gap: 2, flexShrink: 0 }}>
+                            <button type="button" style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Rename Test Suite" onClick={async () => { const n = prompt("Rename suite:", s.name); if (n && n.trim()) { try { await api.renameSuite(s.id, n.trim()); refresh(); toast("Renamed", "success"); } catch (e: any) { toast(e.message, "error"); } } }}>✏️</button>
+                            <button type="button" style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 9, cursor: "pointer" }} title="Delete suite" onClick={async () => { if (confirm(`Delete suite "${s.name}"?`)) { try { await api.deleteSuite(s.id); refresh(); toast("Deleted", "info"); } catch (e: any) { toast(e.message, "error"); } } }}>🗑</button>
                           </span>
                         </div>
                       );
@@ -362,7 +392,7 @@ export function App() {
             />
           )}
           {page === "execution" && <ExecutionView project={project} tests={tests} builds={builds} runs={runs} devices={devices} modules={modules} suites={suites} activeRunId={activeRunId} onRunCreated={id => { setActiveRunId(id); refresh(); }} onRefresh={refresh} />}
-          {page === "library" && <LibraryView project={project} tests={tests} runs={runs} modules={modules} suites={suites} onRefresh={refresh} />}
+          {page === "library" && <LibraryView project={project} tests={tests} runs={runs} modules={modules} suites={suites} devices={devices} onRefresh={refresh} />}
           {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} modules={modules} suites={suites} onRefresh={refresh} />}
           {page === "builds" && <BuildsView project={project} builds={builds} runs={runs} onRefresh={refresh} />}
           {page === "settings" && <SettingsView />}
@@ -1008,7 +1038,21 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       })();
     };
     connect();
-    pollRef.current = setInterval(async () => { try { const r = await api.getRun(activeRunId); setRun(r); if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current); } catch {} }, 5000);
+    pollRef.current = setInterval(async () => {
+      try {
+        const r = await api.getRun(activeRunId);
+        setRun(r);
+        const saved = (r.summary as any)?.stepResults;
+        if (Array.isArray(saved) && saved.length) {
+          setStepResults(prev => {
+            if (["passed", "failed", "error", "cancelled"].includes(r.status)) return saved;
+            if (saved.length > (prev?.length ?? 0)) return saved;
+            return prev;
+          });
+        }
+        if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current);
+      } catch { /* ignore */ }
+    }, 5000);
     return () => {
       cancelled = true;
       if (wsReconnectTimerRef.current) {
@@ -1101,12 +1145,21 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       const targetTest = prereq && failedIdx < stepsForPlatform(prereq, platform).length ? prereq : currentTest;
       const prereqLen = prereq ? stepsForPlatform(prereq, platform).length : 0;
       let failXml = "";
+      let failXmlRaw = "";
+      const PAGE_SRC_RAW_CAP = 400_000;
       const artifacts = (completed.artifacts as any) || {};
       const pageSources = artifacts.pageSources || [];
       const screenshots = artifacts.screenshots || [];
       const failPs = stepResultsArr[failedIdx]?.pageSource || pageSources[failedIdx];
       if (failPs) {
-        try { const resp = await fetch(`/api/artifacts/${completed.project_id}/${completed.id}/${failPs}`); if (resp.ok) failXml = simplifyXmlForAI(await resp.text()); } catch {}
+        try {
+          const resp = await fetch(`/api/artifacts/${completed.project_id}/${completed.id}/${failPs}`);
+          if (resp.ok) {
+            const raw = await resp.text();
+            failXmlRaw = raw.slice(0, PAGE_SRC_RAW_CAP);
+            failXml = simplifyXmlForAI(raw);
+          }
+        } catch { /* ignore */ }
       }
       let screenshotB64 = "";
       const failShot = stepResultsArr[failedIdx]?.screenshot || screenshots[failedIdx];
@@ -1132,6 +1185,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
           failed_step_index: failedIdx,
           error_message: errMsg,
           page_source_xml: failXml,
+          page_source_xml_raw: failXmlRaw,
           test_name: currentTest.name,
           screenshot_base64: screenshotB64,
           already_tried_fixes: [...(targetTest.fix_history || []), ...lastFailedFix],
@@ -1148,6 +1202,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
             element_disabled: "element disabled",
             wrong_screen: "app on wrong screen",
             element_missing: "element not in page source",
+            xml_parse_failed: "XML parse — use raw hierarchy for diagnosis",
           };
           addAgentLog(
             `Tap diagnosis: ${causeLabels[d.root_cause] || d.root_cause}` +
@@ -1266,25 +1321,47 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     }
   }, [artBase, pageSources, stepResults]);
 
-  // Keep XML in sync with selected screenshot when user taps step/screenshot or run loads
+  const selShotIdx = useMemo(() => {
+    if (!selShot || screenshots.length === 0) return -1;
+    return screenshots.indexOf(selShot);
+  }, [selShot, screenshots]);
+
+  /** Changes when the artifact path for the *selected* step updates (avoids refetching XML on every other step's WS event). */
+  const selXmlArtifactKey = useMemo(() => {
+    if (!run || selShotIdx < 0) return "";
+    return String(pageSources[selShotIdx] || (stepResults[selShotIdx] as any)?.pageSource || "");
+  }, [run?.id, selShotIdx, pageSources, stepResults]);
+
+  // Keep XML in sync when selection, run, or this step's page source path changes (incl. after run completes)
   useEffect(() => {
-    if (!run || !selShot || screenshots.length === 0) return;
-    const idx = screenshots.indexOf(selShot);
-    if (idx >= 0) loadXmlForStep(idx);
-  }, [selShot, run?.id, screenshots, loadXmlForStep]);
+    if (!run || selShotIdx < 0) return;
+    loadXmlForStep(selShotIdx);
+  }, [selShotIdx, run?.id, run?.status, selXmlArtifactKey, loadXmlForStep]);
 
   const aiFixRun = async () => {
     if (!run || !testForRun || failedIdx < 0) return;
     setFixBusy(true); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(true);
     toast("AI is analyzing screenshot, XML, and error logs...", "info");
 
-    // Fetch page source XML from the failed step
+    // Fetch page source: simplified for LLM + raw for tap diagnosis (strict XML parser on server)
+    const PAGE_SRC_RAW_CAP = 400_000;
     let failXml = "";
+    let failXmlRaw = "";
     const failPs = pageSources[failedIdx] || stepResults[failedIdx]?.pageSource;
     if (failPs) {
-      try { const r = await fetch(artBase + failPs); if (r.ok) failXml = simplifyXmlForAI(await r.text()); } catch {}
+      try {
+        const r = await fetch(artBase + failPs);
+        if (r.ok) {
+          const raw = await r.text();
+          failXmlRaw = raw.slice(0, PAGE_SRC_RAW_CAP);
+          failXml = simplifyXmlForAI(raw);
+        }
+      } catch { /* ignore */ }
     }
-    if (!failXml && liveXml) failXml = simplifyXmlForAI(liveXml);
+    if (!failXml && liveXml) {
+      failXml = simplifyXmlForAI(liveXml);
+      if (!failXmlRaw) failXmlRaw = liveXml.slice(0, PAGE_SRC_RAW_CAP);
+    }
 
     // Fetch screenshot from the failed step as base64
     let screenshotB64 = "";
@@ -1325,6 +1402,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         failed_step_index: failedIdx,
         error_message: errMsg,
         page_source_xml: failXml,
+        page_source_xml_raw: failXmlRaw,
         test_name: testNameWithContext,
         screenshot_base64: screenshotB64,
         already_tried_fixes: targetTest.fix_history || [],
@@ -1334,14 +1412,16 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       setFixResult(res);
       setTapDiagnosis(res.tap_diagnosis ?? null);
       setRelatedTests(null);
+      setFixBusy(false);
       if (targetTest) {
-        try { const rel = await api.getRelatedTests(targetTest.id); setRelatedTests(rel); } catch {}
+        void api.getRelatedTests(targetTest.id).then(rel => setRelatedTests(rel)).catch(() => {});
       }
       toast(`AI found ${res.changes.length} fix${res.changes.length !== 1 ? "es" : ""}`, "success");
     } catch (e: any) {
       toast(e.message, "error");
       setShowFixPanel(false);
-    } finally { setFixBusy(false); }
+      setFixBusy(false);
+    }
   };
 
   const refineFixRun = async () => {
@@ -1349,10 +1429,24 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     setFixBusy(true);
     setTapDiagnosis(null);
     toast("AI is refining the fix with your suggestion...", "info");
+    const PAGE_SRC_RAW_CAP = 400_000;
     let failXml = "";
+    let failXmlRaw = "";
     const failPs = pageSources[failedIdx] || stepResults[failedIdx]?.pageSource;
-    if (failPs) { try { const r = await fetch(artBase + failPs); if (r.ok) failXml = simplifyXmlForAI(await r.text()); } catch {} }
-    if (!failXml && liveXml) failXml = simplifyXmlForAI(liveXml);
+    if (failPs) {
+      try {
+        const r = await fetch(artBase + failPs);
+        if (r.ok) {
+          const raw = await r.text();
+          failXmlRaw = raw.slice(0, PAGE_SRC_RAW_CAP);
+          failXml = simplifyXmlForAI(raw);
+        }
+      } catch { /* ignore */ }
+    }
+    if (!failXml && liveXml) {
+      failXml = simplifyXmlForAI(liveXml);
+      if (!failXmlRaw) failXmlRaw = liveXml.slice(0, PAGE_SRC_RAW_CAP);
+    }
     let screenshotB64 = "";
     const failShot = stepResults[failedIdx]?.screenshot || screenshots[failedIdx];
     if (failShot) {
@@ -1388,6 +1482,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         failed_step_index: failedIdx,
         error_message: errMsg,
         page_source_xml: failXml,
+        page_source_xml_raw: failXmlRaw,
         test_name: testNameWithContextR,
         screenshot_base64: screenshotB64,
         acceptance_criteria: targetTestR.acceptance_criteria || "",
@@ -1576,16 +1671,69 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
     if (!run) { toast("No run", "error"); return; }
     const arts = run.artifacts as Record<string, unknown> | undefined;
     const vid = arts?.video;
+    /* Prefer stitched replay from step screenshots; fall back to device screen recording when no shots */
+    if (screenshots.length > 0) {
+      toast("Generating video from screenshots...", "info");
+      const canvas = document.createElement("canvas");
+      canvas.width = 540; canvas.height = 960;
+      const ctx = canvas.getContext("2d")!;
+      const stream = canvas.captureStream(30);
+      const picked = pickScreenRecorderMime();
+      const recorder = picked.mime
+        ? new MediaRecorder(stream, { mimeType: picked.mime })
+        : new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.start();
+      for (const shot of screenshots) {
+        const img = new Image(); img.crossOrigin = "anonymous";
+        await new Promise<void>(resolve => {
+          img.onload = () => {
+            ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+            const x = (canvas.width - img.width * scale) / 2, y = (canvas.height - img.height * scale) / 2;
+            ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
+            // Step label overlay
+            const idx = screenshots.indexOf(shot);
+            const st = stepResults[idx]?.status;
+            ctx.fillStyle = st === "failed" ? "rgba(255,59,92,.85)" : "rgba(0,229,160,.85)";
+            ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+            ctx.fillStyle = "#fff"; ctx.font = "bold 16px system-ui";
+            ctx.fillText(`Step ${idx + 1} — ${stepDefs[idx]?.type || ""}  [${(st || "pending").toUpperCase()}]`, 12, canvas.height - 14);
+            resolve();
+          };
+          img.onerror = () => resolve();
+          img.src = artBase + shot;
+        });
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      recorder.stop();
+      await new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
+      const outMime = recorder.mimeType || (picked.mime ?? "video/webm");
+      const ext = replayExtFromRecorderMime(outMime);
+      const blob = new Blob(chunks, { type: outMime });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+      a.download = `run_${run.id}_replay.${ext}`; a.click();
+      toast("Video downloaded", "success");
+      return;
+    }
     if (typeof vid === "string" && vid.length > 0) {
       toast("Downloading device recording…", "info");
       try {
         const res = await fetch(`/api/artifacts/${project.id}/${run.id}/${encodeURIComponent(vid)}`);
         if (!res.ok) { toast("Video file not found on server", "error"); return; }
         const raw = await res.blob();
-        const ct = res.headers.get("content-type")?.split(";")[0]?.trim();
+        const ct = res.headers.get("content-type")?.split(";")[0]?.trim() ?? "";
         const blob = ct && ct.startsWith("video/") ? new Blob([raw], { type: ct }) : raw;
+        const blobType = (blob as Blob).type?.toLowerCase() ?? "";
         const vl = vid.toLowerCase();
-        const ext = vl.endsWith(".mov") ? "mov" : vl.endsWith(".webm") ? "webm" : vl.endsWith(".mp4") ? "mp4" : "mp4";
+        /* Filename must match real bytes — .mp4 with WebM/VP8 data breaks QuickTime */
+        const ext =
+          blobType.includes("webm") || ct.includes("webm") ? "webm"
+          : blobType.includes("quicktime") || ct.includes("quicktime") || vl.endsWith(".mov") ? "mov"
+          : vl.endsWith(".webm") ? "webm"
+          : vl.endsWith(".mp4") ? "mp4"
+          : "mp4";
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = `run_${run.id}_recording.${ext}`;
@@ -1596,49 +1744,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
       }
       return;
     }
-    if (screenshots.length === 0) { toast("No screenshots to generate video", "error"); return; }
-    toast("Generating video from screenshots...", "info");
-    const canvas = document.createElement("canvas");
-    canvas.width = 540; canvas.height = 960;
-    const ctx = canvas.getContext("2d")!;
-    const stream = canvas.captureStream(30);
-    const picked = pickScreenRecorderMime();
-    const recorder = picked.mime
-      ? new MediaRecorder(stream, { mimeType: picked.mime })
-      : new MediaRecorder(stream);
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    recorder.start();
-    for (const shot of screenshots) {
-      const img = new Image(); img.crossOrigin = "anonymous";
-      await new Promise<void>(resolve => {
-        img.onload = () => {
-          ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-          const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-          const x = (canvas.width - img.width * scale) / 2, y = (canvas.height - img.height * scale) / 2;
-          ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
-          // Step label overlay
-          const idx = screenshots.indexOf(shot);
-          const st = stepResults[idx]?.status;
-          ctx.fillStyle = st === "failed" ? "rgba(255,59,92,.85)" : "rgba(0,229,160,.85)";
-          ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
-          ctx.fillStyle = "#fff"; ctx.font = "bold 16px system-ui";
-          ctx.fillText(`Step ${idx + 1} — ${stepDefs[idx]?.type || ""}  [${(st || "pending").toUpperCase()}]`, 12, canvas.height - 14);
-          resolve();
-        };
-        img.onerror = () => resolve();
-        img.src = artBase + shot;
-      });
-      await new Promise(r => setTimeout(r, 1500));
-    }
-    recorder.stop();
-    await new Promise<void>(resolve => { recorder.onstop = () => resolve(); });
-    const outMime = recorder.mimeType || (picked.mime ?? "video/webm");
-    const ext = replayExtFromRecorderMime(outMime);
-    const blob = new Blob(chunks, { type: outMime });
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `run_${run.id}_replay.${ext}`; a.click();
-    toast("Video downloaded", "success");
+    toast("No screenshots or device recording for this run", "error");
   };
 
   return (
@@ -1664,24 +1770,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
         </div>
       )}
 
-      {/* Agent Progress Panel — when no run yet (before execution opens) */}
-      {(agentRunning || agentProgressLog.length > 0) && !run && (
-        <div className="panel" style={{ marginBottom: 16, border: "1px solid rgba(167,139,250,.4)", background: "rgba(167,139,250,.04)" }}>
-          <div className="panel-header" style={{ background: "linear-gradient(135deg, rgba(167,139,250,.15), rgba(139,92,246,.1))" }}>
-            <div>
-              <div className="panel-title" style={{ color: "#a78bfa" }}>🤖 Agent {agentRunning ? "Running" : "Progress"}</div>
-              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{agentStatus || (agentProgressLog.length ? "Completed" : "")}</div>
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {agentRunning && <button className="btn-ghost btn-sm" style={{ color: "#a78bfa", borderColor: "rgba(167,139,250,.5)" }} onClick={pauseAgent}>⏸ Pause</button>}
-              {!agentRunning && agentProgressLog.length > 0 && <button className="btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={() => setAgentProgressLog([])}>Clear log</button>}
-            </div>
-          </div>
-          <div style={{ padding: 12, maxHeight: 180, overflow: "auto", fontFamily: "var(--mono)", fontSize: 11, lineHeight: 1.6 }}>
-            {agentProgressLog.length === 0 ? <div style={{ color: "var(--muted)" }}>Waiting...</div> : agentProgressLog.map((line, i) => <div key={i} style={{ color: "var(--text)" }}>{line}</div>)}
-          </div>
-        </div>
-      )}
+      {/* Agent progress only inside exec-layout when a run exists — avoids duplicate panels */}
 
       {/* Controls */}
       {!run && (
@@ -1777,12 +1866,16 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
             {/* Live XML Panel */}
             <div className="panel">
               <div className="panel-header">
-                <div className="panel-title">Page Source XML — Step {selShot && screenshots.length ? (() => { const i = screenshots.indexOf(selShot); return i >= 0 ? `S${i + 1}` : "—"; })() : "—"}</div>
+                <div className="panel-title">Page Source XML — Step {selShotIdx >= 0 ? `S${selShotIdx + 1}` : "—"}</div>
                 <div style={{ fontSize: 11, color: "var(--muted)" }}>Captured after each step · click a step to view</div>
               </div>
               <div style={{ padding: 12 }}>
                 {liveXml ? (
-                  <XmlElementTree xml={liveXml} onCopy={(msg) => toast(msg, "success")} />
+                  <XmlElementTree
+                    key={`${run.id}-${selShotIdx}-${selXmlArtifactKey}`}
+                    xml={liveXml}
+                    onCopy={(msg) => toast(msg, "success")}
+                  />
                 ) : (
                   <div className="xml-panel" style={{ color: "var(--muted)" }}>
                     {run.status === "running" ? "Waiting for page source..." : pageSources.length > 0 ? "Click a step to view its XML" : "No page source captured"}
@@ -1831,6 +1924,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                               element_disabled: "rgba(255,59,92,.12)",
                               wrong_screen: "rgba(255,176,32,.15)",
                               element_missing: "rgba(255,59,92,.15)",
+                              xml_parse_failed: "rgba(255,176,32,.2)",
                             }[tapDiagnosis.root_cause] || "var(--bg2)",
                           color:
                             tapDiagnosis.root_cause === "element_missing" || tapDiagnosis.root_cause === "overlay_blocking" || tapDiagnosis.root_cause === "element_disabled"
@@ -1846,6 +1940,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                           element_disabled: "element disabled",
                           wrong_screen: "wrong screen",
                           element_missing: "element missing",
+                          xml_parse_failed: "XML not parseable",
                         }[tapDiagnosis.root_cause as string] || tapDiagnosis.root_cause}
                       </span>
                       {tapDiagnosis.found && (
@@ -1938,7 +2033,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                     )}
                   </div>
                 )}
-                {fixBusy && (
+                {fixBusy && !fixResult && (
                   <div style={{ padding: 24, textAlign: "center" }}>
                     <div className="spinner" style={{ margin: "0 auto 12px" }} />
                     <div style={{ fontSize: 12, color: "var(--muted)" }}>AI is analyzing screenshot, page source XML, and error logs...</div>
@@ -2206,7 +2301,7 @@ function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onP
   );
 }
 
-function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { project: Project; tests: TestDef[]; runs: Run[]; modules: ModuleDef[]; suites: SuiteDef[]; onRefresh: () => void }) {
+function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh }: { project: Project; tests: TestDef[]; runs: Run[]; modules: ModuleDef[]; suites: SuiteDef[]; devices: DeviceList; onRefresh: () => void }) {
   const [busy, setBusy] = useState(false);
   /** Upload % when set, or null = indeterminate (AI / server processing). */
   const [taskProgress, setTaskProgress] = useState<{ label: string; pct: number | null } | null>(null);
@@ -2230,6 +2325,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
   const [newFolderName, setNewFolderName] = useState("");
   const [showNewFolder, setShowNewFolder] = useState(false);
+  const [captureDeviceId, setCaptureDeviceId] = useState("");
 
   const loadScreenFolders = useCallback(async () => {
     try { setScreenFolders(await api.listScreenFolders(project.id)); } catch {}
@@ -2245,6 +2341,21 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
   const loadBuilds = useCallback(async () => {
     try { setBuilds(await api.listBuilds(project.id)); } catch {}
   }, [project.id]);
+
+  const devicePickerPlatform = useMemo(
+    () => (builds.find(b => b.id === screenBuildFilter) || builds[0])?.platform || platform,
+    [builds, screenBuildFilter, platform],
+  );
+
+  useEffect(() => {
+    if (devicePickerPlatform === "ios_sim") {
+      const ids = devices.ios_simulators.map(d => d.udid);
+      setCaptureDeviceId(prev => (prev && ids.includes(prev) ? prev : ids[0] || ""));
+    } else {
+      const ids = devices.android.map(d => String((d as { serial?: string }).serial || ""));
+      setCaptureDeviceId(prev => (prev && ids.includes(prev) ? prev : ids[0] || ""));
+    }
+  }, [devices, devicePickerPlatform]);
 
   useEffect(() => { loadScreenFolders(); }, [loadScreenFolders]);
   useEffect(() => { if (libTab === "screens") { loadScreens(); loadBuilds(); } }, [libTab, loadScreens, loadBuilds]);
@@ -3182,7 +3293,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
               <div className="panel" style={{ padding: 16, marginBottom: 12, border: "1px solid rgba(139,92,246,.25)" }}>
                 <div style={{ fontFamily: "var(--sans)", fontWeight: 600, marginBottom: 4, fontSize: 13 }}>Capture Screen</div>
                 <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>
-                  First capture installs the app. After that, navigate on the emulator and capture any screen.
+                  <strong>First screen in an empty folder:</strong> the selected build is <strong>uninstalled and reinstalled</strong> so you start clean. <strong>If you change the Build</strong> while the folder already has screens from another build, QA·OS <strong>removes the old app(s)</strong> and <strong>installs the newly selected build</strong>. <strong>Later captures (same build):</strong> capture shows <strong>whatever is on screen</strong> (navigate first). QA·OS does <strong>not</strong> relaunch your app after capture (that was skipping onboarding); if you land on the home screen, open the app again. Pick the <strong>Device</strong> that matches your emulator.
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
                   <div style={{ minWidth: 130 }}>
@@ -3214,6 +3325,21 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
                       {capturePlatform === "ios_sim" ? "iOS" : "Android"}
                     </span>
                   </div>
+                  <div style={{ minWidth: 160 }}>
+                    <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Device</label>
+                    <select value={captureDeviceId} onChange={e => setCaptureDeviceId(e.target.value)} style={{ fontSize: 11, width: "100%", maxWidth: 220 }}>
+                      {capturePlatform === "ios_sim"
+                        ? (devices.ios_simulators.length === 0
+                          ? <option value="">No simulator — boot one in Xcode</option>
+                          : devices.ios_simulators.map(d => <option key={d.udid} value={d.udid}>{d.name} ({d.state})</option>))
+                        : (devices.android.length === 0
+                          ? <option value="">No device — start emulator / USB</option>
+                          : devices.android.map(d => {
+                              const serial = String((d as { serial?: string }).serial || "");
+                              return <option key={serial} value={serial}>{serial}</option>;
+                            }))}
+                    </select>
+                  </div>
                   <div style={{ flex: 1, minWidth: 120 }}>
                     <label style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", display: "block", marginBottom: 3 }}>Notes</label>
                     <input type="text" value={captureNotes} onChange={e => setCaptureNotes(e.target.value)} placeholder="Optional" style={{ width: "100%", fontSize: 11, padding: "6px 8px" }} />
@@ -3222,8 +3348,20 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
                     setBusy(true);
                     setCaptureStatus("Capturing screen — first time may install the app (~20s), otherwise a few seconds...");
                     try {
-                      const entry = await api.captureScreen({ project_id: project.id, build_id: screenBuildFilter, folder_id: activeFolderId!, name: captureName.trim(), platform: capturePlatform, notes: captureNotes });
-                      setCaptureStatus(`Captured "${entry.name}" — ${entry.xml_length.toLocaleString()} chars of XML`);
+                      const entry = await api.captureScreen({
+                        project_id: project.id,
+                        build_id: screenBuildFilter,
+                        folder_id: activeFolderId!,
+                        name: captureName.trim(),
+                        platform: capturePlatform,
+                        notes: captureNotes,
+                        ...(captureDeviceId.trim() ? { device_target: captureDeviceId.trim() } : {}),
+                      });
+                      setCaptureStatus(
+                        `Captured "${entry.name}" — ${entry.xml_length.toLocaleString()} chars of XML` +
+                          (entry.fresh_install ? " · Fresh reinstall (first screen in this folder)" : "") +
+                          (entry.build_changed ? " · Switched build — old app removed, new build installed" : ""),
+                      );
                       setCaptureName("");
                       setCaptureNotes("");
                       loadScreens(); loadScreenFolders();
@@ -3272,7 +3410,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
                     api.getScreen(s.id).then(setScreenDetail).catch(() => {});
                   }}>
                     <div className="screen-card-img">
-                      {s.screenshot_path ? <img src={api.screenScreenshotUrl(s.id)} alt={s.name} /> : <div className="screen-card-placeholder">No screenshot</div>}
+                      {s.screenshot_path ? <img src={api.screenScreenshotUrl(s.id, s.captured_at)} alt={s.name} /> : <div className="screen-card-placeholder">No screenshot</div>}
                     </div>
                     <div className="screen-card-body">
                       {editingScreenId === s.id ? (
@@ -3328,7 +3466,7 @@ function LibraryView({ project, tests, runs, modules, suites, onRefresh }: { pro
               <div style={{ display: "grid", gridTemplateColumns: screenDetail.screenshot_path ? "220px 1fr" : "1fr", flex: 1, minHeight: 0, overflow: "hidden" }}>
                 {screenDetail.screenshot_path && (
                   <div style={{ padding: 16, overflow: "auto", borderRight: "1px solid var(--border)" }}>
-                    <img src={api.screenScreenshotUrl(screenDetail.id)} alt={screenDetail.name} style={{ width: "100%", borderRadius: 8, border: "1px solid var(--border)" }} />
+                    <img src={api.screenScreenshotUrl(screenDetail.id, screenDetail.captured_at)} alt={screenDetail.name} style={{ width: "100%", borderRadius: 8, border: "1px solid var(--border)" }} />
                   </div>
                 )}
                 <div style={{ display: "flex", flexDirection: "column", minHeight: 0 }}>

@@ -307,7 +307,15 @@ export function XmlElementTree({
           Show only elements with id/desc/text
         </label>
       </div>
-      <div style={{ maxHeight: 320, overflow: "auto" }}>
+      <div
+        style={{
+          maxHeight: 320,
+          overflow: "auto",
+          overscrollBehavior: "contain",
+          WebkitOverflowScrolling: "touch",
+          touchAction: "pan-y",
+        }}
+      >
         <XmlTreeNode node={filteredTree} depth={0} path="0" expanded={expanded} onToggle={toggle} onCopy={handleCopy} onNodeClick={onNodeClick} />
       </div>
     </div>
