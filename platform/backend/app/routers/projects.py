@@ -28,3 +28,14 @@ def list_projects() -> list[ProjectOut]:
     with SessionLocal() as db:
         projects = db.query(Project).order_by(Project.created_at.desc()).all()
         return [ProjectOut(id=p.id, name=p.name, created_at=p.created_at) for p in projects]
+
+
+@router.delete("/api/projects/{project_id}")
+def delete_project(project_id: int) -> dict[str, bool]:
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+        db.delete(p)
+        db.commit()
+        return {"ok": True}

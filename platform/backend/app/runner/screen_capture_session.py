@@ -5,8 +5,13 @@ In-memory Appium WebDriver registry for Screen Library: one long-lived session p
 from __future__ import annotations
 
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional, TypeVar
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 _registry_lock = threading.Lock()
 # key -> slot with per-session lock for driver I/O
@@ -75,7 +80,7 @@ def with_session_driver(key: str, fn: Callable[[Any], T]) -> T:
         try:
             out = fn(driver)
         finally:
-            slot["last_used"] = datetime.utcnow()
+            slot["last_used"] = _utcnow()
         return out
 
 
@@ -91,7 +96,7 @@ def try_start_or_reuse_session(
     with slot["lock"]:
         old = slot.get("driver")
         if old and _driver_alive(old):
-            slot["last_used"] = datetime.utcnow()
+            slot["last_used"] = _utcnow()
             return old, True, False
         if old:
             try:
@@ -100,7 +105,7 @@ def try_start_or_reuse_session(
                 pass
             slot["driver"] = None
         driver = create_driver_fn()
-        now = datetime.utcnow()
+        now = _utcnow()
         slot["driver"] = driver
         slot["created_at"] = now
         slot["last_used"] = now
@@ -117,7 +122,7 @@ def set_session_driver(key: str, driver: Any) -> None:
                 prev.quit()
             except Exception:
                 pass
-        now = datetime.utcnow()
+        now = _utcnow()
         slot["driver"] = driver
         if slot.get("created_at") is None:
             slot["created_at"] = now

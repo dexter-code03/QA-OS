@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from .settings import settings, ensure_dirs
@@ -15,6 +15,8 @@ from .models import (  # noqa: F401 — re-exported for backward compat
     Run,
     ScreenFolder,
     ScreenLibrary,
+    DataFolder,
+    DataSet,
 )
 
 
@@ -25,6 +27,14 @@ def _db_url() -> str:
 
 engine = create_engine(_db_url(), connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, _connection_record):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
 
 
 def init_db() -> None:
@@ -98,6 +108,15 @@ def init_db() -> None:
     run_cols2 = [row[1] for row in cur.execute("PRAGMA table_info(runs)").fetchall()]
     if "batch_run_id" not in run_cols2:
         cur.execute("ALTER TABLE runs ADD COLUMN batch_run_id INTEGER REFERENCES batch_runs(id) ON DELETE SET NULL")
+        con.commit()
+
+    # -- runs: data_set_id, data_row_index --
+    run_cols3 = [row[1] for row in cur.execute("PRAGMA table_info(runs)").fetchall()]
+    if "data_set_id" not in run_cols3:
+        cur.execute("ALTER TABLE runs ADD COLUMN data_set_id INTEGER REFERENCES data_sets(id) ON DELETE SET NULL")
+        con.commit()
+    if "data_row_index" not in run_cols3:
+        cur.execute("ALTER TABLE runs ADD COLUMN data_row_index INTEGER")
         con.commit()
 
     con.close()

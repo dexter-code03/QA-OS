@@ -16,6 +16,7 @@ from .routers import (
     auth,
     batch_runs,
     builds,
+    data,
     execution,
     imports,
     integrations,
@@ -46,6 +47,9 @@ async def _startup() -> None:
     run_engine.start()
 
 
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
 @app.middleware("http")
 async def require_local_token(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in {"/api/health", "/api/auth/token"}:
@@ -53,6 +57,12 @@ async def require_local_token(request: Request, call_next):
 
     if extract_request_token(request) != get_auth_token():
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    if request.method not in _CSRF_SAFE_METHODS:
+        origin = request.headers.get("origin", "")
+        has_custom_header = request.headers.get("x-requested-with") or request.headers.get("content-type", "").startswith("application/json")
+        if origin and origin not in ALLOWED_ORIGINS and not has_custom_header:
+            return JSONResponse(status_code=403, content={"detail": "CSRF check failed"})
 
     return await call_next(request)
 
@@ -68,6 +78,7 @@ app.include_router(tests.router)
 app.include_router(runs.router)
 app.include_router(batch_runs.router)
 app.include_router(screens.router)
+app.include_router(data.router)
 app.include_router(ai.router)
 app.include_router(imports.router)
 app.include_router(reports.router)

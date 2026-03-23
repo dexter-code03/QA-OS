@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,17 +23,27 @@ from .session import SessionConfig, create_driver
 from .steps import parse_steps
 
 
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 @dataclass(frozen=True)
 class EnqueuedRun:
     run_id: int
 
 
+_APPIUM_IDLE_TIMEOUT_S = 300  # kill managed Appium after 5 min idle
+
+
 class RunEngine:
-    def __init__(self) -> None:
+    def __init__(self, max_workers: int = 1) -> None:
         self._q: asyncio.Queue[EnqueuedRun] = asyncio.Queue()
-        self._task: Optional[asyncio.Task] = None
+        self._tasks: list[asyncio.Task] = []
+        self._max_workers = max_workers
         self._pending_cancel: set[int] = set()
         self._cancel_events: dict[int, threading.Event] = {}
+        self._last_run_finished: float = 0.0
+        self._managed_appium: Optional[object] = None  # AppiumHandle or None
 
     def request_cancel(self, run_id: int) -> None:
         ev = self._cancel_events.get(run_id)
@@ -57,43 +67,66 @@ class RunEngine:
         self._cancel_events.pop(run_id, None)
 
     def start(self) -> None:
-        if self._task:
+        if self._tasks:
             return
-        self._task = asyncio.create_task(self._loop())
+        for _ in range(self._max_workers):
+            self._tasks.append(asyncio.create_task(self._loop()))
 
     async def enqueue(self, run_id: int) -> None:
         await self._q.put(EnqueuedRun(run_id=run_id))
 
     async def _loop(self) -> None:
+        import time as _time
         while True:
             try:
                 item = await asyncio.wait_for(self._q.get(), timeout=2.0)
             except asyncio.TimeoutError:
+                self._maybe_kill_idle_appium(_time.monotonic())
                 continue
             try:
                 await self._execute(item.run_id)
             except Exception as e:
                 await event_bus.publish(RunEvent(run_id=item.run_id, type="engine_error", payload={"error": str(e)}))
+            self._last_run_finished = _time.monotonic()
+
+    def _maybe_kill_idle_appium(self, now: float) -> None:
+        handle = self._managed_appium
+        if handle is None or not self._last_run_finished:
+            return
+        if now - self._last_run_finished > _APPIUM_IDLE_TIMEOUT_S:
+            try:
+                if hasattr(handle, "process") and handle.process and handle.process.poll() is None:
+                    handle.process.terminate()
+            except Exception:
+                pass
+            self._managed_appium = None
 
     @staticmethod
     def _sync_batch_counters(run_id: int) -> None:
-        """If this run belongs to a batch, recalculate batch passed/failed/status."""
+        """Recalculate batch counters atomically using SQL subqueries."""
+        from sqlalchemy import text
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             if not r or not getattr(r, "batch_run_id", None):
                 return
-            batch = db.query(BatchRun).filter(BatchRun.id == r.batch_run_id).first()
+            bid = r.batch_run_id
+            db.execute(text("""
+                UPDATE batch_runs SET
+                    passed = (SELECT count(*) FROM runs WHERE batch_run_id = :bid AND status = 'passed'),
+                    failed = (SELECT count(*) FROM runs WHERE batch_run_id = :bid AND status IN ('failed','error'))
+                WHERE id = :bid
+            """), {"bid": bid})
+            db.commit()
+            batch = db.query(BatchRun).filter(BatchRun.id == bid).first()
             if not batch:
                 return
-            children = db.query(Run).filter(Run.batch_run_id == batch.id).all()
-            passed = sum(1 for c in children if c.status == "passed")
-            failed = sum(1 for c in children if c.status in ("failed", "error"))
+            children = db.query(Run).filter(Run.batch_run_id == bid).all()
+            passed = batch.passed
+            failed = batch.failed
             cancelled = sum(1 for c in children if c.status == "cancelled")
             done = passed + failed + cancelled
-            batch.passed = passed
-            batch.failed = failed
             if done >= batch.total:
-                batch.finished_at = datetime.utcnow()
+                batch.finished_at = _utcnow()
                 if cancelled == batch.total:
                     batch.status = "cancelled"
                 elif failed == 0 and passed == batch.total:
@@ -118,7 +151,7 @@ class RunEngine:
                 r = db.query(Run).filter(Run.id == run_id).first()
                 if r:
                     r.status = "cancelled"
-                    r.finished_at = datetime.utcnow()
+                    r.finished_at = _utcnow()
                     db.commit()
             self.clear_cancel(run_id)
             await event_bus.publish(RunEvent(run_id=run_id, type="finished", payload={"status": "cancelled"}))
@@ -134,13 +167,13 @@ class RunEngine:
             if not t:
                 r.status = "error"
                 r.error_message = "Test definition not found"
-                r.finished_at = datetime.utcnow()
+                r.finished_at = _utcnow()
                 db.commit()
                 self.clear_cancel(run_id)
                 return
 
             r.status = "running"
-            r.started_at = datetime.utcnow()
+            r.started_at = _utcnow()
             db.commit()
 
             project_id = r.project_id
@@ -153,7 +186,7 @@ class RunEngine:
         build_meta = b.build_metadata if b else {}
         platform = self._platform_for_run(run_id)
         device_target = self._device_for_run(run_id)
-        raw_steps = self._steps_for_run(run_id)
+        raw_steps = self._resolve_steps(run_id)
 
         # All blocking Appium/driver work runs in a thread so the event loop stays free
         # for HTTP requests, WebSocket messages, and other async tasks.
@@ -161,6 +194,8 @@ class RunEngine:
 
         def _blocking_work() -> None:
             appium_handle = ensure_appium_running()
+            if appium_handle is not None:
+                self._managed_appium = appium_handle
             driver: Optional[WebDriver] = None
             rec = None
             ios_rec = None
@@ -246,11 +281,6 @@ class RunEngine:
                         driver.quit()
                 except Exception:
                     pass
-                try:
-                    if appium_handle and appium_handle.process:
-                        appium_handle.process.terminate()
-                except Exception:
-                    pass
 
         await loop.run_in_executor(None, _blocking_work)
 
@@ -271,7 +301,7 @@ class RunEngine:
                     r.summary = summary
                 if artifacts:
                     r.artifacts = artifacts
-                r.finished_at = r.finished_at or datetime.utcnow()
+                r.finished_at = r.finished_at or _utcnow()
                 if verdict == "failed":
                     r.failure_category = _classify_error(r.error_message or "")
                 elif verdict == "error" and error_str:
@@ -287,17 +317,22 @@ class RunEngine:
         self.clear_cancel(run_id)
         self._sync_batch_counters(run_id)
 
-    def _platform_for_run(self, run_id: int) -> str:
+    @staticmethod
+    def _platform_for_run(run_id: int) -> str:
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             return (r.platform if r else "android") or "android"
 
-    def _device_for_run(self, run_id: int) -> str:
+    @staticmethod
+    def _device_for_run(run_id: int) -> str:
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             return (r.device_target if r else "") or ""
 
-    def _steps_for_run(self, run_id: int) -> list[dict]:
+    @staticmethod
+    def _resolve_steps(run_id: int) -> list[dict]:
+        from .variables import build_context, resolve_step
+
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             if not r or not r.test_id:
@@ -308,17 +343,49 @@ class RunEngine:
 
             platform = (r.platform or "android").strip() or "android"
 
-            def resolve_steps(test: TestDefinition) -> list[dict]:
+            def _resolve(test: TestDefinition) -> list[dict]:
                 ps = getattr(test, "platform_steps", None) or {}
                 if isinstance(ps, dict) and platform in ps and ps[platform]:
                     return list(ps[platform])
                 return list(test.steps or [])
 
-            steps = resolve_steps(t)
+            steps = _resolve(t)
             if t.prerequisite_test_id and t.prerequisite_test_id != t.id:
                 prereq = db.query(TestDefinition).filter(TestDefinition.id == t.prerequisite_test_id).first()
                 if prereq:
-                    steps = resolve_steps(prereq) + steps
+                    steps = _resolve(prereq) + steps
+
+            # Variable resolution: load bound data set or project default
+            ds_vars: dict | None = None
+            ds_rows: list[dict] | None = None
+            data_set_id = getattr(r, "data_set_id", None)
+            data_row_index = getattr(r, "data_row_index", None)
+
+            if data_set_id:
+                from ..models import DataSet
+                ds = db.query(DataSet).filter(DataSet.id == data_set_id).first()
+                if ds:
+                    ds_vars = ds.variables
+                    ds_rows = ds.rows
+            elif r.project_id:
+                from ..models import DataSet
+                default_ds = db.query(DataSet).filter(
+                    DataSet.project_id == r.project_id,
+                    DataSet.is_default == 1,
+                ).first()
+                if default_ds:
+                    ds_vars = default_ds.variables
+
+            if ds_vars or ds_rows:
+                ctx = build_context(
+                    data_set_variables=ds_vars,
+                    data_set_rows=ds_rows,
+                    row_index=data_row_index,
+                    run_id=run_id,
+                    platform=platform,
+                )
+                steps = [resolve_step(s, ctx) for s in steps]
+
             return steps
 
 

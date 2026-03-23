@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from ..db import SessionLocal
-from ..helpers import steps_for_platform_record, test_out
+from ..helpers import steps_for_platform_record, test_out, utcnow
 from ..models import Project, TestDefinition
 from ..schemas import TestCreate, TestOut, TestUpdate
 
@@ -115,7 +114,7 @@ def append_fix_history(test_id: int, payload: AppendFixHistoryRequest) -> dict[s
             "changes": payload.changes,
             "run_id": payload.run_id,
             "target_platform": tp,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": utcnow().isoformat(),
         }
         if payload.steps_before_fix is not None:
             entry["steps_before_fix"] = payload.steps_before_fix

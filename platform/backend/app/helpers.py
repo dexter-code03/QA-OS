@@ -5,7 +5,7 @@ import json
 import os
 import secrets
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,6 +40,11 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:5174",
     "http://localhost:5174",
 ]
+def utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (SQLite-compatible)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 AUTH_COOKIE_NAME = "qa_os_token"
 AUTH_TOKEN_FILE = settings.data_dir / "token.txt"
 SETTINGS_FILE = settings.data_dir / "settings.json"
@@ -139,11 +144,11 @@ def extract_request_token(request: Request) -> str:
     return (
         extract_bearer_token(request.headers.get("Authorization"))
         or request.cookies.get(AUTH_COOKIE_NAME, "")
-        or request.query_params.get("token", "")
     )
 
 
 def extract_websocket_token(websocket: WebSocket) -> str:
+    """WebSocket still accepts ?token= because browsers can't set custom headers on WS upgrade."""
     return (
         extract_bearer_token(websocket.headers.get("authorization"))
         or websocket.cookies.get(AUTH_COOKIE_NAME, "")
@@ -169,6 +174,8 @@ def run_to_out(r: Run) -> RunOut:
         error_message=r.error_message,
         summary=r.summary or {},
         artifacts=r.artifacts or {},
+        data_set_id=getattr(r, "data_set_id", None),
+        data_row_index=getattr(r, "data_row_index", None),
     )
 
 
@@ -371,58 +378,11 @@ def ios_selector_generation_rules(screens: list[ScreenLibrary]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def build_xml_context(screens: list[ScreenLibrary]) -> str:
-    """Extract interactive elements from page source XML to reduce token usage."""
-    INTERACTIVE_CLASSES = {
-        "android.widget.Button", "android.widget.EditText", "android.widget.CheckBox",
-        "android.widget.RadioButton", "android.widget.Spinner", "android.widget.ImageButton",
-        "android.view.View", "android.widget.TextView", "android.widget.ImageView",
-        "android.widget.Switch", "android.widget.ToggleButton",
-        "XCUIElementTypeButton", "XCUIElementTypeTextField", "XCUIElementTypeSecureTextField",
-        "XCUIElementTypeStaticText", "XCUIElementTypeSwitch", "XCUIElementTypeImage",
-    }
-    chunks = []
-    for screen in screens:
-        try:
-            root = ET.fromstring(screen.xml_snapshot)
-        except ET.ParseError:
-            chunks.append(f"=== {screen.name} ===\n[XML parse error]")
-            continue
-        elements = []
-        for el in root.iter():
-            cls = el.get("class", "") or el.get("type", "")
-            clickable = el.get("clickable") == "true"
-            focusable = el.get("focusable") == "true"
-            rid = el.get("resource-id", "")
-            cdesc = el.get("content-desc", "")
-            txt = el.get("text", "")
-            name_attr = el.get("name", "")
-            label_attr = el.get("label", "")
-            if not (cls in INTERACTIVE_CLASSES or clickable or focusable):
-                continue
-            if not (rid or cdesc or txt or name_attr or label_attr):
-                continue
-            parts = [f'class="{cls}"']
-            if rid:
-                parts.append(f'resource-id="{rid}"')
-            if cdesc:
-                parts.append(f'content-desc="{cdesc}"')
-            if txt:
-                parts.append(f'text="{txt}"')
-            if name_attr:
-                parts.append(f'name="{name_attr}"')
-            if label_attr:
-                parts.append(f'label="{label_attr}"')
-            if clickable:
-                parts.append('clickable="true"')
-            elements.append("  " + " ".join(parts))
-        if screen.platform == "android":
-            st = effective_screen_type(screen)
-            header = f"=== {screen.name} (Android selector_strategy={st}) ==="
-        elif (screen.platform or "").lower() in ("ios_sim", "ios"):
-            st = effective_screen_type(screen)
-            header = f"=== {screen.name} (iOS selector_strategy={st}) ==="
-        else:
-            header = f"=== {screen.name} ==="
-        chunks.append(header + "\n" + "\n".join(elements))
-    return "\n\n".join(chunks)
+def build_xml_context(screens: list[ScreenLibrary], description: str = "") -> str:
+    """Extract interactive elements from page source XML to reduce token usage.
+
+    Delegates to the 3-pass pipeline in helpers_xml. When no description is
+    provided, Pass 3 (relevance ranking) is skipped for backward compatibility.
+    """
+    from .helpers_xml import build_xml_context_v2
+    return build_xml_context_v2(screens, description=description)

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,9 @@ def _find_aapt() -> str:
 def _parse_apk_manifest(apk_path: str) -> dict:
     try:
         aapt = _find_aapt()
-        result = subprocess.run([aapt, "dump", "badging", apk_path], capture_output=True, text=True, timeout=10)
+        # argv list (no shell); path is server-side upload under sanitized safe_fname
+        apk_arg = str(Path(apk_path).resolve())
+        result = subprocess.run([aapt, "dump", "badging", apk_arg], capture_output=True, text=True, timeout=10)
         output = result.stdout
     except Exception:
         return {"file_name": Path(apk_path).name, "file_size_mb": round(os.path.getsize(apk_path) / 1024 / 1024, 1)}
@@ -93,20 +97,29 @@ async def upload_build(project_id: int, platform: str, file: UploadFile = File(.
     elif fname_lower.endswith(".apk"):
         platform = "android"
 
-    content = b""
-    size = 0
-    while chunk := await file.read(1024 * 1024):
-        size += len(chunk)
-        if size > _BUILD_MAX_SIZE_BYTES:
-            raise HTTPException(status_code=413, detail="File exceeds 500MB limit")
-        content += chunk
-
     safe_fname = _sanitize_build_filename(file.filename)
     ensure_dirs()
     out_dir = settings.uploads_dir / str(project_id) / platform
     out_dir.mkdir(parents=True, exist_ok=True)
     dest = out_dir / safe_fname
-    dest.write_bytes(content)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(out_dir))
+    try:
+        size = 0
+        with os.fdopen(tmp_fd, "wb") as tmp:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _BUILD_MAX_SIZE_BYTES:
+                    os.unlink(tmp_path)
+                    raise HTTPException(status_code=413, detail="File exceeds 500MB limit")
+                tmp.write(chunk)
+        shutil.move(tmp_path, str(dest))
+    except HTTPException:
+        raise
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     meta: dict = {}
     if platform == "android" and str(dest).endswith(".apk"):
@@ -133,9 +146,16 @@ async def upload_build(project_id: int, platform: str, file: UploadFile = File(.
 
 
 @router.get("/api/projects/{project_id}/builds", response_model=list[BuildOut])
-def list_builds(project_id: int) -> list[BuildOut]:
+def list_builds(project_id: int, limit: int = 100, offset: int = 0) -> list[BuildOut]:
     with SessionLocal() as db:
-        builds = db.query(Build).filter(Build.project_id == project_id).order_by(Build.created_at.desc()).all()
+        builds = (
+            db.query(Build)
+            .filter(Build.project_id == project_id)
+            .order_by(Build.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
         return [_build_out(b) for b in builds]
 
 

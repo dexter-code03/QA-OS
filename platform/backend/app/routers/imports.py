@@ -90,7 +90,7 @@ async def _ai_complete_gherkin(
 ) -> list[dict]:
     if not api_key:
         return [{"name": "Imported from Gherkin", "steps": raw_steps, "import": True, "acceptance_criteria": ""}]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     prompt = (
         "Convert this Gherkin feature file into Appium test cases. "
         f"Platform: {platform}. Return ONLY JSON: "
@@ -102,7 +102,7 @@ async def _ai_complete_gherkin(
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
     async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(url, json=body)
+        r = await client.post(url, json=body, headers={"x-goog-api-key": api_key})
         if r.status_code != 200:
             return [{"name": "Imported from Gherkin", "steps": raw_steps, "import": True, "acceptance_criteria": ""}]
         try:
@@ -116,7 +116,7 @@ async def _ai_complete_gherkin(
 async def _ai_parse_python_script(source: str, platform: str, api_key: str, model: str) -> list[dict]:
     if not api_key:
         return []
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     prompt = (
         f"Parse this Appium Python test script into test cases for platform {platform}. "
         "Map driver.find_element+click to tap, send_keys to type, WebDriverWait+visibility to waitForVisible, assertions to assertText/assertVisible. "
@@ -132,7 +132,7 @@ async def _ai_parse_python_script(source: str, platform: str, api_key: str, mode
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
     async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(url, json=body)
+        r = await client.post(url, json=body, headers={"x-goog-api-key": api_key})
         if r.status_code != 200:
             return []
         try:
@@ -272,7 +272,7 @@ async def _ai_parse_katalon_source(
     stem = Path(logical_path).stem or "Imported"
     max_chars = 56_000
     src = source if len(source) <= max_chars else source[:max_chars] + "\n\n// ... [truncated for AI context] ...\n"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     system = (
         "You parse Katalon Studio Mobile test scripts (Groovy/Java calling Mobile.*) into JSON for Appium.\n"
         f"Target platform: {platform} (android = UiAutomator2, ios_sim = XCUITest).\n\n"
@@ -338,7 +338,7 @@ async def _ai_parse_katalon_source(
     }
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(url, json=body)
+            r = await client.post(url, json=body, headers={"x-goog-api-key": api_key})
         if r.status_code != 200:
             return None, extra_warnings
         text = gemini_extract_text(r.json())
@@ -406,7 +406,7 @@ async def _ai_complete_sheet_rows(rows: list, platform: str, api_key: str, model
     if not api_key:
         return _sheet_fallback_chunk(rows)
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     CHUNK = 12
     all_out: list[dict] = []
 
@@ -441,7 +441,7 @@ async def _ai_complete_sheet_rows(rows: list, platform: str, api_key: str, model
         parsed_ok = False
         try:
             async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(url, json=body)
+                resp = await client.post(url, json=body, headers={"x-goog-api-key": api_key})
             if resp.status_code == 200:
                 text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 parsed = json.loads(text)

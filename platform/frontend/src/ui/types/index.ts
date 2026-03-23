@@ -35,6 +35,8 @@ export type Run = {
   error_message: string | null;
   summary: Record<string, unknown>;
   artifacts: Record<string, unknown>;
+  data_set_id?: number | null;
+  data_row_index?: number | null;
 };
 export type BatchRunChild = {
   run_id: number;
@@ -48,7 +50,7 @@ export type BatchRunChild = {
 export type BatchRun = {
   id: number;
   project_id: number;
-  mode: "suite" | "collection";
+  mode: "suite" | "collection" | "data-driven";
   source_id: number;
   source_name: string;
   platform: string;
@@ -213,4 +215,29 @@ export interface ScreenEntry {
 
 export interface ScreenEntryFull extends ScreenEntry {
   xml_snapshot: string;
+}
+
+// ── Data Layer ──────────────────────────────────────────────────────
+
+export interface DataFolder {
+  id: number;
+  project_id: number;
+  name: string;
+  description: string;
+  data_set_count: number;
+  created_at: string | null;
+}
+
+export interface DataSet {
+  id: number;
+  project_id: number;
+  folder_id: number | null;
+  name: string;
+  description: string;
+  environment: string;
+  variables: Record<string, string>;
+  rows: Record<string, string>[];
+  is_default: boolean;
+  created_at: string | null;
+  updated_at: string | null;
 }

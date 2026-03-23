@@ -2,23 +2,22 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
 from ..db import SessionLocal
 from ..events import RunEvent, event_bus
-from ..helpers import classify_failure_message, run_to_out
-from ..models import Build, Project, Run, TestDefinition
+from ..helpers import classify_failure_message, run_to_out, utcnow
+from ..models import BatchRun, Build, DataSet, Project, Run, TestDefinition
 from ..runner.engine import RunEngine, run_engine
 from ..schemas import RunCreate, RunOut
 
 router = APIRouter()
 
 
-@router.post("/api/runs", response_model=RunOut)
-async def create_run(payload: RunCreate) -> RunOut:
+@router.post("/api/runs")
+async def create_run(payload: RunCreate):
     with SessionLocal() as db:
         p = db.query(Project).filter(Project.id == payload.project_id).first()
         if not p:
@@ -33,24 +32,82 @@ async def create_run(payload: RunCreate) -> RunOut:
             if not b:
                 raise HTTPException(status_code=404, detail="Build not found")
 
-        r = Run(
-            project_id=payload.project_id,
-            build_id=payload.build_id,
-            test_id=payload.test_id,
-            status="queued",
-            device_target=payload.device_target,
-            platform=payload.platform,
-            artifacts={},
-            summary={},
-        )
-        db.add(r)
-        db.commit()
-        db.refresh(r)
+        # Resolve data set: explicit id or by environment
+        data_set_id = payload.data_set_id
+        if not data_set_id and payload.environment:
+            ds = db.query(DataSet).filter(
+                DataSet.project_id == payload.project_id,
+                DataSet.environment == payload.environment,
+            ).first()
+            if ds:
+                data_set_id = ds.id
 
-        asyncio.create_task(event_bus.publish(RunEvent(run_id=r.id, type="queued", payload={"runId": r.id})))
-        asyncio.create_task(run_engine.enqueue(r.id))
+        # Check for data-driven: if data set has rows, expand into batch
+        ds_obj = db.query(DataSet).filter(DataSet.id == data_set_id).first() if data_set_id else None
+        rows = (ds_obj.rows or []) if ds_obj else []
 
-        return run_to_out(r)
+        if len(rows) > 1:
+            # Data-driven: create a batch run with one child per row
+            batch = BatchRun(
+                project_id=payload.project_id,
+                mode="data-driven",
+                source_id=payload.test_id,
+                source_name=t.name,
+                platform=payload.platform,
+                status="queued",
+                total=len(rows),
+                started_at=utcnow(),
+            )
+            db.add(batch)
+            db.commit()
+            db.refresh(batch)
+
+            first_run = None
+            for idx in range(len(rows)):
+                r = Run(
+                    project_id=payload.project_id,
+                    build_id=payload.build_id,
+                    test_id=payload.test_id,
+                    batch_run_id=batch.id,
+                    status="queued",
+                    device_target=payload.device_target,
+                    platform=payload.platform,
+                    data_set_id=data_set_id,
+                    data_row_index=idx,
+                    artifacts={},
+                    summary={},
+                )
+                db.add(r)
+                db.commit()
+                db.refresh(r)
+                if first_run is None:
+                    first_run = r
+                asyncio.create_task(event_bus.publish(RunEvent(run_id=r.id, type="queued", payload={"runId": r.id})))
+                asyncio.create_task(run_engine.enqueue(r.id))
+
+            return run_to_out(first_run)
+        else:
+            # Single run (optionally with data set for key-value variables)
+            r = Run(
+                project_id=payload.project_id,
+                build_id=payload.build_id,
+                test_id=payload.test_id,
+                status="queued",
+                device_target=payload.device_target,
+                platform=payload.platform,
+                data_set_id=data_set_id,
+                data_row_index=0 if rows else None,
+                artifacts={},
+                summary={},
+            )
+            db.add(r)
+            db.commit()
+            db.refresh(r)
+
+            asyncio.create_task(event_bus.publish(RunEvent(run_id=r.id, type="queued", payload={"runId": r.id})))
+            asyncio.create_task(run_engine.enqueue(r.id))
+
+            return run_to_out(r)
 
 
 @router.get("/api/runs/{run_id}", response_model=RunOut)
@@ -63,9 +120,16 @@ def get_run(run_id: int) -> RunOut:
 
 
 @router.get("/api/projects/{project_id}/runs", response_model=list[RunOut])
-def list_runs(project_id: int) -> list[RunOut]:
+def list_runs(project_id: int, limit: int = 100, offset: int = 0) -> list[RunOut]:
     with SessionLocal() as db:
-        runs = db.query(Run).filter(Run.project_id == project_id).order_by(Run.id.desc()).limit(100).all()
+        runs = (
+            db.query(Run)
+            .filter(Run.project_id == project_id)
+            .order_by(Run.id.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
         return [run_to_out(r) for r in runs]
 
 
@@ -79,7 +143,7 @@ def cancel_run(run_id: int) -> dict[str, Any]:
             return {"ok": True, "status": r.status, "message": f"Run already {r.status}"}
         run_engine.request_cancel(run_id)
         r.status = "cancelled"
-        r.finished_at = r.finished_at or datetime.utcnow()
+        r.finished_at = r.finished_at or utcnow()
         db.commit()
     RunEngine._sync_batch_counters(run_id)
     return {"ok": True, "message": "Run cancelled"}

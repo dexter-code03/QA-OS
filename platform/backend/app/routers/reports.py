@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html as html_lib
+import time
 from datetime import datetime
+from functools import lru_cache
 from io import BytesIO
 from typing import Any, Optional
 
@@ -9,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..db import SessionLocal, _classify_error
-from ..helpers import steps_for_platform_record as _steps_for_platform_record
+from ..helpers import steps_for_platform_record as _steps_for_platform_record, utcnow
 from ..models import (
     Build,
     Module,
@@ -22,13 +24,19 @@ from ..settings import settings
 
 router = APIRouter()
 
+_REPORT_CACHE_TTL = 60  # seconds
+
+
+def _cache_bucket() -> int:
+    return int(time.monotonic() // _REPORT_CACHE_TTL)
+
 
 # ── Reports v2 — test-case-first endpoints ─────────────────────────────
 
 def _run_window(db, suite_or_test_ids: list[int], days: int, platform: str, *, by_suite: bool = True):
     """Return runs within the time window, optionally filtered by platform."""
     from datetime import timedelta
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = utcnow() - timedelta(days=days)
     q = db.query(Run).filter(Run.started_at >= cutoff)
     if platform:
         q = q.filter(Run.platform == platform)
@@ -155,8 +163,17 @@ def _test_health_row(t: TestDefinition, test_runs: list[Run], days: int, prereq_
     }
 
 
+@lru_cache(maxsize=128)
+def _cached_suite_health(suite_id: int, days: int, platform: str, _ttl: int) -> dict[str, Any]:
+    return _suite_health_impl(suite_id, days, platform)
+
+
 @router.get("/api/suites/{suite_id}/health")
 def suite_health(suite_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
+    return _cached_suite_health(suite_id, days, platform, _cache_bucket())
+
+
+def _suite_health_impl(suite_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
     with SessionLocal() as db:
         suite = db.query(TestSuite).filter(TestSuite.id == suite_id).first()
         if not suite:
@@ -293,8 +310,17 @@ def suite_triage(suite_id: int, days: int = 14, platform: str = "") -> dict[str,
     return {"categories": categories, "total_failures": total_failures}
 
 
+@lru_cache(maxsize=64)
+def _cached_collection_health(collection_id: int, days: int, platform: str, _ttl: int) -> dict[str, Any]:
+    return _collection_health_impl(collection_id, days, platform)
+
+
 @router.get("/api/collections/{collection_id}/health")
 def collection_health(collection_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
+    return _cached_collection_health(collection_id, days, platform, _cache_bucket())
+
+
+def _collection_health_impl(collection_id: int, days: int = 14, platform: str = "") -> dict[str, Any]:
     with SessionLocal() as db:
         module = db.query(Module).filter(Module.id == collection_id).first()
         if not module:
@@ -308,7 +334,7 @@ def collection_health(collection_id: int, days: int = 14, platform: str = "") ->
             for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
                 prereq_map[p.id] = p
         from datetime import timedelta
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = utcnow() - timedelta(days=days)
         q = db.query(Run).filter(Run.started_at >= cutoff, Run.test_id.in_(test_ids)) if test_ids else None
         if platform and q is not None:
             q = q.filter(Run.platform == platform)
@@ -353,7 +379,7 @@ def collection_health(collection_id: int, days: int = 14, platform: str = "") ->
 
         # 30-day trend
         from datetime import timedelta as td
-        cutoff_30 = datetime.utcnow() - td(days=30)
+        cutoff_30 = utcnow() - td(days=30)
         trend_runs = [r for r in runs if r.started_at and r.started_at >= cutoff_30]
         day_buckets: dict[str, dict] = {}
         for r in trend_runs:
@@ -385,7 +411,7 @@ def collection_blockers(collection_id: int, days: int = 14, platform: str = "") 
             for p in db.query(TestDefinition).filter(TestDefinition.id.in_(prereq_ids)).all():
                 prereq_map[p.id] = p
         from datetime import timedelta
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = utcnow() - timedelta(days=days)
         q = db.query(Run).filter(Run.started_at >= cutoff, Run.test_id.in_(test_ids)) if test_ids else None
         if platform and q is not None:
             q = q.filter(Run.platform == platform)
@@ -643,7 +669,7 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
         html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{test.name} — Test Report</title>
 <style>{_REPORT_CSS}</style></head><body>
 <h1>{test.name} <span class="badge {status_badge}">{status_label}</span></h1>
-<div class="subtitle">{project.name if project else ""} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+<div class="subtitle">{project.name if project else ""} · Generated {utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
 
 <div class="stats">
 <div class="stat"><div class="stat-val" style="color:{"#00e5a0" if rate>=80 else "#ffb020" if rate>=50 else "#ff3b5c"}">{rate}%</div><div class="stat-lbl">Pass Rate</div></div>
@@ -676,7 +702,7 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
 {fix_html}
 {fail_screenshot_html}
 
-<div class="footer">QA·OS Test Case Report · {test.name} · {datetime.utcnow().isoformat()}</div>
+<div class="footer">QA·OS Test Case Report · {test.name} · {utcnow().isoformat()}</div>
 </body></html>'''
 
     safe_name = test.name.replace(" ", "_").replace("/", "_")[:60]
@@ -762,7 +788,7 @@ def export_suite_html(suite_id: int, days: int = 14, platform: str = ""):
     html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Suite Report — {s["name"]}</title>
 <style>{_REPORT_CSS}</style></head><body>
 <h1>Suite Report — {s["name"]}</h1>
-<div class="subtitle">{s.get("module_name","")} · {days}-day window · Platform: {platform or "All"} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+<div class="subtitle">{s.get("module_name","")} · {days}-day window · Platform: {platform or "All"} · Generated {utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
 <div class="stats">
 <div class="stat"><div class="stat-val" style="color:{"#00e5a0" if s["pass_rate"]>=80 else "#ffb020" if s["pass_rate"]>=50 else "#ff3b5c"}">{s["pass_rate"]}%</div><div class="stat-lbl">Pass Rate</div></div>
 <div class="stat"><div class="stat-val">{m["total"]}</div><div class="stat-lbl">Total</div></div>
@@ -773,7 +799,7 @@ def export_suite_html(suite_id: int, days: int = 14, platform: str = ""):
 </div>
 <h2>Test Cases ({m["total"]})</h2>
 {test_sections}
-<div class="footer">QA·OS Suite Report · {s["name"]} · {datetime.utcnow().isoformat()}</div>
+<div class="footer">QA·OS Suite Report · {s["name"]} · {utcnow().isoformat()}</div>
 </body></html>'''
 
     return StreamingResponse(
@@ -911,7 +937,7 @@ def export_collection_html(collection_id: int, days: int = 14, platform: str = "
     html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Collection Report — {_esc(c["name"])}</title>
 <style>{_REPORT_CSS}</style></head><body>
 <h1>{_esc(c["name"])} <span class="badge {verdict_cls}">{c["verdict"]}</span></h1>
-<div class="subtitle">{days}-day window · Platform: {platform or "All"} · Generated {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
+<div class="subtitle">{days}-day window · Platform: {platform or "All"} · Generated {utcnow().strftime("%Y-%m-%d %H:%M")} UTC</div>
 <div class="stats">
 <div class="stat"><div class="stat-val">{m["total"]}</div><div class="stat-lbl">Total</div></div>
 <div class="stat"><div class="stat-val" style="color:#00e5a0">{m["passing"]}</div><div class="stat-lbl">Passing</div></div>
@@ -923,7 +949,7 @@ def export_collection_html(collection_id: int, days: int = 14, platform: str = "
 <h2>Suites ({len(data["suites"])})</h2>
 {suite_cards}
 {trend_html}
-<div class="footer">QA·OS Collection Report · {_esc(c["name"])} · {datetime.utcnow().isoformat()}</div>
+<div class="footer">QA·OS Collection Report · {_esc(c["name"])} · {utcnow().isoformat()}</div>
 </body></html>'''
 
     return StreamingResponse(

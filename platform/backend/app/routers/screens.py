@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
-from datetime import datetime
 from typing import Any, Optional
 
 import httpx
@@ -12,7 +11,7 @@ from fastapi.responses import FileResponse
 
 from ..compose_detection import is_compose_screen
 from ..db import SessionLocal
-from ..helpers import load_settings, screen_to_dict
+from ..helpers import load_settings, screen_to_dict, utcnow
 from ..models import Build, ScreenFolder, ScreenLibrary
 from ..runner.appium_service import ensure_appium_running
 from ..runner.screen_capture_session import (
@@ -24,6 +23,7 @@ from ..runner.screen_capture_session import (
     stop_session,
     with_session_driver,
 )
+from ..schemas import CaptureScreenBody, StartScreenSessionBody, StopScreenSessionBody
 from ..settings import ensure_dirs, settings
 from ..swiftui_detection import is_swiftui_screen
 
@@ -355,42 +355,32 @@ async def _establish_screen_capture_driver(
 
 
 @router.post("/api/screens/session/start")
-async def start_screen_session(body: dict[str, Any]) -> dict[str, Any]:
-    project_id = body.get("project_id")
-    build_id = body.get("build_id")
-    folder_id = body.get("folder_id")
-    platform_hint = body.get("platform", "android")
-    requested_device = (body.get("device_target") or "").strip()
-
-    if not project_id:
-        raise HTTPException(status_code=400, detail="project_id is required")
-    if not build_id:
-        raise HTTPException(
-            status_code=400,
-            detail="build_id is required — pick a specific build (not Latest) to start a screen capture session.",
-        )
-    if not folder_id:
-        raise HTTPException(status_code=400, detail="folder_id is required — select or create a folder first.")
+async def start_screen_session(body: StartScreenSessionBody) -> dict[str, Any]:
+    project_id = body.project_id
+    build_id = body.build_id
+    folder_id = body.folder_id
+    platform_hint = body.platform
+    requested_device = body.device_target
 
     s = load_settings()
     base = f"http://{s.get('appium_host', settings.appium_host)}:{s.get('appium_port', settings.appium_port)}"
 
     try:
         platform_val, device_target, build_meta, app_path = await _screen_session_resolve_target(
-            int(build_id), platform_hint, requested_device, ensure_appium_svc=True
+            build_id, platform_hint, requested_device, ensure_appium_svc=True
         )
-        key = make_session_key(int(project_id), platform_val, device_target, int(build_id))
+        key = make_session_key(project_id, platform_val, device_target, build_id)
 
         if session_active_and_alive(key):
             return {"ok": True, "started": True, "reused": True, "flags": {}}
 
         evict_dead_session(key)
 
-        first_capture_in_folder, build_switch_reinstall = _screen_folder_build_flags(int(folder_id), int(build_id))
+        first_capture_in_folder, build_switch_reinstall = _screen_folder_build_flags(folder_id, build_id)
 
         driver, flags, used_install_path = await _establish_screen_capture_driver(
-            folder_id=int(folder_id),
-            build_id=int(build_id),
+            folder_id=folder_id,
+            build_id=build_id,
             platform_val=platform_val,
             device_target=device_target,
             build_meta=build_meta,
@@ -423,19 +413,16 @@ async def start_screen_session(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.post("/api/screens/session/stop")
-async def stop_screen_session(body: dict[str, Any]) -> dict[str, Any]:
-    project_id = body.get("project_id")
-    build_id = body.get("build_id")
-    platform_hint = body.get("platform", "android")
-    requested_device = (body.get("device_target") or "").strip()
-
-    if not project_id or not build_id:
-        raise HTTPException(status_code=400, detail="project_id and build_id are required")
+async def stop_screen_session(body: StopScreenSessionBody) -> dict[str, Any]:
+    project_id = body.project_id
+    build_id = body.build_id
+    platform_hint = body.platform
+    requested_device = body.device_target
 
     platform_val, device_target, _, _ = await _screen_session_resolve_target(
-        int(build_id), platform_hint, requested_device, ensure_appium_svc=False
+        build_id, platform_hint, requested_device, ensure_appium_svc=False
     )
-    key = make_session_key(int(project_id), platform_val, device_target, int(build_id))
+    key = make_session_key(project_id, platform_val, device_target, build_id)
     existed = stop_session(key)
     return {"ok": True, "stopped": existed}
 
@@ -463,24 +450,14 @@ async def screen_session_status(
 
 
 @router.post("/api/screens/capture")
-async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
-    project_id = body.get("project_id")
-    build_id = body.get("build_id")
-    folder_id = body.get("folder_id")
-    name = (body.get("name") or "").strip()
-    platform_hint = body.get("platform", "android")
-    notes = body.get("notes", "")
-    requested_device = (body.get("device_target") or "").strip()
-
-    if not project_id or not name:
-        raise HTTPException(status_code=400, detail="project_id and name are required")
-    if not folder_id:
-        raise HTTPException(status_code=400, detail="folder_id is required — select or create a folder first")
-    if not build_id:
-        raise HTTPException(
-            status_code=400,
-            detail="build_id is required — pick a specific build and run Start build before capturing.",
-        )
+async def capture_screen(body: CaptureScreenBody) -> dict[str, Any]:
+    project_id = body.project_id
+    build_id = body.build_id
+    folder_id = body.folder_id
+    name = body.name
+    platform_hint = body.platform
+    notes = body.notes
+    requested_device = body.device_target
 
     s = load_settings()
     base = f"http://{s.get('appium_host', settings.appium_host)}:{s.get('appium_port', settings.appium_port)}"
@@ -492,9 +469,9 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
         await asyncio.get_event_loop().run_in_executor(None, ensure_appium_running)
 
         platform_val, device_target, _, _ = await _screen_session_resolve_target(
-            int(build_id), platform_hint, requested_device, ensure_appium_svc=False
+            build_id, platform_hint, requested_device, ensure_appium_svc=False
         )
-        key = make_session_key(int(project_id), platform_val, device_target, int(build_id))
+        key = make_session_key(project_id, platform_val, device_target, build_id)
 
         evict_dead_session(key)
         if not session_active_and_alive(key):
@@ -556,7 +533,7 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
         screen_dir = settings.artifacts_dir / str(project_id) / "screens"
         screen_dir.mkdir(parents=True, exist_ok=True)
         safe_name = name.replace(" ", "_").replace("/", "_")[:80]
-        fname = f"{safe_name}_{platform_val}_{int(datetime.utcnow().timestamp())}.png"
+        fname = f"{safe_name}_{platform_val}_{int(utcnow().timestamp())}.png"
         fpath = screen_dir / fname
         fpath.write_bytes(base64.b64decode(shot_b64))
         screenshot_path_val = f"screens/{fname}"
@@ -571,7 +548,7 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
         if existing:
             existing.xml_snapshot = xml
             existing.screenshot_path = screenshot_path_val or existing.screenshot_path
-            existing.captured_at = datetime.utcnow()
+            existing.captured_at = utcnow()
             existing.notes = notes or existing.notes
             existing.folder_id = folder_id or existing.folder_id
             existing.screen_type = screen_type_val

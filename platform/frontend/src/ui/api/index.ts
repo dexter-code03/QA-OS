@@ -18,6 +18,8 @@ export type {
   TriageResponse,
   CollectionHealthResponse,
   BlockerItem,
+  DataFolder,
+  DataSet,
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
@@ -42,6 +44,8 @@ import type {
   TriageResponse,
   CollectionHealthResponse,
   BlockerItem,
+  DataFolder,
+  DataSet,
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
@@ -405,10 +409,12 @@ export const api = {
   createBatchRun: (payload: {
     project_id: number;
     build_id?: number | null;
-    mode: "suite" | "collection";
+    mode: "suite" | "collection" | "data-driven";
     source_id: number;
     platform: Run["platform"];
     device_target?: string;
+    data_set_id?: number | null;
+    environment?: string;
   }) => http<BatchRun>("/api/batch-runs", { method: "POST", body: JSON.stringify(payload) }),
   getBatchRun: (batchId: number) => http<BatchRun>(`/api/batch-runs/${batchId}`),
   listBatchRuns: (projectId: number) => http<BatchRun[]>(`/api/projects/${projectId}/batch-runs`),
@@ -422,8 +428,13 @@ export const api = {
     test_id: number;
     platform: Run["platform"];
     device_target?: string;
+    data_set_id?: number | null;
+    environment?: string;
   }) => http<Run>("/api/runs", { method: "POST", body: JSON.stringify(payload) }),
   getRun: (runId: number) => http<Run>(`/api/runs/${runId}`),
+  /** Missed run events after a sequence number (WebSocket reconnection recovery). */
+  getRunEvents: (runId: number, after = 0) =>
+    http<{ events: unknown[]; after: number }>(`/api/runs/${runId}/events?after=${after}`),
   cancelRun: (runId: number) => http<{ ok: boolean; message?: string }>(`/api/runs/${runId}/cancel`, { method: "POST" }),
   deleteRun: (runId: number) => http<{ ok: boolean }>(`/api/runs/${runId}`, { method: "DELETE" }),
 
@@ -628,5 +639,71 @@ export const api = {
   },
   downloadCollectionHtml: (collectionId: number, days = 14, platform = "") => {
     window.open(`/api/collections/${collectionId}/export/html?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
+  },
+
+  // ── Data Layer ──────────────────────────────────────
+  listDataFolders: (projectId: number) =>
+    http<DataFolder[]>(`/api/data-folders?project_id=${projectId}`),
+  createDataFolder: (body: { project_id: number; name: string; description?: string }) =>
+    http<DataFolder>("/api/data-folders", { method: "POST", body: JSON.stringify(body) }),
+  updateDataFolder: (id: number, body: { name?: string; description?: string }) =>
+    http<DataFolder>(`/api/data-folders/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteDataFolder: (id: number) =>
+    http<{ ok: boolean }>(`/api/data-folders/${id}`, { method: "DELETE" }),
+
+  listDataSets: (projectId: number, opts?: { folderId?: number | null; environment?: string }) => {
+    const params = new URLSearchParams({ project_id: String(projectId) });
+    if (opts?.folderId != null) params.set("folder_id", String(opts.folderId));
+    if (opts?.environment) params.set("environment", opts.environment);
+    return http<DataSet[]>(`/api/data-sets?${params}`);
+  },
+  getDataSet: (id: number) => http<DataSet>(`/api/data-sets/${id}`),
+  createDataSet: (body: {
+    project_id: number;
+    folder_id?: number | null;
+    name: string;
+    description?: string;
+    environment?: string;
+    variables?: Record<string, string>;
+    rows?: Record<string, string>[];
+    is_default?: boolean;
+  }) => http<DataSet>("/api/data-sets", { method: "POST", body: JSON.stringify(body) }),
+  updateDataSet: (id: number, body: {
+    name?: string;
+    description?: string;
+    environment?: string;
+    folder_id?: number | null;
+    variables?: Record<string, string>;
+    rows?: Record<string, string>[];
+    is_default?: boolean;
+  }) => http<DataSet>(`/api/data-sets/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteDataSet: (id: number) =>
+    http<{ ok: boolean }>(`/api/data-sets/${id}`, { method: "DELETE" }),
+  duplicateDataSet: (id: number) =>
+    http<DataSet>(`/api/data-sets/${id}/duplicate`, { method: "POST" }),
+  setDefaultDataSet: (id: number) =>
+    http<DataSet>(`/api/data-sets/${id}/default`, { method: "PUT" }),
+
+  importDataSetCsv: async (projectId: number, file: File, opts?: { folderId?: number; name?: string; environment?: string }) => {
+    await bootstrapAuth();
+    const form = new FormData();
+    form.append("project_id", String(projectId));
+    form.append("file", file);
+    if (opts?.folderId != null) form.append("folder_id", String(opts.folderId));
+    if (opts?.name) form.append("name", opts.name);
+    if (opts?.environment) form.append("environment", opts.environment);
+    const res = await fetch("/api/data-sets/import/csv", {
+      method: "POST",
+      body: form,
+      credentials: "same-origin",
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return (await res.json()) as DataSet;
+  },
+  exportDataSetCsv: (id: number) => {
+    window.open(`/api/data-sets/${id}/export/csv`, "_blank");
+  },
+  exportDataSetJson: (id: number) => {
+    window.open(`/api/data-sets/${id}/export/json`, "_blank");
   },
 };

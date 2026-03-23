@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
 from ..db import SessionLocal
 from ..events import RunEvent, event_bus
-from ..helpers import batch_to_out
-from ..models import BatchRun, Module, Project, Run, TestDefinition, TestSuite
+from ..helpers import batch_to_out, utcnow
+from ..models import BatchRun, DataSet, Module, Project, Run, TestDefinition, TestSuite
 from ..runner.engine import run_engine
 from ..schemas import BatchRunCreate, BatchRunOut
 
@@ -43,6 +42,16 @@ async def create_batch_run(payload: BatchRunCreate) -> BatchRunOut:
         if not test_ids:
             raise HTTPException(status_code=400, detail="No tests found for the selected scope")
 
+        # Resolve data set: explicit id or by environment
+        data_set_id = payload.data_set_id
+        if not data_set_id and payload.environment:
+            ds = db.query(DataSet).filter(
+                DataSet.project_id == payload.project_id,
+                DataSet.environment == payload.environment,
+            ).first()
+            if ds:
+                data_set_id = ds.id
+
         batch = BatchRun(
             project_id=payload.project_id,
             mode=payload.mode,
@@ -51,7 +60,7 @@ async def create_batch_run(payload: BatchRunCreate) -> BatchRunOut:
             platform=payload.platform,
             status="queued",
             total=len(test_ids),
-            started_at=datetime.utcnow(),
+            started_at=utcnow(),
         )
         db.add(batch)
         db.commit()
@@ -67,6 +76,7 @@ async def create_batch_run(payload: BatchRunCreate) -> BatchRunOut:
                 status="queued",
                 device_target=payload.device_target,
                 platform=payload.platform,
+                data_set_id=data_set_id,
                 artifacts={},
                 summary={},
             )
@@ -96,9 +106,16 @@ def get_batch_run(batch_id: int) -> BatchRunOut:
 
 
 @router.get("/api/projects/{project_id}/batch-runs")
-def list_batch_runs(project_id: int) -> list[dict[str, Any]]:
+def list_batch_runs(project_id: int, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
     with SessionLocal() as db:
-        batches = db.query(BatchRun).filter(BatchRun.project_id == project_id).order_by(BatchRun.id.desc()).limit(20).all()
+        batches = (
+            db.query(BatchRun)
+            .filter(BatchRun.project_id == project_id)
+            .order_by(BatchRun.id.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
         return [batch_to_out(b, db).dict() for b in batches]
 
 
@@ -114,7 +131,7 @@ def cancel_batch_run(batch_id: int) -> dict[str, Any]:
             if r.status == "running":
                 run_engine.request_cancel(r.id)
             r.status = "cancelled"
-            r.finished_at = r.finished_at or datetime.utcnow()
+            r.finished_at = r.finished_at or utcnow()
             cancelled_count += 1
         db.commit()
 
@@ -124,7 +141,7 @@ def cancel_batch_run(batch_id: int) -> dict[str, Any]:
         cancelled_n = sum(1 for c in all_children if c.status == "cancelled")
         batch.passed = passed
         batch.failed = failed
-        batch.finished_at = batch.finished_at or datetime.utcnow()
+        batch.finished_at = batch.finished_at or utcnow()
         if cancelled_n == batch.total:
             batch.status = "cancelled"
         elif failed == 0 and passed == batch.total:

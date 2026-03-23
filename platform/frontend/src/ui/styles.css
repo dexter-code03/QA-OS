@@ -799,3 +799,66 @@ textarea {
   border-radius: 6px; padding: 10px 12px; color: var(--text);
   font-family: var(--mono); font-size: 12px; resize: vertical;
 }
+
+/* ── F10: Not Run badge ── */
+.badge-not-run {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(107,114,128,.18);
+  color: var(--muted);
+  letter-spacing: .02em;
+}
+
+/* ── F8: Device status badge ── */
+.device-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  margin-left: 4px;
+}
+.device-badge.booted { background: rgba(0,229,160,.15); color: var(--accent); }
+.device-badge.shutdown { background: rgba(107,114,128,.15); color: var(--muted); }
+.device-badge.connected { background: rgba(0,229,160,.15); color: var(--accent); }
+
+/* ── F9: Loading spinner for action buttons ── */
+.btn-loading {
+  position: relative;
+  pointer-events: none;
+  opacity: .7;
+}
+.btn-loading::after {
+  content: "";
+  position: absolute;
+  width: 14px; height: 14px;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+  right: 8px; top: 50%;
+  margin-top: -7px;
+}
+
+/* ── F12: Responsive desktop-lock ── */
+@media (max-width: 768px) {
+  .layout, .topbar .nav-tabs, .sidebar { display: none !important; }
+  .mobile-lock-msg { display: flex !important; }
+}
+.mobile-lock-msg {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  padding: 40px;
+  text-align: center;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--muted);
+  font-family: var(--sans);
+}
+.mobile-lock-msg h2 { color: var(--text); font-size: 20px; }
+.mobile-lock-msg p { font-size: 13px; max-width: 300px; }

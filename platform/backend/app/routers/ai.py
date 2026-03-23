@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
+from collections import defaultdict
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from ..compose_detection import is_compose_screen
@@ -19,6 +21,7 @@ from ..helpers import (
     ios_selector_generation_rules,
     load_settings,
 )
+from ..helpers_xml import build_xml_context_v2, preprocess_live_xml
 from ..models import Build, Project, ScreenLibrary, TestDefinition, TestSuite
 from ..runner.ai_fix_diagnosis import (
     AI_FIX_CLASSIFICATION_RULES,
@@ -31,6 +34,50 @@ from ..settings import settings
 from ..swiftui_detection import is_swiftui_screen
 
 router = APIRouter()
+
+
+def _variable_hint(project_id: Optional[int]) -> str:
+    """Build a hint about available ${variables} for the AI to use."""
+    if not project_id:
+        return ""
+    from ..models import DataSet
+    with SessionLocal() as db:
+        sets = db.query(DataSet).filter(DataSet.project_id == project_id).limit(10).all()
+    if not sets:
+        return ""
+    all_keys: set[str] = set()
+    for ds in sets:
+        if ds.variables:
+            all_keys.update(ds.variables.keys())
+        if ds.rows:
+            for row in ds.rows[:1]:
+                all_keys.update(row.keys())
+    if not all_keys:
+        return ""
+    keys_preview = ", ".join(sorted(all_keys)[:20])
+    return (
+        "\n\nDATA VARIABLES: The project has test data with these variable names: "
+        + keys_preview
+        + '\nUse ${variable_name} syntax in step text/expect fields instead of hardcoded values '
+        "when appropriate. E.g. ${username}, ${password}.\n"
+    )
+
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT = 10
+_RATE_WINDOW = 60  # seconds
+
+
+def _check_rate_limit(request: Request) -> None:
+    ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    bucket = _rate_buckets[ip]
+    _rate_buckets[ip] = bucket = [t for t in bucket if now - t < _RATE_WINDOW]
+    if len(bucket) >= _RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Max 10 AI requests per minute.",
+        )
+    bucket.append(now)
 
 
 # ── AI Step Generation ─────────────────────────────────────────────────
@@ -48,7 +95,8 @@ class GenerateStepsRequest(BaseModel):
 
 
 @router.post("/api/ai/generate-steps")
-async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
+async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dict[str, Any]:
+    _check_rate_limit(request)
     if payload.platform not in ("android", "ios_sim"):
         raise HTTPException(status_code=400, detail="platform must be android|ios_sim")
 
@@ -80,7 +128,7 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
             screens = q.all()
             if screens:
                 screens_for_prompt = list(screens)
-                xml_context = build_xml_context(screens)
+                xml_context = build_xml_context_v2(screens, description=payload.prompt)
                 grounded = True
                 for scr in screens:
                     if scr.screenshot_path:
@@ -128,7 +176,8 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
             "Every selector you use must be found verbatim in the XML below.\n"
             "No markdown, no explanation, only JSON."
         )
-        user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
+        var_hint = _variable_hint(payload.project_id)
+        user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}{var_hint}\n\nDOM CONTEXT\n==========\n{xml_context}"
     else:
         compose_from_live_xml = (
             payload.platform == "android"
@@ -173,9 +222,11 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
                 "Avoid selector.using \"id\" for taps. Use \"-ios class chain\" to disambiguate (e.g. **/XCUIElementTypeButton[`name == 'x'`]). "
                 "Avoid xpath on iOS unless necessary.\n"
             )
-        user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}"
+        var_hint = _variable_hint(payload.project_id)
+        user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}{var_hint}"
         if payload.page_source_xml:
-            user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
+            filtered_xml = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
+            user_msg += f"\n\nCurrent page source (filtered):\n{filtered_xml}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -242,7 +293,7 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             screens = q.all()
             if screens:
                 screens_for_prompt = list(screens)
-                xml_context = build_xml_context(screens)
+                xml_context = build_xml_context_v2(screens, description=payload.prompt)
                 for scr in screens:
                     if scr.screenshot_path:
                         fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
@@ -325,7 +376,8 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             )
         user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
         if payload.page_source_xml:
-            user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
+            filtered_xml = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
+            user_msg += f"\n\nCurrent page source (filtered):\n{filtered_xml}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -490,7 +542,8 @@ class FixStepsRequest(BaseModel):
 
 
 @router.post("/api/ai/fix-steps")
-async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
+async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any]:
+    _check_rate_limit(request)
     s = load_settings()
     api_key, model = ai_creds(s)
 
@@ -623,7 +676,12 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         user_msg += "Try a DIFFERENT approach. Do not suggest the same or similar fix.\n\n"
 
     if payload.page_source_xml:
-        user_msg += f"\n=== PAGE SOURCE XML (current screen) ===\n{payload.page_source_xml[:12000]}\n"
+        filtered_xml = preprocess_live_xml(
+            payload.page_source_xml,
+            payload.platform,
+            description=payload.error_message or "",
+        )
+        user_msg += f"\n=== PAGE SOURCE (filtered) ===\n{filtered_xml}\n"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -688,8 +746,9 @@ class RefineFixRequest(BaseModel):
 
 
 @router.post("/api/ai/refine-fix")
-async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
+async def refine_fix(request: Request, payload: RefineFixRequest) -> dict[str, Any]:
     """Refine the AI fix based on user suggestion, with full context (original steps, step results, error, page source, screenshot, previous fix)."""
+    _check_rate_limit(request)
     s = load_settings()
     api_key, model = ai_creds(s)
     if not api_key:
@@ -797,7 +856,12 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
         f"=== USER'S SUGGESTION ===\n{payload.user_suggestion}\n\n"
     )
     if payload.page_source_xml:
-        user_msg += f"=== PAGE SOURCE XML ===\n{payload.page_source_xml[:12000]}\n"
+        filtered_xml = preprocess_live_xml(
+            payload.page_source_xml,
+            payload.target_platform or payload.platform,
+            description=payload.user_suggestion or payload.error_message or "",
+        )
+        user_msg += f"=== PAGE SOURCE (filtered) ===\n{filtered_xml}\n"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -845,7 +909,8 @@ class EditStepsRequest(BaseModel):
 
 
 @router.post("/api/ai/edit-steps")
-async def edit_steps(payload: EditStepsRequest) -> dict[str, Any]:
+async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, Any]:
+    _check_rate_limit(request)
     s = load_settings()
     api_key, model = ai_creds(s)
     if not api_key:

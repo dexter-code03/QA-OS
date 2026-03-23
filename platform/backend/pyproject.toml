@@ -18,7 +18,20 @@ requires-python = ">=3.9"
    "openpyxl>=3.1.0",
    "pillow>=11.3.0",
    "imageio-ffmpeg>=0.5.1",
+   "alembic>=1.14.0",
 ]
- 
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.24.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
  [tool.uvicorn]
  factory = false

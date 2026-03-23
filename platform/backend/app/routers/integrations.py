@@ -5,20 +5,61 @@ import json
 import os
 import subprocess
 import time
+from functools import lru_cache
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException
 
 from ..db import SessionLocal
-from ..helpers import ai_creds, load_settings
+from ..helpers import ai_creds, load_settings, utcnow
 from ..models import Project, Run, TestDefinition, TestSuite
 from ..runner.appium_service import ensure_appium_running
 from ..settings import settings
 
 router = APIRouter()
 
-_figma_components_cache: dict[str, Any] = {"ts": 0.0, "names": []}
+_FIGMA_COMPONENTS_TTL_SEC = 300
+
+
+def _figma_components_ttl_bucket() -> int:
+    return int(time.time() // _FIGMA_COMPONENTS_TTL_SEC)
+
+
+@lru_cache(maxsize=32)
+def _cached_figma_component_names(token: str, file_key: str, _ttl_bucket: int) -> tuple[str, ...]:
+    r = httpx.get(
+        f"https://api.figma.com/v1/files/{file_key}/components",
+        headers={"X-Figma-Token": token},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Figma API error: HTTP {r.status_code}")
+    data = r.json()
+    meta = data.get("meta") or {}
+    components = meta.get("components") or {}
+    names = sorted({str(v.get("name") or "") for v in components.values() if v.get("name")})
+    return tuple(names)
+
+
+def _confluence_cql_string_literal(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _existing_confluence_sync_page_id(results: list[dict[str, Any]], title_prefix: str) -> str | None:
+    matches: list[dict[str, Any]] = []
+    for item in results:
+        t = str(item.get("title") or "")
+        if t.startswith(title_prefix):
+            matches.append(item)
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda x: int((x.get("version") or {}).get("number") or 0),
+        reverse=True,
+    )
+    pid = str(matches[0].get("id") or "")
+    return pid or None
 
 
 @router.get("/api/devices")
@@ -114,23 +155,9 @@ def list_figma_components() -> dict[str, Any]:
     file_key = (s.get("figma_file_key") or "").strip()
     if not token or not file_key:
         raise HTTPException(status_code=400, detail="Configure Figma token and file key in Settings")
-    now = time.time()
-    if now - float(_figma_components_cache["ts"]) < 300 and _figma_components_cache.get("names"):
-        return {"names": _figma_components_cache["names"]}
     try:
-        r = httpx.get(
-            f"https://api.figma.com/v1/files/{file_key}/components",
-            headers={"X-Figma-Token": token},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Figma API error: HTTP {r.status_code}")
-        data = r.json()
-        meta = data.get("meta") or {}
-        components = meta.get("components") or {}
-        names = sorted({str(v.get("name") or "") for v in components.values() if v.get("name")})
-        _figma_components_cache["ts"] = now
-        _figma_components_cache["names"] = names
+        bucket = _figma_components_ttl_bucket()
+        names = list(_cached_figma_component_names(token, file_key, bucket))
         return {"names": names}
     except HTTPException:
         raise
@@ -141,7 +168,6 @@ def list_figma_components() -> dict[str, Any]:
 @router.post("/api/projects/{project_id}/confluence/sync")
 async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
     import html as html_lib
-    from datetime import datetime
 
     s = load_settings()
     base = (s.get("confluence_url") or "").rstrip("/")
@@ -194,7 +220,7 @@ async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
         f"<tbody>{tbody}</tbody>"
         "</table>"
     )
-    title = f"QA-OS — {proj.name} — {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+    title = f"QA-OS — {proj.name} — {utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
     body_html = (
         f"<p>Automated test status from <strong>QA-OS</strong> (project id {project_id}).</p>"
         f"{table}"
@@ -213,16 +239,71 @@ async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
                 )
             space_key = str(results[0].get("key") or "")
 
-        payload = {
-            "type": "page",
-            "title": title,
-            "space": {"key": space_key},
-            "body": {"storage": {"value": body_html, "representation": "storage"}},
-        }
-        r = await client.post(f"{base}/rest/api/content", json=payload, headers=headers)
-        if r.status_code not in (200, 201):
-            raise HTTPException(status_code=502, detail=f"Confluence create page failed: HTTP {r.status_code} {r.text[:400]}")
-        data = r.json()
+        title_prefix = f"QA-OS — {proj.name} —"
+        title_fragment = f"QA-OS — {proj.name}"
+        cql = (
+            f"type = page AND space = {_confluence_cql_string_literal(space_key)} "
+            f"AND title ~ {_confluence_cql_string_literal(title_fragment)}"
+        )
+        sr = await client.get(
+            f"{base}/rest/api/content/search",
+            params={"cql": cql, "limit": 25, "expand": "version"},
+            headers=headers,
+        )
+        if sr.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Confluence search failed: HTTP {sr.status_code} {sr.text[:400]}",
+            )
+        search_results = sr.json().get("results") or []
+        existing_id = _existing_confluence_sync_page_id(search_results, title_prefix)
+
+        if existing_id:
+            gr = await client.get(
+                f"{base}/rest/api/content/{existing_id}",
+                params={"expand": "version"},
+                headers=headers,
+            )
+            if gr.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Confluence load page failed: HTTP {gr.status_code} {gr.text[:400]}",
+                )
+            cur = gr.json()
+            ver_num = int((cur.get("version") or {}).get("number") or 1)
+            update_payload: dict[str, Any] = {
+                "id": existing_id,
+                "type": "page",
+                "title": title,
+                "version": {"number": ver_num + 1},
+                "body": {"storage": {"value": body_html, "representation": "storage"}},
+            }
+            ur = await client.put(
+                f"{base}/rest/api/content/{existing_id}",
+                json=update_payload,
+                headers=headers,
+            )
+            if ur.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Confluence update page failed: HTTP {ur.status_code} {ur.text[:400]}",
+                )
+            data = ur.json()
+        else:
+            payload = {
+                "type": "page",
+                "title": title,
+                "space": {"key": space_key},
+                "body": {"storage": {"value": body_html, "representation": "storage"}},
+            }
+            r = await client.post(f"{base}/rest/api/content", json=payload, headers=headers)
+            if r.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Confluence create page failed: HTTP {r.status_code} {r.text[:400]}",
+                )
+            data = r.json()
+
         links = data.get("_links") or {}
         web_ui = links.get("webui") or ""
         page_id = data.get("id") or ""
@@ -237,10 +318,10 @@ async def test_ai() -> dict[str, Any]:
     api_key, model = ai_creds(s)
     if not api_key:
         return {"ok": False, "message": "No AI API key configured"}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(url)
+            r = await client.get(url, headers={"x-goog-api-key": api_key})
             if r.status_code == 200:
                 return {"ok": True, "message": f"Connected to {model}"}
             return {"ok": False, "message": f"API returned HTTP {r.status_code}: {r.text[:200]}"}
