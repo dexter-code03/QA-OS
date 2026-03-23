@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { DndContext, closestCenter, DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { api, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef, SuiteHealthResponse, TestHealthRow, SuiteTrendItem, StepCoverageItem, TriageResponse, CollectionHealthResponse, BlockerItem, ScreenEntry, ScreenEntryFull, ScreenFolder } from "./api";
+import { api, BatchRun, BatchRunChild, Build, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef, SuiteHealthResponse, TestHealthRow, SuiteTrendItem, StepCoverageItem, TriageResponse, CollectionHealthResponse, BlockerItem, ScreenEntry, ScreenEntryFull, ScreenFolder } from "./api";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line, Legend } from "recharts";
 import { XmlElementTree, simplifyXmlForAI } from "./XmlElementTree";
 
@@ -28,6 +28,14 @@ function Toasts() {
 
 /* ── Helpers ────────────────────────────────────────── */
 type Page = "dashboard" | "execution" | "library" | "reports" | "builds" | "settings";
+
+/** One-shot preset for Live Run setup (e.g. re-run prerequisite with same build/device). */
+type ExecutionSetupPreset = {
+  testId: number;
+  buildId: number | null;
+  platform: Run["platform"];
+  deviceTarget: string;
+};
 function guessModule(n: string) { const p = n.split(/[_\s-]+/); return p.length >= 2 ? p[0][0].toUpperCase() + p[0].slice(1) : "General"; }
 function statusDot(s: string) { return s === "passed" ? "dot-green" : s === "failed" || s === "error" ? "dot-danger" : s === "running" ? "dot-warn" : "dot-gray"; }
 function statusIcon(s: string) { return s === "passed" ? "si-pass" : s === "failed" || s === "error" ? "si-fail" : s === "running" ? "si-run" : "si-skip"; }
@@ -205,13 +213,32 @@ export function App() {
   const [suites, setSuites] = useState<SuiteDef[]>([]);
   const [devices, setDevices] = useState<DeviceList>({ android: [], ios_simulators: [] });
   const [activeRunId, setActiveRunId] = useState<number | null>(null);
+  const [activeBatchId, setActiveBatchId] = useState<number | null>(null);
+  const [batchRuns, setBatchRuns] = useState<BatchRun[]>([]);
+  const [libraryOpenTestId, setLibraryOpenTestId] = useState<number | null>(null);
+  const [executionSetupPreset, setExecutionSetupPreset] = useState<ExecutionSetupPreset | null>(null);
+
+  const clearExecutionSetupPreset = useCallback(() => setExecutionSetupPreset(null), []);
+  const clearLibraryOpenTest = useCallback(() => setLibraryOpenTestId(null), []);
 
   const refresh = useCallback(async () => {
     if (!project) return;
-    const [b, t, r, m] = await Promise.all([api.listBuilds(project.id), api.listTests(project.id), api.listRuns(project.id), api.listModules(project.id)]);
-    setBuilds(b); setTests(t); setRuns(r); setModules(m);
+    const pid = project.id;
+    const [b, t, r, m, br] = await Promise.all([
+      api.listBuilds(pid).catch(() => null),
+      api.listTests(pid).catch(() => null),
+      api.listRuns(pid).catch(() => null),
+      api.listModules(pid).catch(() => null),
+      api.listBatchRuns(pid).catch(() => null),
+    ]);
+    if (b) setBuilds(b);
+    if (t) setTests(t);
+    if (r) setRuns(r);
+    if (m) setModules(m);
+    if (br) setBatchRuns(br as BatchRun[]);
+    const mods = m || modules;
     const allSuites: SuiteDef[] = [];
-    for (const mod of m) { try { const s = await api.listSuites(mod.id); allSuites.push(...s); } catch {} }
+    for (const mod of mods) { try { const s = await api.listSuites(mod.id); allSuites.push(...s); } catch {} }
     setSuites(allSuites);
   }, [project]);
 
@@ -223,7 +250,8 @@ export function App() {
   const loadDevices = useCallback(() => { api.listDevices().then(setDevices).catch(() => {}); }, []);
   useEffect(() => { if (project) { refresh(); loadDevices(); } }, [project, refresh, loadDevices]);
 
-  const liveRun = runs.find(r => r.status === "running");
+  const runningRuns = runs.filter(r => r.status === "running");
+  const runningCount = runningRuns.length;
 
   if (ok === null) return <><Toasts /><div className="center-screen"><div className="spinner" /><p style={{ color: "var(--muted)", marginTop: 12 }}>Connecting...</p></div></>;
   if (!ok) return <><Toasts /><div className="center-screen"><h2 style={{ fontFamily: "var(--sans)" }}>Backend Unreachable</h2><p style={{ color: "var(--muted)", marginTop: 8 }}>Start: <code style={{ color: "var(--accent)" }}>cd platform/backend && uvicorn app.main:app --port 9001 --reload</code></p><button className="btn-primary" style={{ marginTop: 16 }} onClick={() => location.reload()}>Retry</button></div></>;
@@ -244,7 +272,7 @@ export function App() {
           {([["dashboard", "Dashboard"], ["execution", "Live Run"], ["library", "Test Library"], ["reports", "Reports"], ["builds", "Builds"], ["settings", "Settings"]] as [Page, string][]).map(([k, label]) => (
             <button key={k} className={`nav-tab${page === k ? " active" : ""}`} onClick={() => setPage(k)}>
               {label}
-              {k === "execution" && liveRun && <span className="badge warn">1</span>}
+              {k === "execution" && runningCount > 0 && <span className="badge warn">{runningCount > 9 ? "9+" : runningCount}</span>}
             </button>
           ))}
         </nav>
@@ -256,8 +284,13 @@ export function App() {
           {latestBuild && (latestBuild.metadata as any)?.display_name && (
             <div style={{ fontSize: 11, fontFamily: "var(--mono)", color: "var(--accent2)" }}>{(latestBuild.metadata as any).display_name}{(latestBuild.metadata as any).version_name ? ` v${(latestBuild.metadata as any).version_name}` : ""}</div>
           )}
-          {liveRun && <div className="status-pill warn"><div className="live-dot" />Run in progress</div>}
-          {!liveRun && runs.length > 0 && <div className="status-pill"><div className="live-dot" />Ready</div>}
+          {runningCount > 0 && (
+            <div className="status-pill warn" title={runningRuns.map(r => `#${r.id}`).join(", ")}>
+              <div className="live-dot" />
+              {runningCount === 1 ? "Run in progress" : `${runningCount} runs in progress`}
+            </div>
+          )}
+          {runningCount === 0 && runs.length > 0 && <div className="status-pill"><div className="live-dot" />Ready</div>}
         </div>
       </div>
 
@@ -266,41 +299,69 @@ export function App() {
         <div className="sidebar">
           <div className="sidebar-section">
             <div className="sidebar-label">Recent Runs</div>
-            {runs.slice(0, 5).map(r => (
+            {batchRuns.slice(0, 5).map(br => (
+              <div key={`batch-${br.id}`} className="sidebar-run-row" style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
+                <button type="button" className={`sidebar-item${activeBatchId === br.id ? " active" : ""}`} style={{ flex: 1, minWidth: 0 }} onClick={() => { setActiveBatchId(br.id); setActiveRunId(null); setPage("execution"); }}>
+                  <div className={`dot ${statusDot(br.status)}`} style={{ flexShrink: 0 }} />
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, fontSize: 11 }}>
+                    {br.source_name} <span style={{ color: "var(--muted)", fontSize: 10 }}>({br.children.filter(c => c.status === "passed").length}/{br.total})</span>
+                  </span>
+                </button>
+              </div>
+            ))}
+            {runs.filter(r => !r.batch_run_id).slice(0, 5).map(r => (
               <div key={r.id} className="sidebar-run-row" style={{ display: "flex", alignItems: "center", minWidth: 0 }}>
                 <button
                   type="button"
-                  className={`sidebar-item${activeRunId === r.id ? " active" : ""}`}
+                  className={`sidebar-item${activeRunId === r.id && !activeBatchId ? " active" : ""}`}
                   style={{ flex: 1, minWidth: 0 }}
-                  onClick={() => { setActiveRunId(r.id); setPage("execution"); }}
+                  onClick={() => { setActiveRunId(r.id); setActiveBatchId(null); setPage("execution"); }}
                 >
                   <div className={`dot ${statusDot(r.status)}`} style={{ flexShrink: 0 }} />
                   <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                     {tests.find(t => t.id === r.test_id)?.name || `Run #${r.id}`}{r.status === "running" ? " · Live" : ""}
                   </span>
                 </button>
-                {r.status !== "running" && (
-                  <button
-                    type="button"
-                    className="sidebar-delete-btn"
-                    style={{ background: "none", border: "none", color: "var(--muted)", fontSize: 10, cursor: "pointer", padding: "2px 8px", flexShrink: 0 }}
-                    title="Delete run"
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      if (confirm(`Delete run #${r.id}?`)) {
+                <button
+                  type="button"
+                  className="sidebar-delete-btn"
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: r.status === "running" || r.status === "queued" ? "var(--warn)" : "var(--muted)",
+                    fontSize: 10,
+                    cursor: "pointer",
+                    padding: "2px 8px",
+                    flexShrink: 0,
+                  }}
+                  title={r.status === "running" || r.status === "queued" ? "Remove stuck or abandoned run (still marked in progress)" : "Delete run"}
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    const inFlight = r.status === "running" || r.status === "queued";
+                    const msg = inFlight
+                      ? `Remove run #${r.id}? It is still “${r.status}”. Use this if the run is stuck (e.g. after a server restart) or you want to discard it.`
+                      : `Delete run #${r.id}?`;
+                    if (!confirm(msg)) return;
+                    try {
+                      if (inFlight) {
                         try {
-                          await api.deleteRun(r.id);
-                          if (activeRunId === r.id) setActiveRunId(null);
-                          refresh();
-                          toast("Run deleted", "info");
-                        } catch (err: any) { toast(err.message, "error"); }
+                          await api.cancelRun(r.id);
+                        } catch {
+                          /* engine may be gone for stuck runs */
+                        }
                       }
-                    }}
-                  >✕</button>
-                )}
+                      await api.deleteRun(r.id);
+                      if (activeRunId === r.id) setActiveRunId(null);
+                      refresh();
+                      toast("Run removed", "info");
+                    } catch (err: any) {
+                      toast(err.message, "error");
+                    }
+                  }}
+                >✕</button>
               </div>
             ))}
-            {runs.length === 0 && <div style={{ padding: "4px 16px", fontSize: 11, color: "var(--muted)" }}>No runs yet</div>}
+            {runs.length === 0 && batchRuns.length === 0 && <div style={{ padding: "4px 16px", fontSize: 11, color: "var(--muted)" }}>No runs yet</div>}
           </div>
 
           {latestBuild && (
@@ -391,10 +452,74 @@ export function App() {
               onOpenRun={id => { setActiveRunId(id); setPage("execution"); }}
             />
           )}
-          {page === "execution" && <ExecutionView project={project} tests={tests} builds={builds} runs={runs} devices={devices} modules={modules} suites={suites} activeRunId={activeRunId} onRunCreated={id => { setActiveRunId(id); refresh(); }} onRefresh={refresh} />}
-          {page === "library" && <LibraryView project={project} tests={tests} runs={runs} modules={modules} suites={suites} devices={devices} onRefresh={refresh} />}
+          {page === "execution" && activeBatchId && (
+            <BatchRunView
+              batchId={activeBatchId}
+              onBack={() => setActiveBatchId(null)}
+              onDrillIn={(runId) => { setActiveRunId(runId); setActiveBatchId(null); }}
+              onRefresh={refresh}
+              onBatchCreated={(id) => { setActiveBatchId(id); setActiveRunId(null); }}
+            />
+          )}
+          {page === "execution" && !activeBatchId && (
+            <ExecutionView
+              project={project}
+              tests={tests}
+              builds={builds}
+              runs={runs}
+              devices={devices}
+              modules={modules}
+              suites={suites}
+              activeRunId={activeRunId}
+              executionSetupPreset={executionSetupPreset}
+              onExecutionSetupPresetConsumed={clearExecutionSetupPreset}
+              onClearActiveRun={() => setActiveRunId(null)}
+              onOpenTestInLibrary={id => {
+                setLibraryOpenTestId(id);
+                setPage("library");
+              }}
+              onOpenPrereqRun={id => setActiveRunId(id)}
+              onPreparePrerequisiteRun={(prereqTestId, fromRun) => {
+                setActiveRunId(null);
+                setExecutionSetupPreset({
+                  testId: prereqTestId,
+                  buildId: fromRun.build_id ?? null,
+                  platform: fromRun.platform,
+                  deviceTarget: fromRun.device_target || "",
+                });
+              }}
+              onRunCreated={id => {
+                setActiveRunId(id);
+                // Light sidebar update: only fetch runs (1 request) instead of full refresh (5+ requests)
+                if (project) api.listRuns(project.id).then(setRuns).catch(() => {});
+              }}
+              onBatchCreated={id => {
+                setActiveBatchId(id);
+                setActiveRunId(null);
+                // Light sidebar update: only fetch batch runs (1 request) instead of full refresh (5+ requests)
+                if (project) api.listBatchRuns(project.id).then(br => setBatchRuns(br as BatchRun[])).catch(() => {});
+              }}
+              onRefresh={refresh}
+            />
+          )}
+          {page === "library" && (
+            <LibraryView
+              project={project}
+              tests={tests}
+              runs={runs}
+              modules={modules}
+              suites={suites}
+              devices={devices}
+              openTestId={libraryOpenTestId}
+              onOpenTestConsumed={clearLibraryOpenTest}
+              onRefresh={refresh}
+            />
+          )}
           {page === "reports" && <ReportsView project={project} runs={runs} tests={tests} modules={modules} suites={suites} onRefresh={refresh} />}
-          {page === "builds" && <BuildsView project={project} builds={builds} runs={runs} onRefresh={refresh} />}
+          {page === "builds" && <BuildsView project={project} builds={builds} runs={runs} onRefresh={refresh} onRunTest={(b) => {
+                setExecutionSetupPreset({ testId: 0, buildId: b.id, platform: b.platform as Run["platform"], deviceTarget: "" });
+                setActiveRunId(null); setActiveBatchId(null); setPage("execution");
+              }} />}
           {page === "settings" && <SettingsView />}
         </div>
       </div>
@@ -940,8 +1065,285 @@ function DashboardView({
   );
 }
 
+/* ── Batch Run View ────────────────────────────────── */
+const BATCH_TERMINAL = ["passed", "failed", "partial", "cancelled"];
+
+function BatchRunView({ batchId, onBack, onDrillIn, onRefresh, onBatchCreated }: { batchId: number; onBack: () => void; onDrillIn: (runId: number) => void; onRefresh: () => void; onBatchCreated: (id: number) => void }) {
+  const [batch, setBatch] = useState<BatchRun | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [rerunning, setRerunning] = useState(false);
+  const onRefreshRef = useRef(onRefresh);
+  onRefreshRef.current = onRefresh;
+
+  const didRefreshOnTerminal = useRef(false);
+  const loadBatch = useCallback(async () => {
+    try {
+      const b = await api.getBatchRun(batchId);
+      setBatch(b);
+      setError(null);
+      if (BATCH_TERMINAL.includes(b.status) && !didRefreshOnTerminal.current) {
+        didRefreshOnTerminal.current = true;
+        try { onRefreshRef.current(); } catch {}
+      }
+    } catch (e: any) {
+      setError(e.message || "Failed to load batch run");
+    }
+    setLoading(false);
+  }, [batchId]);
+
+  useEffect(() => {
+    setLoading(true);
+    setBatch(null);
+    setError(null);
+    didRefreshOnTerminal.current = false;
+    loadBatch();
+  }, [batchId, loadBatch]);
+
+  useEffect(() => {
+    if (!batch || BATCH_TERMINAL.includes(batch.status)) return;
+    const iv = setInterval(loadBatch, 3000);
+    return () => clearInterval(iv);
+  }, [batch?.status, loadBatch]);
+
+  if (error && !batch) {
+    return (
+      <div className="main-content">
+        <div className="panel" style={{ padding: 28, textAlign: "center" }}>
+          <div style={{ fontSize: 13, color: "var(--danger)", marginBottom: 12 }}>{error}</div>
+          <button className="btn-ghost btn-sm" onClick={() => { setError(null); setLoading(true); loadBatch(); }}>Retry</button>
+        </div>
+      </div>
+    );
+  }
+
+  if ((loading && !batch) || !batch) {
+    return (
+      <div className="main-content">
+        <div className="panel" style={{ padding: 28, textAlign: "center" }}>
+          <div className="spinner" style={{ margin: "0 auto 12px" }} />
+          <div style={{ fontSize: 13, color: "var(--muted)" }}>Loading batch run...</div>
+        </div>
+      </div>
+    );
+  }
+
+  // Derive counts from children (source of truth) rather than batch.passed/failed
+  // which may be stale or unsynced.
+  const childPassed = batch.children.filter(c => c.status === "passed").length;
+  const childFailed = batch.children.filter(c => c.status === "failed" || c.status === "error").length;
+  const childCancelled = batch.children.filter(c => c.status === "cancelled").length;
+  const childRunning = batch.children.filter(c => c.status === "running").length;
+  const childQueued = batch.children.filter(c => c.status === "queued").length;
+  const executed = childPassed + childFailed;
+  const notRun = childCancelled + childQueued;
+  const passedPct = batch.total > 0 ? (childPassed / batch.total) * 100 : 0;
+  const failedPct = batch.total > 0 ? (childFailed / batch.total) * 100 : 0;
+  const executedPct = batch.total > 0 ? Math.round((executed / batch.total) * 100) : 0;
+  const isActive = batch.status === "running" || batch.status === "queued";
+  const isTerminal = BATCH_TERMINAL.includes(batch.status);
+
+  const handleCancel = async () => {
+    setCancelling(true);
+    try {
+      await api.cancelBatchRun(batch.id);
+      toast("Stopping — waiting for running test to finish...", "info");
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const b = await api.getBatchRun(batchId);
+          setBatch(b);
+          if (BATCH_TERMINAL.includes(b.status)) break;
+        } catch { break; }
+      }
+    } catch (e: any) {
+      toast(e.message || "Cancel failed", "error");
+    }
+    setCancelling(false);
+    // Refresh sidebar + top bar badge after cancel settles
+    try { onRefreshRef.current(); } catch {}
+  };
+
+  const handleRerun = async () => {
+    setRerunning(true);
+    try {
+      const newBatch = await api.createBatchRun({
+        project_id: batch.project_id,
+        build_id: batch.build_id,
+        mode: batch.mode,
+        source_id: batch.source_id,
+        platform: batch.platform as "android" | "ios_sim",
+        device_target: batch.device_target || undefined,
+      });
+      toast(`Rerun: ${newBatch.source_name} — ${newBatch.total} tests queued`, "success");
+      onBatchCreated(newBatch.id);
+    } catch (e: any) {
+      toast(e.message || "Rerun failed", "error");
+    }
+    setRerunning(false);
+  };
+
+  const totalDuration = (() => {
+    if (!batch.started_at) return null;
+    const start = new Date(batch.started_at + "Z").getTime();
+    const end = batch.finished_at ? new Date(batch.finished_at + "Z").getTime() : Date.now();
+    const secs = (end - start) / 1000;
+    if (secs < 60) return `${secs.toFixed(1)}s`;
+    return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+  })();
+
+  return (
+    <div className="main-content">
+      <div className="section-head">
+        <div>
+          <div className="section-title" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button className="btn-ghost btn-sm" onClick={onBack} style={{ fontSize: 11, padding: "4px 10px" }}>← Back</button>
+            {batch.mode === "suite" ? "Suite" : "Collection"}: {batch.source_name}
+          </div>
+          <div className="section-sub">{batch.platform === "android" ? "Android" : "iOS"} · {batch.total} test{batch.total !== 1 ? "s" : ""}{totalDuration ? ` · ${totalDuration}` : ""}</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: batch.status === "passed" ? "#00e5a0" : batch.status === "failed" ? "#ff3b5c" : batch.status === "partial" ? "#ffb020" : "var(--muted)" }}>
+            {batch.status.toUpperCase()}
+          </span>
+          {isActive && (
+            <button className="btn-ghost btn-sm" style={{ color: "var(--danger)", borderColor: "rgba(255,59,92,.4)" }} onClick={handleCancel} disabled={cancelling}>
+              {cancelling ? "⏳ Stopping..." : "⏹ Stop"}
+            </button>
+          )}
+          {isTerminal && (
+            <button className="run-now-btn" style={{ fontSize: 11, padding: "7px 14px" }} onClick={handleRerun} disabled={rerunning}>
+              {rerunning ? "⏳ Starting..." : "▶ Rerun"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Summary report — always visible, acts as the immediate report on stop */}
+      <div className="panel" style={{ padding: 16, marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 8 }}>
+          <span>{executed} of {batch.total} executed</span>
+          <span style={{ fontWeight: 600 }}>{executedPct}%</span>
+        </div>
+        <div style={{ height: 8, borderRadius: 4, background: "var(--bg3)", overflow: "hidden", display: "flex" }}>
+          <div style={{ height: "100%", width: `${passedPct}%`, background: "#00e5a0", transition: "width .3s" }} />
+          <div style={{ height: "100%", width: `${failedPct}%`, background: "#ff3b5c", transition: "width .3s" }} />
+        </div>
+        <div style={{ display: "flex", gap: 16, marginTop: 10, fontSize: 11 }}>
+          <span style={{ color: "#00e5a0", fontWeight: 600 }}>✓ {childPassed} passed</span>
+          <span style={{ color: "#ff3b5c", fontWeight: 600 }}>✗ {childFailed} failed</span>
+          {childRunning > 0 && <span style={{ color: "#ffb020", fontWeight: 600 }}>◎ {childRunning} running</span>}
+          {childQueued > 0 && <span style={{ color: "var(--muted)" }}>○ {childQueued} queued</span>}
+          {notRun > 0 && isTerminal && <span style={{ color: "var(--muted)" }}>— {notRun} not run</span>}
+        </div>
+      </div>
+
+      {/* Terminal report banner */}
+      {isTerminal && (
+        <div className="panel" style={{ padding: 14, marginBottom: 16, border: batch.status === "passed" ? "1px solid rgba(0,229,160,.3)" : batch.status === "cancelled" ? "1px solid rgba(255,255,255,.1)" : "1px solid rgba(255,59,92,.3)", background: batch.status === "passed" ? "rgba(0,229,160,.04)" : batch.status === "cancelled" ? "rgba(255,255,255,.02)" : "rgba(255,59,92,.04)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+            <span style={{ fontSize: 14 }}>{batch.status === "passed" ? "✅" : batch.status === "cancelled" ? "⏹" : "📋"}</span>
+            <span style={{ fontSize: 13, fontWeight: 700, color: batch.status === "passed" ? "#00e5a0" : batch.status === "cancelled" ? "var(--text)" : "#ff3b5c" }}>
+              {batch.status === "passed" ? "All tests passed" : batch.status === "cancelled" ? "Execution stopped" : "Execution Report"}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", lineHeight: 1.6 }}>
+            {childPassed > 0 && <div>{childPassed} test{childPassed !== 1 ? "s" : ""} passed</div>}
+            {childFailed > 0 && <div>{childFailed} test{childFailed !== 1 ? "s" : ""} failed</div>}
+            {notRun > 0 && <div>{notRun} test{notRun !== 1 ? "s" : ""} not executed</div>}
+            {totalDuration && <div>Total duration: {totalDuration}</div>}
+          </div>
+        </div>
+      )}
+
+      {/* Test case table */}
+      <div className="panel" style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 100px 90px 80px", gap: 8, padding: "10px 16px", fontSize: 10, color: "var(--muted)", textTransform: "uppercase" as const, borderBottom: "1px solid var(--border)", fontWeight: 600 }}>
+          <div>Test Case</div>
+          <div>Status</div>
+          <div>Duration</div>
+          <div></div>
+        </div>
+        {batch.children.map(child => {
+          let dur = "—";
+          if (child.started_at && child.finished_at) {
+            const secs = (new Date(child.finished_at + "Z").getTime() - new Date(child.started_at + "Z").getTime()) / 1000;
+            dur = secs >= 0 ? `${secs.toFixed(1)}s` : "—";
+          } else if (child.status === "running" && child.started_at) {
+            const secs = (Date.now() - new Date(child.started_at + "Z").getTime()) / 1000;
+            dur = secs >= 0 ? `${secs.toFixed(0)}s...` : "...";
+          }
+          const isOrphaned = isTerminal && (child.status === "running" || child.status === "queued");
+          const statusLabel = child.status === "cancelled" || isOrphaned ? "NOT RUN" : child.status.toUpperCase();
+          return (
+            <div key={child.run_id} style={{ display: "grid", gridTemplateColumns: "1fr 100px 90px 80px", gap: 8, padding: "12px 16px", borderBottom: "1px solid var(--border)", fontSize: 12, alignItems: "center", opacity: child.status === "cancelled" || isOrphaned ? 0.5 : 1 }}>
+              <div style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{child.test_name}</div>
+              <div>
+                <span style={{
+                  fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 12,
+                  background: isOrphaned ? "var(--bg3)" : child.status === "passed" ? "rgba(0,229,160,.12)" : child.status === "failed" || child.status === "error" ? "rgba(255,59,92,.12)" : child.status === "running" ? "rgba(255,176,32,.12)" : "var(--bg3)",
+                  color: isOrphaned ? "var(--muted)" : child.status === "passed" ? "#00e5a0" : child.status === "failed" || child.status === "error" ? "#ff3b5c" : child.status === "running" ? "#ffb020" : "var(--muted)",
+                }}>{statusLabel}</span>
+              </div>
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>{dur}</div>
+              <div>
+                {(child.status === "passed" || child.status === "failed" || child.status === "error") && (
+                  <button className="btn-ghost btn-sm" style={{ fontSize: 10, padding: "3px 8px" }} onClick={() => onDrillIn(child.run_id)}>View →</button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {batch.started_at && (
+        <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 12, textAlign: "right" }}>
+          Started {ago(batch.started_at)}{batch.finished_at ? ` · Finished ${ago(batch.finished_at)}` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Execution ─────────────────────────────────────── */
-function ExecutionView({ project, tests, builds, runs, devices, modules, suites, activeRunId, onRunCreated, onRefresh }: { project: Project; tests: TestDef[]; builds: Build[]; runs: Run[]; devices: DeviceList; modules: ModuleDef[]; suites: SuiteDef[]; activeRunId: number | null; onRunCreated: (id: number) => void; onRefresh: () => void }) {
+function ExecutionView({
+  project,
+  tests,
+  builds,
+  runs,
+  devices,
+  modules,
+  suites,
+  activeRunId,
+  executionSetupPreset,
+  onExecutionSetupPresetConsumed,
+  onClearActiveRun,
+  onOpenTestInLibrary,
+  onOpenPrereqRun,
+  onPreparePrerequisiteRun,
+  onRunCreated,
+  onBatchCreated,
+  onRefresh,
+}: {
+  project: Project;
+  tests: TestDef[];
+  builds: Build[];
+  runs: Run[];
+  devices: DeviceList;
+  modules: ModuleDef[];
+  suites: SuiteDef[];
+  activeRunId: number | null;
+  executionSetupPreset: ExecutionSetupPreset | null;
+  onExecutionSetupPresetConsumed: () => void;
+  onClearActiveRun: () => void;
+  onOpenTestInLibrary: (testId: number) => void;
+  onOpenPrereqRun: (runId: number) => void;
+  onPreparePrerequisiteRun: (prereqTestId: number, fromRun: Run) => void;
+  onRunCreated: (id: number) => void;
+  onBatchCreated: (id: number) => void;
+  onRefresh: () => void;
+}) {
   const [platform, setPlatform] = useState<Run["platform"]>("android");
   const [buildId, setBuildId] = useState<number | null>(null);
   const [testId, setTestId] = useState<number | null>(null);
@@ -974,6 +1376,19 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   const testsInCollection = selectedCollectionId ? tests.filter(t => { const s = suites.find(x => x.id === t.suite_id); return s && s.module_id === selectedCollectionId; }) : [];
   const batchTests = runMode === "suite" ? testsInSuite : runMode === "collection" ? testsInCollection : [];
 
+  useEffect(() => {
+    if (!executionSetupPreset) return;
+    const p = executionSetupPreset;
+    setRunMode("single");
+    if (p.testId) setTestId(p.testId);
+    setBuildId(p.buildId);
+    setPlatform(p.platform);
+    setDeviceTarget(p.deviceTarget ?? "");
+    setSelectedSuiteId(null);
+    setSelectedCollectionId(null);
+    onExecutionSetupPresetConsumed();
+  }, [executionSetupPreset, onExecutionSetupPresetConsumed]);
+
   const loadRun = useCallback(async (id: number) => {
     const r = await api.getRun(id);
     setRun(r);
@@ -987,9 +1402,16 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       setRun(null);
       setStepResults([]);
       setSelShot(null);
+      setLiveXml(null);
+      setLiveXmlName(null);
       setWsLive(true);
       return;
     }
+    setRun(null);
+    setStepResults([]);
+    setSelShot(null);
+    setLiveXml(null);
+    setLiveXmlName(null);
     setWsLive(true);
     loadRun(activeRunId);
     wsRef.current?.close();
@@ -1050,7 +1472,11 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
             return prev;
           });
         }
-        if (["passed", "failed", "error", "cancelled"].includes(r.status) && pollRef.current) clearInterval(pollRef.current);
+        if (["passed", "failed", "error", "cancelled"].includes(r.status)) {
+          const shots = (r.artifacts as any)?.screenshots || [];
+          if (shots.length) setSelShot(shots[shots.length - 1]);
+          if (pollRef.current) clearInterval(pollRef.current);
+        }
       } catch { /* ignore */ }
     }, 5000);
     return () => {
@@ -1255,6 +1681,19 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
         setAgentStatus(agentPausedRef.current ? "Paused" : "Done");
         setAgentRunning(false);
         onRefresh();
+      } else if (runMode !== "single" && (selectedSuiteId || selectedCollectionId)) {
+        const sourceId = runMode === "suite" ? selectedSuiteId! : selectedCollectionId!;
+        const batch = await api.createBatchRun({
+          project_id: project.id,
+          build_id: buildId,
+          mode: runMode as "suite" | "collection",
+          source_id: sourceId,
+          platform,
+          device_target: deviceTarget,
+        });
+        setStepResults([]); setSelShot(null);
+        onBatchCreated(batch.id);
+        toast(`${batch.source_name}: ${batch.total} tests queued`, "success");
       } else {
         const created: Run[] = [];
         for (const t of toRun) {
@@ -1275,13 +1714,6 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     toast("Agent will pause after current run completes", "info");
   };
 
-  const rerun = async () => {
-    if (!run) return; setBusy(true);
-    try { const r = await api.createRun({ project_id: run.project_id, build_id: run.build_id ?? undefined, test_id: run.test_id!, platform: run.platform, device_target: run.device_target }); setStepResults([]); setSelShot(null); onRunCreated(r.id); toast(`Rerun → #${r.id}`, "success"); }
-    catch (e: any) { toast(e.message, "error"); }
-    finally { setBusy(false); }
-  };
-
   // AI Fix state
   const [fixBusy, setFixBusy] = useState(false);
   const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[] } | null>(null);
@@ -1290,21 +1722,59 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   const [fixSuggestion, setFixSuggestion] = useState("");
   const [relatedTests, setRelatedTests] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
 
-  const artBase = run ? `/api/artifacts/${run.project_id}/${run.id}/` : "";
-  const screenshots = ((run?.artifacts as any)?.screenshots || []) as string[];
-  const pageSources = ((run?.artifacts as any)?.pageSources || []) as string[];
-  const testForRun = run?.test_id ? tests.find(t => t.id === run.test_id) : null;
+  /** Shown run: full loaded row, or list cache while getRun() loads — avoids flashing Run setup when opening a recent run. */
+  const displayRun = useMemo(() => {
+    if (!activeRunId) return null;
+    if (run && run.id === activeRunId) return run;
+    return runs.find(r => r.id === activeRunId) ?? null;
+  }, [activeRunId, run, runs]);
+
+  const artBase = displayRun ? `/api/artifacts/${displayRun.project_id}/${displayRun.id}/` : "";
+  const screenshots = ((displayRun?.artifacts as any)?.screenshots || []) as string[];
+  const pageSources = ((displayRun?.artifacts as any)?.pageSources || []) as string[];
+  const testForRun = displayRun?.test_id ? tests.find(t => t.id === displayRun.test_id) : null;
   const prereq = testForRun?.prerequisite_test_id ? tests.find(t => t.id === testForRun.prerequisite_test_id) : null;
-  const runPf = (run?.platform ?? platform) as Run["platform"];
+  const runPf = (displayRun?.platform ?? platform) as Run["platform"];
   const mergedSteps = prereq ? [...stepsForPlatform(prereq, runPf), ...stepsForPlatform(testForRun, runPf)] : stepsForPlatform(testForRun, runPf);
-  const stepDefs = ((run?.summary as any)?.stepDefinitions as any[]) || mergedSteps;
+  const prereqStepsLen = prereq ? stepsForPlatform(prereq, runPf).length : 0;
+  const latestPrereqRun = useMemo(() => {
+    if (!prereq) return null;
+    const matches = runs.filter(r => r.test_id === prereq.id);
+    if (matches.length === 0) return null;
+    return matches.reduce((a, b) => (a.id > b.id ? a : b));
+  }, [runs, prereq]);
+  const stepDefs = ((displayRun?.summary as any)?.stepDefinitions as any[]) || mergedSteps;
   const completedSteps = stepResults.filter(s => s?.status).length;
   const passedSteps = stepResults.filter(s => s?.status === "passed").length;
   const totalSteps = stepDefs.length;
-  const pct = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+  const pct = totalSteps > 0 ? Math.round((passedSteps / totalSteps) * 100) : 0;
 
   const failedIdx = stepResults.findIndex(s => s?.status === "failed");
-  const isFailed = run && ["failed", "error"].includes(run.status) && failedIdx >= 0;
+  const isFailed = displayRun && ["failed", "error"].includes(displayRun.status) && failedIdx >= 0;
+  const failureInPrereqSegment = Boolean(prereq && failedIdx >= 0 && failedIdx < prereqStepsLen);
+  const showPrereqHelpActions = Boolean(displayRun && prereq && failureInPrereqSegment && ["failed", "error"].includes(displayRun.status));
+
+  const rerun = async () => {
+    if (!displayRun) return;
+    setBusy(true);
+    try {
+      const r = await api.createRun({
+        project_id: displayRun.project_id,
+        build_id: displayRun.build_id ?? undefined,
+        test_id: displayRun.test_id!,
+        platform: displayRun.platform,
+        device_target: displayRun.device_target,
+      });
+      setStepResults([]);
+      setSelShot(null);
+      onRunCreated(r.id);
+      toast(`Rerun → #${r.id}`, "success");
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const loadXmlForStep = useCallback(async (idx: number) => {
     const ps = pageSources[idx] || stepResults[idx]?.pageSource;
@@ -1328,18 +1798,18 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
 
   /** Changes when the artifact path for the *selected* step updates (avoids refetching XML on every other step's WS event). */
   const selXmlArtifactKey = useMemo(() => {
-    if (!run || selShotIdx < 0) return "";
+    if (!displayRun || selShotIdx < 0) return "";
     return String(pageSources[selShotIdx] || (stepResults[selShotIdx] as any)?.pageSource || "");
-  }, [run?.id, selShotIdx, pageSources, stepResults]);
+  }, [displayRun?.id, selShotIdx, pageSources, stepResults]);
 
   // Keep XML in sync when selection, run, or this step's page source path changes (incl. after run completes)
   useEffect(() => {
-    if (!run || selShotIdx < 0) return;
+    if (!displayRun || selShotIdx < 0) return;
     loadXmlForStep(selShotIdx);
-  }, [selShotIdx, run?.id, run?.status, selXmlArtifactKey, loadXmlForStep]);
+  }, [selShotIdx, displayRun?.id, displayRun?.status, selXmlArtifactKey, loadXmlForStep]);
 
   const aiFixRun = async () => {
-    if (!run || !testForRun || failedIdx < 0) return;
+    if (!displayRun || !testForRun || failedIdx < 0) return;
     setFixBusy(true); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(true);
     toast("AI is analyzing screenshot, XML, and error logs...", "info");
 
@@ -1381,22 +1851,22 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     }
 
     const failDetails = stepResults[failedIdx]?.details;
-    const errMsg = run.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
+    const errMsg = displayRun.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
 
-    const prereqStepsLen = prereq ? stepsForPlatform(prereq, run.platform).length : 0;
+    const prereqStepsLen = prereq ? stepsForPlatform(prereq, displayRun.platform).length : 0;
     const failureInPrereq = prereq && failedIdx < prereqStepsLen;
     const targetTest = failureInPrereq ? prereq : testForRun;
     const testNameWithContext = prereq
       ? `${testForRun.name} (main) · Prerequisite: ${prereq.name} · Failure at step ${failedIdx + 1}${failureInPrereq ? " (in prerequisite)" : ""}`
       : testForRun.name;
-    const buildInfo = run.build_id ? builds.find(b => b.id === run.build_id) : null;
+    const buildInfo = displayRun.build_id ? builds.find(b => b.id === displayRun.build_id) : null;
     const meta = (buildInfo?.metadata || {}) as any;
     const appContext = [meta.display_name, meta.package].filter(Boolean).join(" · ") || undefined;
 
     try {
       const res = await api.fixSteps({
-        platform: run.platform,
-        target_platform: run.platform,
+        platform: displayRun.platform,
+        target_platform: displayRun.platform,
         original_steps: stepDefs,
         step_results: stepResults.map(s => s ? { status: s.status, details: s.details } : { status: "pending" }),
         failed_step_index: failedIdx,
@@ -1425,7 +1895,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   };
 
   const refineFixRun = async () => {
-    if (!run || !testForRun || !fixResult || !fixSuggestion.trim()) return;
+    if (!displayRun || !testForRun || !fixResult || !fixSuggestion.trim()) return;
     setFixBusy(true);
     setTapDiagnosis(null);
     toast("AI is refining the fix with your suggestion...", "info");
@@ -1463,20 +1933,20 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       } catch {}
     }
     const failDetails = stepResults[failedIdx]?.details;
-    const errMsg = run.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
-    const prereqStepsLenR = prereq ? stepsForPlatform(prereq, run.platform).length : 0;
+    const errMsg = displayRun.error_message || (typeof failDetails === "string" ? failDetails : failDetails?.error || JSON.stringify(failDetails || {}));
+    const prereqStepsLenR = prereq ? stepsForPlatform(prereq, displayRun.platform).length : 0;
     const failureInPrereqR = prereq && failedIdx < prereqStepsLenR;
     const targetTestR = failureInPrereqR ? prereq : testForRun;
     const testNameWithContextR = prereq
       ? `${testForRun.name} (main) · Prerequisite: ${prereq.name} · Failure at step ${failedIdx + 1}${failureInPrereqR ? " (in prerequisite)" : ""}`
       : testForRun.name;
-    const buildInfoR = run.build_id ? builds.find(b => b.id === run.build_id) : null;
+    const buildInfoR = displayRun.build_id ? builds.find(b => b.id === displayRun.build_id) : null;
     const metaR = (buildInfoR?.metadata || {}) as any;
     const appContextR = [metaR.display_name, metaR.package].filter(Boolean).join(" · ") || undefined;
     try {
       const res = await api.refineFix({
-        platform: run.platform,
-        target_platform: run.platform,
+        platform: displayRun.platform,
+        target_platform: displayRun.platform,
         original_steps: stepDefs,
         step_results: stepResults.map(s => s ? { status: s.status, details: s.details } : { status: "pending" }),
         failed_step_index: failedIdx,
@@ -1502,7 +1972,7 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     } finally { setFixBusy(false); }
   };
 
-  const prereqStepsLenApply = prereq ? stepsForPlatform(prereq, run?.platform ?? platform).length : 0;
+  const prereqStepsLenApply = prereq ? stepsForPlatform(prereq, displayRun?.platform ?? platform).length : 0;
   const failureInPrereqApply = prereq && failedIdx >= 0 && failedIdx < prereqStepsLenApply;
   const targetTestApply = failureInPrereqApply && prereq ? prereq : testForRun;
   const fixedStepsForTarget = prereq && fixResult
@@ -1510,16 +1980,16 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
     : (fixResult?.fixed_steps ?? []);
 
   const applyFix = async (mode: "update" | "new") => {
-    if (!fixResult || !testForRun || !run || !targetTestApply) return;
+    if (!fixResult || !testForRun || !displayRun || !targetTestApply) return;
     setBusy(true);
     try {
       if (mode === "update") {
-        await api.updateTest(targetTestApply.id, { steps: fixedStepsForTarget, platform: run.platform });
-        await api.appendFixHistory(targetTestApply.id, { analysis: fixResult.analysis, fixed_steps: fixedStepsForTarget, changes: fixResult.changes, run_id: run.id, steps_before_fix: stepsForPlatform(targetTestApply, run.platform), target_platform: run.platform });
+        await api.updateTest(targetTestApply.id, { steps: fixedStepsForTarget, platform: displayRun.platform });
+        await api.appendFixHistory(targetTestApply.id, { analysis: fixResult.analysis, fixed_steps: fixedStepsForTarget, changes: fixResult.changes, run_id: displayRun.id, steps_before_fix: stepsForPlatform(targetTestApply, displayRun.platform), target_platform: displayRun.platform });
         toast(failureInPrereqApply ? `Prerequisite "${targetTestApply.name}" updated with fixed steps` : "Test updated with fixed steps", "success");
       } else {
-        const psNew = run.platform === "ios_sim" ? { android: [] as any[], ios_sim: fixedStepsForTarget } : { android: fixedStepsForTarget, ios_sim: [] as any[] };
-        await api.createTest(project.id, { name: `${targetTestApply.name} (fixed)`, steps: run.platform === "android" ? fixedStepsForTarget : [], platform_steps: psNew, acceptance_criteria: targetTestApply.acceptance_criteria || null });
+        const psNew = displayRun.platform === "ios_sim" ? { android: [] as any[], ios_sim: fixedStepsForTarget } : { android: fixedStepsForTarget, ios_sim: [] as any[] };
+        await api.createTest(project.id, { name: `${targetTestApply.name} (fixed)`, steps: displayRun.platform === "android" ? fixedStepsForTarget : [], platform_steps: psNew, acceptance_criteria: targetTestApply.acceptance_criteria || null });
         toast("New test created with fixed steps", "success");
       }
       setShowFixPanel(false);
@@ -1532,25 +2002,25 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   };
 
   const applyFixAllRelated = async () => {
-    if (!fixResult || !testForRun || !run) return;
+    if (!fixResult || !testForRun || !displayRun) return;
     if (failureInPrereqApply) {
       await applyFix("update");
       return;
     }
     if (!relatedTests?.similar?.length) return;
     const mainFailedIdx = prereq ? failedIdx - prereqStepsLenApply : failedIdx;
-    const prefixLen = Math.min(mainFailedIdx + 1, stepsForPlatform(testForRun, run.platform).length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
+    const prefixLen = Math.min(mainFailedIdx + 1, stepsForPlatform(testForRun, displayRun.platform).length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
     if (prefixLen < 2) return;
     setBusy(true);
     try {
       const stepsToApply = prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps;
-      await api.updateTest(testForRun.id, { steps: stepsToApply, platform: run.platform });
-      await api.appendFixHistory(testForRun.id, { analysis: fixResult.analysis, fixed_steps: stepsToApply, changes: fixResult.changes, run_id: run.id, steps_before_fix: stepsForPlatform(testForRun, run.platform), target_platform: run.platform });
+      await api.updateTest(testForRun.id, { steps: stepsToApply, platform: displayRun.platform });
+      await api.appendFixHistory(testForRun.id, { analysis: fixResult.analysis, fixed_steps: stepsToApply, changes: fixResult.changes, run_id: displayRun.id, steps_before_fix: stepsForPlatform(testForRun, displayRun.platform), target_platform: displayRun.platform });
       const res = await api.applyFixToRelated(testForRun.id, {
         fixed_steps: stepsToApply,
         prefix_length: prefixLen,
-        original_steps: stepsForPlatform(testForRun, run.platform),
-        target_platform: run.platform,
+        original_steps: stepsForPlatform(testForRun, displayRun.platform),
+        target_platform: displayRun.platform,
       });
       setShowFixPanel(false);
       setFixResult(null);
@@ -1563,11 +2033,11 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   };
 
   const rerunWithFix = async () => {
-    if (!fixResult || !run || !testForRun) return;
+    if (!fixResult || !displayRun || !testForRun) return;
     await applyFix("update");
     setTimeout(async () => {
       try {
-        const r = await api.createRun({ project_id: run.project_id, build_id: run.build_id ?? undefined, test_id: testForRun.id, platform: run.platform, device_target: run.device_target });
+        const r = await api.createRun({ project_id: displayRun.project_id, build_id: displayRun.build_id ?? undefined, test_id: testForRun.id, platform: displayRun.platform, device_target: displayRun.device_target });
         setStepResults([]); setSelShot(null); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(false);
         onRunCreated(r.id);
         toast(`Rerun with fix → #${r.id}`, "success");
@@ -1576,8 +2046,8 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
   };
 
   const downloadFixReport = async () => {
-    if (!fixResult || !run || !testForRun) return;
-    const buildInfo = run.build_id ? builds.find(b => b.id === run.build_id) : null;
+    if (!fixResult || !displayRun || !testForRun) return;
+    const buildInfo = displayRun.build_id ? builds.find(b => b.id === displayRun.build_id) : null;
     const meta = (buildInfo?.metadata || {}) as any;
 
     // Collect all screenshot URLs as base64 for embedding
@@ -1617,16 +2087,16 @@ function ExecutionView({ project, tests, builds, runs, devices, modules, suites,
       return `<div style="text-align:center"><img src="${s.b64}" style="width:160px;border-radius:8px;border:${border};display:block;margin:0 auto 6px" /><div style="font-size:10px;font-weight:700;color:${labelColor}">Step ${s.idx + 1} — ${label}</div></div>`;
     }).join("");
 
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>QA·OS Bug Report — Run #${run.id}</title>
+    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>QA·OS Bug Report — Run #${displayRun.id}</title>
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#080b0f;color:#e8eaed;padding:32px;line-height:1.6}h1{font-size:22px;color:#00e5a0;margin-bottom:4px}h2{font-size:16px;color:#a78bfa;margin:28px 0 12px;border-bottom:1px solid #1e2430;padding-bottom:8px}h3{font-size:13px;color:#e8eaed;margin-bottom:8px}.meta{font-size:12px;color:#8a8f98;margin-bottom:24px}.card{background:#0d1117;border:1px solid #1e2430;border-radius:8px;padding:16px;margin-bottom:16px}.label{font-size:11px;text-transform:uppercase;color:#8a8f98;margin-bottom:4px;font-weight:600;letter-spacing:.5px}.val{font-size:14px;color:#e8eaed;margin-bottom:10px}table{width:100%;border-collapse:collapse;font-size:12px}th{background:#131920;color:#8a8f98;text-transform:uppercase;font-size:10px;letter-spacing:.5px;text-align:left;padding:8px 10px;border-bottom:1px solid #1e2430}td{padding:8px 10px;border-bottom:1px solid #151a20}.analysis{background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:16px;font-size:13px;line-height:1.8;margin-bottom:16px}.shots-grid{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}.footer{margin-top:32px;border-top:1px solid #1e2430;padding-top:16px;font-size:11px;color:#555}</style></head><body>
 <h1>🤖 QA·OS Bug Report</h1>
-<div class="meta">Run #${run.id} · ${testForRun.name} · Generated ${new Date().toLocaleString()}</div>
+<div class="meta">Run #${displayRun.id} · ${testForRun.name} · Generated ${new Date().toLocaleString()}</div>
 
 <h2>Build & Device Info</h2>
 <div class="card" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
 <div><div class="label">Project</div><div class="val">${project.name}</div>
-<div class="label">Platform</div><div class="val">${run.platform === "android" ? "Android" : "iOS Simulator"}</div>
-<div class="label">Device</div><div class="val">${run.device_target || "Default"}</div></div>
+<div class="label">Platform</div><div class="val">${displayRun.platform === "android" ? "Android" : "iOS Simulator"}</div>
+<div class="label">Device</div><div class="val">${displayRun.device_target || "Default"}</div></div>
 <div>${buildInfo ? `<div class="label">Build File</div><div class="val">${buildInfo.file_name}</div>
 ${meta.display_name ? `<div class="label">App Name</div><div class="val">${meta.display_name}${meta.version_name ? ` v${meta.version_name}` : ""}</div>` : ""}
 ${meta.package ? `<div class="label">Package</div><div class="val" style="font-family:monospace;font-size:12px;color:#7dd3fc">${meta.package}</div>` : ""}
@@ -1635,13 +2105,13 @@ ${meta.main_activity ? `<div class="label">Activity</div><div class="val" style=
 
 <h2>Run Summary</h2>
 <div class="card" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center">
-<div><div style="font-size:24px;font-weight:700;color:#ff3b5c">${run.status.toUpperCase()}</div><div class="label">Status</div></div>
+<div><div style="font-size:24px;font-weight:700;color:#ff3b5c">${displayRun.status.toUpperCase()}</div><div class="label">Status</div></div>
 <div><div style="font-size:24px;font-weight:700">${completedSteps}/${totalSteps}</div><div class="label">Steps Done</div></div>
 <div><div style="font-size:24px;font-weight:700;color:#00e5a0">${passedSteps}</div><div class="label">Passed</div></div>
 <div><div style="font-size:24px;font-weight:700;color:#ff3b5c">${failedIdx >= 0 ? 1 : 0}</div><div class="label">Failed</div></div>
 </div>
 
-${run.error_message ? `<h2>Error Message</h2><div class="card" style="border-color:rgba(255,59,92,.3);color:#ff3b5c;font-family:monospace;font-size:12px;white-space:pre-wrap">${run.error_message}</div>` : ""}
+${displayRun.error_message ? `<h2>Error Message</h2><div class="card" style="border-color:rgba(255,59,92,.3);color:#ff3b5c;font-family:monospace;font-size:12px;white-space:pre-wrap">${displayRun.error_message}</div>` : ""}
 
 ${(targetTestApply?.fix_history?.length ?? 0) > 0 ? `<h2>Previously Tried Fixes (${targetTestApply!.fix_history!.length})</h2><div class="card">${(targetTestApply!.fix_history as any[]).map((h: any, i: number) => "<div style=\"margin-bottom:12px;padding:12px;border:1px solid #2a2f38;border-radius:6px;background:rgba(255,59,92,.04)\"><div style=\"font-size:10px;color:#8a8f98;margin-bottom:4px\">Attempt " + (i + 1) + (h.run_id ? " · Run #" + h.run_id : "") + (h.created_at ? " · " + h.created_at : "") + "</div><div style=\"font-size:12px;color:#e8eaed;margin-bottom:6px\">" + (h.analysis || "") + "</div>" + ((h.changes || []).length > 0 ? "<div style=\"font-size:10px;color:#8a8f98\">" + h.changes.length + " change(s)</div>" : "") + "</div>").join("")}</div>` : ""}
 
@@ -1657,19 +2127,19 @@ ${fixResult.changes.length > 0 ? `<h2>Changes Applied (${fixResult.changes.lengt
 
 ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screenshotsHtml}</div>` : ""}
 
-<div class="footer">QA·OS Automated Bug Report · ${project.name} · Run #${run.id} · ${new Date().toISOString()}</div>
+<div class="footer">QA·OS Automated Bug Report · ${project.name} · Run #${displayRun.id} · ${new Date().toISOString()}</div>
 </body></html>`;
 
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([html], { type: "text/html" }));
-    a.download = `bug_report_run_${run.id}_${(testForRun?.name ?? "test").replace(/\s+/g, "_")}.html`;
+    a.download = `bug_report_run_${displayRun.id}_${(testForRun?.name ?? "test").replace(/\s+/g, "_")}.html`;
     a.click();
     toast("Bug report downloaded", "success");
   };
 
   const downloadVideo = async () => {
-    if (!run) { toast("No run", "error"); return; }
-    const arts = run.artifacts as Record<string, unknown> | undefined;
+    if (!displayRun) { toast("No run", "error"); return; }
+    const arts = displayRun.artifacts as Record<string, unknown> | undefined;
     const vid = arts?.video;
     /* Prefer stitched replay from step screenshots; fall back to device screen recording when no shots */
     if (screenshots.length > 0) {
@@ -1713,14 +2183,14 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
       const ext = replayExtFromRecorderMime(outMime);
       const blob = new Blob(chunks, { type: outMime });
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = `run_${run.id}_replay.${ext}`; a.click();
+      a.download = `run_${displayRun.id}_replay.${ext}`; a.click();
       toast("Video downloaded", "success");
       return;
     }
     if (typeof vid === "string" && vid.length > 0) {
       toast("Downloading device recording…", "info");
       try {
-        const res = await fetch(`/api/artifacts/${project.id}/${run.id}/${encodeURIComponent(vid)}`);
+        const res = await fetch(`/api/artifacts/${project.id}/${displayRun.id}/${encodeURIComponent(vid)}`);
         if (!res.ok) { toast("Video file not found on server", "error"); return; }
         const raw = await res.blob();
         const ct = res.headers.get("content-type")?.split(";")[0]?.trim() ?? "";
@@ -1736,7 +2206,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
           : "mp4";
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
-        a.download = `run_${run.id}_recording.${ext}`;
+        a.download = `run_${displayRun.id}_recording.${ext}`;
         a.click();
         toast("Video downloaded", "success");
       } catch (e: any) {
@@ -1751,16 +2221,21 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
     <>
       <div className="section-head" style={{ marginBottom: 14 }}>
         <div>
-          <div className="section-title">{run ? `Live Execution — ${testForRun?.name || `Run #${run.id}`}` : "Execution"}</div>
-          <div className="section-sub">{run ? `${run.device_target || "default"} · ${run.platform}${builds.find(b => b.id === run.build_id)?.file_name ? ` · ${builds.find(b => b.id === run.build_id)?.file_name}` : ""}` : "Select test and device to begin"}</div>
+          <div className="section-title">{displayRun ? `Live Execution — ${testForRun?.name || `Run #${displayRun.id}`}` : "Execution"}</div>
+          <div className="section-sub">{displayRun ? `${displayRun.device_target || "default"} · ${displayRun.platform}${builds.find(b => b.id === displayRun.build_id)?.file_name ? ` · ${builds.find(b => b.id === displayRun.build_id)?.file_name}` : ""}` : "Select test and device to begin"}</div>
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          {activeRunId && (
+            <button type="button" className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={onClearActiveRun}>
+              ← Run setup
+            </button>
+          )}
           {agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "#a78bfa", borderColor: "rgba(167,139,250,.4)" }} onClick={pauseAgent}>⏸ Pause Agent</button>}
-          {run && run.status === "running" && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }} onClick={async () => { try { await api.cancelRun(run!.id); toast("Stop requested", "info"); } catch (e: any) { toast(e.message, "error"); } }}>⏹ Stop</button>}
-          {run && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={() => api.exportKatalon(run.id)}>⬇ Katalon</button>}
-          {run && (screenshots.length > 0 || !!(run.artifacts as Record<string, unknown> | undefined)?.video) && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={downloadVideo}>🎬 Video</button>}
+          {displayRun && (displayRun.status === "running" || displayRun.status === "queued") && !agentRunning && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }} onClick={async () => { try { await api.cancelRun(displayRun.id); toast("Stop requested", "info"); } catch (e: any) { toast(e.message, "error"); } }}>⏹ Stop</button>}
+          {displayRun && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={() => api.exportKatalon(displayRun.id)}>⬇ Katalon</button>}
+          {displayRun && (screenshots.length > 0 || !!(displayRun.artifacts as Record<string, unknown> | undefined)?.video) && <button className="btn-ghost" style={{ fontSize: 11, padding: "7px 14px" }} onClick={downloadVideo}>🎬 Video</button>}
           {isFailed && <button className="btn-primary" style={{ fontSize: 11, padding: "7px 14px", background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiFixRun} disabled={fixBusy}>{fixBusy ? "⏳ AI Analyzing..." : "🤖 AI Fix"}</button>}
-          {run && ["passed", "failed", "error"].includes(run.status) && <button className="run-now-btn" onClick={rerun} disabled={busy}>▶ Rerun</button>}
+          {displayRun && ["passed", "failed", "error", "cancelled"].includes(displayRun.status) && <button className="run-now-btn" onClick={rerun} disabled={busy}>▶ Rerun</button>}
         </div>
       </div>
 
@@ -1773,7 +2248,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
       {/* Agent progress only inside exec-layout when a run exists — avoids duplicate panels */}
 
       {/* Controls */}
-      {!run && (
+      {!activeRunId && (
         <div className="panel" style={{ padding: 14, marginBottom: 16 }}>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
             <span style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>Run</span>
@@ -1797,7 +2272,7 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
           </div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <select value={platform} onChange={e => setPlatform(e.target.value as any)}><option value="android">Android</option><option value="ios_sim">iOS Simulator</option></select>
-            <select value={buildId ?? ""} onChange={e => setBuildId(e.target.value ? Number(e.target.value) : null)}><option value="">(no build)</option>{bfp.map(b => <option key={b.id} value={b.id}>#{b.id} {b.file_name}</option>)}</select>
+            <select value={buildId ?? ""} onChange={e => setBuildId(e.target.value ? Number(e.target.value) : null)}><option value="">{bfp.length > 0 ? "Select build" : "(no build)"}</option>{bfp.map(b => <option key={b.id} value={b.id}>#{b.id} {b.file_name}</option>)}</select>
             {runMode === "single" && (
               <select value={testId ?? ""} onChange={e => setTestId(e.target.value ? Number(e.target.value) : null)}><option value="">Select test</option>{tests.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
             )}
@@ -1814,14 +2289,24 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
               </select>
             )}
             <select value={deviceTarget} onChange={e => setDeviceTarget(e.target.value)}><option value="">Default device</option>{devList.map((d: any) => <option key={d.udid || d.serial} value={d.udid || d.serial}>{d.name || d.serial}</option>)}</select>
-            <button className="run-now-btn" onClick={startRun} disabled={busy || (runMode === "single" ? !testId : runMode === "suite" ? !selectedSuiteId : !selectedCollectionId) || (runMode !== "single" && batchTests.length === 0)}>
+            <button className="run-now-btn" onClick={startRun} disabled={busy || (bfp.length > 0 && !buildId) || (runMode === "single" ? !testId : runMode === "suite" ? !selectedSuiteId : !selectedCollectionId) || (runMode !== "single" && batchTests.length === 0)}>
               ▶ {runMode === "single" ? "Start Run" : runMode === "suite" ? `Run Suite (${batchTests.length})` : `Run Collection (${batchTests.length})`}
             </button>
           </div>
+          {bfp.length === 0 && builds.length > 0 && (
+            <div style={{ fontSize: 11, color: "var(--warn)", marginTop: 8, padding: "0 4px" }}>No builds for {platform === "android" ? "Android" : "iOS"} — upload one in Build Management.</div>
+          )}
         </div>
       )}
 
-      {run && (
+      {activeRunId && !displayRun && (
+        <div className="panel" style={{ padding: 28, marginBottom: 16, textAlign: "center" }}>
+          <div className="spinner" style={{ margin: "0 auto 12px" }} />
+          <div style={{ fontSize: 13, color: "var(--muted)" }}>Loading run #{activeRunId}…</div>
+        </div>
+      )}
+
+      {displayRun && (
         <div className="exec-layout">
           <div className="exec-left">
             {/* Agent Progress — inside exec so it stays visible with device/steps */}
@@ -1845,22 +2330,22 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
             {/* Device Frame */}
             <div className="device-frame">
               <div className="device-toolbar">
-                <div className="device-toolbar-label">Device Screen · {run.device_target || "default"}</div>
+                <div className="device-toolbar-label">Device Screen · {displayRun.device_target || "default"}</div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <div className="di-pill"><div className={`dot ${run.status === "running" ? "dot-green" : "dot-gray"}`} />{run.status === "running" ? "Connected" : run.status}</div>
-                  <div className="di-pill">{run.platform === "android" ? "Android" : "iOS"}</div>
+                  <div className="di-pill"><div className={`dot ${displayRun.status === "running" ? "dot-green" : "dot-gray"}`} />{displayRun.status === "running" ? "Connected" : displayRun.status}</div>
+                  <div className="di-pill">{displayRun.platform === "android" ? "Android" : "iOS"}</div>
                 </div>
-                {run.status === "running" && <div className="rec-badge"><div className="live-dot" />REC</div>}
+                {displayRun.status === "running" && <div className="rec-badge"><div className="live-dot" />REC</div>}
               </div>
               <div className="device-screen">
-                {selShot ? <img key={selShot} src={`${artBase}${selShot}?v=${selShot}`} alt="Device" className="device-screenshot" /> : <div className="device-placeholder">{run.status === "running" ? "Waiting for screenshot..." : "No screenshot"}</div>}
+                {selShot ? <img key={selShot} src={`${artBase}${selShot}?v=${selShot}`} alt="Device" className="device-screenshot" /> : <div className="device-placeholder">{displayRun.status === "running" ? "Waiting for screenshot..." : "No screenshot"}</div>}
               </div>
             </div>
 
             {/* Progress Bar */}
             <div className="exec-progress">
-              <div className="progress-header"><div className="progress-label">Step {completedSteps} of {totalSteps}</div><div className="progress-pct">{pct}% complete</div></div>
-              <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%` }} /></div>
+              <div className="progress-header"><div className="progress-label">{passedSteps} of {totalSteps} passed{completedSteps > passedSteps ? ` · ${completedSteps - passedSteps} failed` : ""}{displayRun.status === "cancelled" ? ` · stopped at step ${completedSteps}` : ""}</div><div className="progress-pct">{pct}%</div></div>
+              <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%`, background: displayRun.status === "cancelled" ? "var(--muted)" : completedSteps > passedSteps ? "var(--danger)" : undefined }} /></div>
             </div>
 
             {/* Live XML Panel */}
@@ -1872,19 +2357,19 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
               <div style={{ padding: 12 }}>
                 {liveXml ? (
                   <XmlElementTree
-                    key={`${run.id}-${selShotIdx}-${selXmlArtifactKey}`}
+                    key={`${displayRun.id}-${selShotIdx}-${selXmlArtifactKey}`}
                     xml={liveXml}
                     onCopy={(msg) => toast(msg, "success")}
                   />
                 ) : (
                   <div className="xml-panel" style={{ color: "var(--muted)" }}>
-                    {run.status === "running" ? "Waiting for page source..." : pageSources.length > 0 ? "Click a step to view its XML" : "No page source captured"}
+                    {displayRun.status === "running" ? "Waiting for page source..." : pageSources.length > 0 ? "Click a step to view its XML" : "No page source captured"}
                   </div>
                 )}
               </div>
             </div>
 
-            {run.error_message && <div className="error-box" style={{ marginTop: 12 }}><strong>Error:</strong> {run.error_message}</div>}
+            {displayRun.error_message && <div className="error-box" style={{ marginTop: 12 }}><strong>Error:</strong> {displayRun.error_message}</div>}
 
             {/* AI Fix Panel */}
             {showFixPanel && (
@@ -2175,20 +2660,49 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
             {/* Test Steps */}
             <div className="steps-panel">
               <div className="panel-header"><div className="panel-title">Test Steps</div><div style={{ fontSize: 11, color: "var(--muted)" }}>{testForRun?.name}</div></div>
+              {showPrereqHelpActions && prereq && displayRun && (
+                <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", fontSize: 11, background: "rgba(251,191,36,.08)" }}>
+                  <span style={{ color: "var(--warn)", fontWeight: 600 }}>Failed in prerequisite</span>
+                  <span style={{ color: "var(--muted)" }}>{prereq.name}</span>
+                  {latestPrereqRun ? (
+                    <button type="button" className="btn-ghost btn-sm" onClick={() => onOpenPrereqRun(latestPrereqRun.id)}>
+                      Open prerequisite run #{latestPrereqRun.id}
+                    </button>
+                  ) : (
+                    <span style={{ color: "var(--muted)", fontSize: 10 }}>No prior run for prerequisite</span>
+                  )}
+                  <button type="button" className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={() => onPreparePrerequisiteRun(prereq.id, displayRun)}>
+                    Run prerequisite (same build &amp; device)
+                  </button>
+                  <button type="button" className="btn-ghost btn-sm" onClick={() => onOpenTestInLibrary(prereq.id)}>
+                    Edit prerequisite in library
+                  </button>
+                </div>
+              )}
               <div className="steps-scroll">
                 {stepDefs.map((s: any, i: number) => {
                   const res = stepResults[i];
                   const st = res?.status || "pending";
-                  const isActive = i === completedSteps && run.status === "running";
+                  const isActive = i === completedSteps && displayRun.status === "running";
                   return (
-                    <div key={i} className={`step-item${isActive ? " running" : st === "failed" ? " fail" : ""}`} onClick={() => { const shot = screenshots[i] || res?.screenshot; setSelShot(shot || null); loadXmlForStep(i); }}>
-                      <div className="step-num">{String(i + 1).padStart(2, "0")}</div>
-                      <div>
-                        <div className="step-desc">{s.type}{s.selector ? ` → ${s.selector.value}` : ""}{s.text ? ` "${s.text}"` : ""}</div>
-                        <div className="step-reason">{st === "passed" ? "Completed" : st === "failed" ? (typeof res?.details === "string" ? res.details : res?.details?.error || "Failed") : isActive ? "Executing..." : "Pending"}</div>
+                    <React.Fragment key={i}>
+                      {prereq && prereqStepsLen > 0 && i === prereqStepsLen && (
+                        <div
+                          className="step-item"
+                          style={{ cursor: "default", background: "rgba(99,102,241,.06)", justifyContent: "center", fontSize: 10, color: "var(--muted)", fontWeight: 600 }}
+                        >
+                          — {testForRun?.name ?? "Main test"} (steps below) —
+                        </div>
+                      )}
+                      <div className={`step-item${isActive ? " running" : st === "failed" ? " fail" : ""}`} onClick={() => { const shot = screenshots[i] || res?.screenshot; setSelShot(shot || null); loadXmlForStep(i); }}>
+                        <div className="step-num">{String(i + 1).padStart(2, "0")}</div>
+                        <div>
+                          <div className="step-desc">{s.type}{s.selector ? ` → ${s.selector.value}` : ""}{s.text ? ` "${s.text}"` : ""}</div>
+                          <div className="step-reason">{st === "passed" ? "Completed" : st === "failed" ? (typeof res?.details === "string" ? res.details : res?.details?.error || "Failed") : isActive ? "Executing..." : displayRun.status === "cancelled" && !res ? "Skipped" : "Pending"}</div>
+                        </div>
+                        <div className="step-icon">{st === "passed" ? "✅" : st === "failed" ? "❌" : isActive ? "⏳" : displayRun.status === "cancelled" && !res ? <span style={{ color: "var(--muted)" }}>⊘</span> : <span style={{ color: "var(--muted)" }}>○</span>}</div>
                       </div>
-                      <div className="step-icon">{st === "passed" ? "✅" : st === "failed" ? "❌" : isActive ? "⏳" : <span style={{ color: "var(--muted)" }}>○</span>}</div>
-                    </div>
+                    </React.Fragment>
                   );
                 })}
                 {stepDefs.length === 0 && <div style={{ padding: 16, color: "var(--muted)", fontSize: 12 }}>No steps</div>}
@@ -2220,12 +2734,32 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
 }
 
 /* ── Library ───────────────────────────────────────── */
-const STEP_TYPES = ["tap", "type", "wait", "waitForVisible", "assertText", "assertVisible", "takeScreenshot", "swipe", "keyboardAction", "hideKeyboard"];
-const NO_SELECTOR_TYPES = new Set(["wait", "hideKeyboard", "takeScreenshot"]);
+const STEP_TYPES = [
+  "tap", "doubleTap", "longPress", "tapByCoordinates",
+  "type", "clear", "clearAndType",
+  "wait", "waitForVisible", "waitForNotVisible", "waitForEnabled", "waitForDisabled",
+  "swipe", "scroll",
+  "assertText", "assertTextContains", "assertVisible", "assertNotVisible",
+  "assertEnabled", "assertChecked", "assertAttribute",
+  "pressKey", "keyboardAction", "hideKeyboard",
+  "launchApp", "closeApp", "resetApp",
+  "takeScreenshot", "getPageSource",
+];
+const NO_SELECTOR_TYPES = new Set([
+  "wait", "hideKeyboard", "takeScreenshot", "tapByCoordinates",
+  "pressKey", "launchApp", "closeApp", "resetApp", "getPageSource",
+]);
 
-function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[] }) {
+const SELECTOR_STRATEGIES: Record<"android" | "ios_sim", string[]> = {
+  android: ["accessibilityId", "id", "xpath", "className", "-android uiautomator"],
+  ios_sim: ["accessibilityId", "id", "xpath", "className", "-ios predicate string", "-ios class chain"],
+};
+
+function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames, platform }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[]; platform?: "android" | "ios_sim" }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: `step-${i}` });
   const st = stepStatuses?.[i];
+  const pf = platform ?? "android";
+  const selectorOptions = SELECTOR_STRATEGIES[pf];
   const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 };
   const update = (fn: (n: any[]) => void) => { const n = [...steps]; fn(n); setSteps(n); };
   const hasSelector = !NO_SELECTOR_TYPES.has(s.type) && s.type !== "keyboardAction";
@@ -2240,8 +2774,8 @@ function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStep
       </select>
       {hasSelector && (
         <>
-          <select value={s.selector?.using || "accessibilityId"} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; })} style={{ width: 110 }}>
-            {["accessibilityId", "id", "xpath", "className", "-android uiautomator"].map(u => <option key={u}>{u}</option>)}
+          <select value={s.selector?.using || "accessibilityId"} onChange={e => update(n => { n[i] = { ...n[i], selector: { ...n[i].selector, using: e.target.value } }; })} style={{ width: pf === "ios_sim" ? 150 : 110 }}>
+            {selectorOptions.map(u => <option key={u}>{u}</option>)}
           </select>
           <input
             value={s.selector?.value || ""}
@@ -2262,25 +2796,39 @@ function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStep
           )}
         </>
       )}
-      {s.type === "keyboardAction" && (
+      {(s.type === "keyboardAction" || s.type === "pressKey") && (
         <select value={s.text || "return"} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} style={{ width: 100 }}>
-          {["return", "done", "go", "next", "search", "send"].map(k => <option key={k}>{k}</option>)}
+          {["return", "done", "go", "next", "search", "send", "back", "home", "enter", "delete", "tab"].map(k => <option key={k}>{k}</option>)}
         </select>
       )}
-      {s.type === "type" && <input value={s.text || ""} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} placeholder="text to type" style={{ flex: 1 }} />}
-      {s.type === "assertText" && <input value={s.expect || ""} onChange={e => update(n => { n[i] = { ...n[i], expect: e.target.value }; })} placeholder="expected text" style={{ flex: 1 }} />}
-      {s.type === "swipe" && (
+      {(s.type === "type" || s.type === "clearAndType") && <input value={s.text || ""} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} placeholder="text to type" style={{ flex: 1 }} />}
+      {(s.type === "assertText" || s.type === "assertTextContains") && <input value={s.expect || ""} onChange={e => update(n => { n[i] = { ...n[i], expect: e.target.value }; })} placeholder="expected text" style={{ flex: 1 }} />}
+      {s.type === "assertAttribute" && (
+        <>
+          <input value={s.meta?.attribute || ""} onChange={e => update(n => { n[i] = { ...n[i], meta: { ...n[i].meta, attribute: e.target.value } }; })} placeholder="attribute name" style={{ width: 100 }} />
+          <input value={s.expect || ""} onChange={e => update(n => { n[i] = { ...n[i], expect: e.target.value }; })} placeholder="expected value" style={{ flex: 1 }} />
+        </>
+      )}
+      {(s.type === "swipe" || s.type === "scroll") && (
         <select value={s.text || "up"} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })}>
           {["up", "down", "left", "right"].map(d => <option key={d}>{d}</option>)}
         </select>
       )}
-      {(s.type === "wait" || s.type === "waitForVisible") && <input type="number" value={s.ms || 1000} onChange={e => update(n => { n[i] = { ...n[i], ms: Number(e.target.value) }; })} placeholder="ms" style={{ width: 70 }} />}
+      {s.type === "tapByCoordinates" && (
+        <>
+          <input type="number" value={s.meta?.x || 0} onChange={e => update(n => { n[i] = { ...n[i], meta: { ...n[i].meta, x: Number(e.target.value) } }; })} placeholder="x" style={{ width: 60 }} />
+          <input type="number" value={s.meta?.y || 0} onChange={e => update(n => { n[i] = { ...n[i], meta: { ...n[i].meta, y: Number(e.target.value) } }; })} placeholder="y" style={{ width: 60 }} />
+        </>
+      )}
+      {(s.type === "launchApp" || s.type === "closeApp" || s.type === "resetApp") && <input value={s.text || ""} onChange={e => update(n => { n[i] = { ...n[i], text: e.target.value }; })} placeholder="bundle/package ID (optional)" style={{ flex: 1 }} />}
+      {s.type === "longPress" && <input type="number" value={s.ms || 2000} onChange={e => update(n => { n[i] = { ...n[i], ms: Number(e.target.value) }; })} placeholder="duration ms" style={{ width: 80 }} />}
+      {["wait", "waitForVisible", "waitForNotVisible", "waitForEnabled", "waitForDisabled"].includes(s.type) && <input type="number" value={s.ms || 1000} onChange={e => update(n => { n[i] = { ...n[i], ms: Number(e.target.value) }; })} placeholder="ms" style={{ width: 70 }} />}
       <button className="btn-ghost btn-sm" onClick={() => setSteps(steps.filter((_, j) => j !== i))} title="Remove step">✕</button>
     </div>
   );
 }
 
-function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[] }) {
+function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames, platform }: { steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[]; platform?: "android" | "ios_sim" }) {
   const ids = useMemo(() => steps.map((_, i) => `step-${i}`), [steps.length]);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   const handleDragEnd = useCallback((event: DragEndEvent) => {
@@ -2293,7 +2841,7 @@ function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onP
     <div className="step-builder">
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-          {steps.map((s, i) => <SortableStepRow key={ids[i]} s={s} i={i} steps={steps} setSteps={setSteps} stepStatuses={stepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={onPickStep} figmaNames={figmaNames} />)}
+          {steps.map((s, i) => <SortableStepRow key={ids[i]} s={s} i={i} steps={steps} setSteps={setSteps} stepStatuses={stepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={onPickStep} figmaNames={figmaNames} platform={platform} />)}
         </SortableContext>
       </DndContext>
       <button className="btn-ghost btn-sm" style={{ marginTop: 6 }} onClick={() => setSteps([...steps, { type: "tap", selector: { using: "accessibilityId", value: "" } }])}>+ Add Step</button>
@@ -2301,7 +2849,27 @@ function StepBuilder({ steps, setSteps, stepStatuses, selectorPickStepIndex, onP
   );
 }
 
-function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh }: { project: Project; tests: TestDef[]; runs: Run[]; modules: ModuleDef[]; suites: SuiteDef[]; devices: DeviceList; onRefresh: () => void }) {
+function LibraryView({
+  project,
+  tests,
+  runs,
+  modules,
+  suites,
+  devices,
+  onRefresh,
+  openTestId,
+  onOpenTestConsumed,
+}: {
+  project: Project;
+  tests: TestDef[];
+  runs: Run[];
+  modules: ModuleDef[];
+  suites: SuiteDef[];
+  devices: DeviceList;
+  onRefresh: () => void;
+  openTestId: number | null;
+  onOpenTestConsumed: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   /** Upload % when set, or null = indeterminate (AI / server processing). */
   const [taskProgress, setTaskProgress] = useState<{ label: string; pct: number | null } | null>(null);
@@ -2479,9 +3047,14 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     total_cases: number;
     total_files: number;
     warnings: string[];
+    collections?: Record<string, string[]>;
+    katalon_detected?: boolean;
     files: { path: string; cases_count: number; status: string }[];
   } | null>(null);
   const [bulkModuleId, setBulkModuleId] = useState<number | null>(null);
+  const [bulkImportFolderId, setBulkImportFolderId] = useState<number | null>(null);
+  const [bulkImportFolderScreens, setBulkImportFolderScreens] = useState<ScreenEntry[]>([]);
+  const [bulkImportBuildIds, setBulkImportBuildIds] = useState<number[]>([]);
   const [bulkFlatCases, setBulkFlatCases] = useState<any[]>([]);
   const zipImportRef = useRef<HTMLInputElement>(null);
   const folderImportRef = useRef<HTMLInputElement>(null);
@@ -2503,9 +3076,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
   // Related tests when editing (for suggestion banner)
   const [editRelated, setEditRelated] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
 
-  // XML click-to-fill: captured page source when editing/creating, and which step to fill
-  const [editXml, setEditXml] = useState<string | null>(null);
-  const [selectorPickStepIndex, setSelectorPickStepIndex] = useState<number | null>(null);
+  // XML click-to-fill: create-test flow only (edit uses manual / Figma datalist)
   const [newXml, setNewXml] = useState<string | null>(null);
   const [newSelectorPickStepIndex, setNewSelectorPickStepIndex] = useState<number | null>(null);
 
@@ -2567,6 +3138,32 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     );
   };
 
+  useEffect(() => {
+    if (!bulkImportFolderId) {
+      setBulkImportFolderScreens([]);
+      setBulkImportBuildIds([]);
+      return;
+    }
+    const pf = platform === "ios_sim" ? "ios_sim" : "android";
+    api
+      .listScreens(project.id, { folderId: bulkImportFolderId, platform: pf })
+      .then((rows) => {
+        setBulkImportFolderScreens(rows);
+        const distinct = [...new Set(rows.map((s) => s.build_id).filter((id): id is number => id != null))].sort((a, b) => a - b);
+        setBulkImportBuildIds(distinct);
+      })
+      .catch(() => {
+        setBulkImportFolderScreens([]);
+        setBulkImportBuildIds([]);
+      });
+  }, [bulkImportFolderId, platform, project.id]);
+
+  const toggleBulkImportBuild = (bid: number) => {
+    setBulkImportBuildIds((prev) =>
+      prev.includes(bid) ? prev.filter((x) => x !== bid) : [...prev, bid].sort((a, b) => a - b),
+    );
+  };
+
   const genAiContextScreenCount = useMemo(() => {
     const hasTagged = genAiFolderScreens.some((s) => s.build_id != null);
     if (!hasTagged) return genAiFolderScreens.length;
@@ -2580,6 +3177,13 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     if (genSuiteBuildIds.length === 0) return 0;
     return genSuiteFolderScreens.filter((s) => s.build_id != null && genSuiteBuildIds.includes(s.build_id)).length;
   }, [genSuiteFolderScreens, genSuiteBuildIds]);
+
+  const bulkImportContextScreenCount = useMemo(() => {
+    const hasTagged = bulkImportFolderScreens.some((s) => s.build_id != null);
+    if (!hasTagged) return bulkImportFolderScreens.length;
+    if (bulkImportBuildIds.length === 0) return 0;
+    return bulkImportFolderScreens.filter((s) => s.build_id != null && bulkImportBuildIds.includes(s.build_id)).length;
+  }, [bulkImportFolderScreens, bulkImportBuildIds]);
 
   const aiGenerate = async () => {
     if (!aiPrompt.trim()) { toast("Describe the test", "error"); return; }
@@ -2652,7 +3256,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     finally { setBusy(false); }
   };
 
-  const openEdit = (t: TestDef) => {
+  const openEdit = useCallback((t: TestDef) => {
     setEditId(t.id);
     setEditName(t.name);
     setEditStepsAndroid([...stepsForPlatform(t, "android")]);
@@ -2663,10 +3267,28 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
     setEditAcceptanceCriteria(t.acceptance_criteria ?? "");
     setAiEditPrompt("");
     setAiEditStatus("");
-    setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null);
+    setEditRelated(null);
     api.getRelatedTests(t.id).then(setEditRelated).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (openTestId == null) return;
+    const t = tests.find(x => x.id === openTestId);
+    if (t) {
+      setLibTab("tests");
+      openEdit(t);
+      onOpenTestConsumed();
+    } else if (tests.length > 0) {
+      onOpenTestConsumed();
+    }
+  }, [openTestId, tests, openEdit, onOpenTestConsumed]);
+
+  const cancelEdit = () => {
+    setEditId(null);
+    setEditRelated(null);
+    setEditStepsAndroid([]);
+    setEditStepsIos([]);
   };
-  const cancelEdit = () => { setEditId(null); setEditRelated(null); setEditXml(null); setSelectorPickStepIndex(null); setEditStepsAndroid([]); setEditStepsIos([]); };
 
   const saveEdit = async () => {
     if (!editId || !editName.trim()) return;
@@ -2888,12 +3510,45 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
               </select>
             )}
             {importTab === "bulk" && (
-              <select value={bulkModuleId ?? ""} onChange={e => setBulkModuleId(e.target.value ? Number(e.target.value) : null)} style={{ minWidth: 220 }}>
-                <option value="">Collection for new suites (optional)</option>
-                {modules.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-              </select>
+              <>
+                <select value={bulkModuleId ?? ""} onChange={e => setBulkModuleId(e.target.value ? Number(e.target.value) : null)} style={{ minWidth: 220 }}>
+                  <option value="">Collection for new suites (optional)</option>
+                  {modules.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+                <select value={bulkImportFolderId ?? ""} onChange={e => setBulkImportFolderId(e.target.value ? Number(e.target.value) : null)} style={{ minWidth: 200 }}>
+                  <option value="">Screen Library folder (optional)</option>
+                  {screenFolders.map(f => <option key={f.id} value={f.id}>{f.name} ({f.screen_count})</option>)}
+                </select>
+              </>
             )}
           </div>
+          {importTab === "bulk" && bulkImportFolderId && bulkImportFolderScreens.some(s => s.build_id != null) && (
+            <div style={{ marginBottom: 10, marginTop: -4 }}>
+              <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 4 }}>Builds in folder (context)</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {[...new Set(bulkImportFolderScreens.map(s => s.build_id).filter((id): id is number => id != null))].sort((a, b) => a - b).map((bid) => {
+                  const b = builds.find(x => x.id === bid);
+                  return (
+                    <label key={bid} style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                      <input type="checkbox" checked={bulkImportBuildIds.includes(bid)} onChange={() => toggleBulkImportBuild(bid)} />
+                      {b?.file_name ?? `Build #${bid}`}
+                    </label>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--accent2)", marginTop: 4 }}>{bulkImportContextScreenCount} screen(s) will ground AI selectors</div>
+            </div>
+          )}
+          {importTab === "bulk" && bulkImportFolderId && !bulkImportFolderScreens.some(s => s.build_id != null) && bulkImportFolderScreens.length > 0 && (
+            <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8, marginTop: -4 }}>
+              {bulkImportFolderScreens.length} screen(s) in folder (no build tag) — all will be sent to AI.
+            </div>
+          )}
+          {importTab === "bulk" && bulkImportFolderId && (
+            <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8, marginTop: bulkImportFolderScreens.length ? 0 : -4 }}>
+              Screen Library XML will ground AI selectors when no Object Repository (.rs) files are found in the upload.
+            </div>
+          )}
 
           {importTab === "single" && (
             <>
@@ -3027,7 +3682,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                   });
                 };
                 try {
-                  const res = await api.importZip(project.id, platform, f, { onUploadProgress: onUp });
+                  const res = await api.importZip(project.id, platform, f, { onUploadProgress: onUp, folderId: bulkImportFolderId, buildIds: bulkImportBuildIds.length ? bulkImportBuildIds : undefined });
                   setBulkImportResult(res);
                   setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
                   toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
@@ -3054,7 +3709,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                     });
                   };
                   try {
-                    const res = await api.importFolder(project.id, platform, picked, { onUploadProgress: onUp });
+                    const res = await api.importFolder(project.id, platform, picked, { onUploadProgress: onUp, folderId: bulkImportFolderId, buildIds: bulkImportBuildIds.length ? bulkImportBuildIds : undefined });
                     setBulkImportResult(res);
                     setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
                     toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
@@ -3082,7 +3737,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                         });
                       };
                       try {
-                        const res = await api.importZip(project.id, platform, file, { onUploadProgress: onUp });
+                        const res = await api.importZip(project.id, platform, file, { onUploadProgress: onUp, folderId: bulkImportFolderId, buildIds: bulkImportBuildIds.length ? bulkImportBuildIds : undefined });
                         setBulkImportResult(res);
                         setBulkFlatCases(Object.values(res.groups).flat().map((tc: any) => ({ ...tc, import: tc.import !== false })));
                         toast(`${res.total_files} files · ${res.total_cases} cases parsed`, "success");
@@ -3101,6 +3756,20 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                 </div>
               ) : (
                 <div style={{ borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                    {bulkImportResult.katalon_detected && (
+                      <div style={{ fontSize: 10, color: "#8b5cf6", padding: "4px 8px", borderRadius: 6, background: "rgba(139,92,246,.1)", display: "inline-block" }}>
+                        Katalon project detected — suites &amp; collections mapped
+                      </div>
+                    )}
+                    {(bulkImportResult as any).grounding && (bulkImportResult as any).grounding !== "none" && (
+                      <div style={{ fontSize: 10, color: "var(--accent)", padding: "4px 8px", borderRadius: 6, background: "rgba(0,229,160,.08)", display: "inline-block" }}>
+                        {(bulkImportResult as any).grounding === "object_repo"
+                          ? `Grounded with Object Repository (${(bulkImportResult as any).object_repo_count} locators)`
+                          : "Grounded with Screen Library XML"}
+                      </div>
+                    )}
+                  </div>
                   {bulkImportResult.warnings.length > 0 && (
                     <div style={{ fontSize: 11, color: "var(--warn)", marginBottom: 10, maxHeight: 120, overflowY: "auto" }}>
                       {bulkImportResult.warnings.slice(0, 80).map((w, i) => <div key={i}>{w}</div>)}
@@ -3118,29 +3787,52 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                     </div>
                   )}
                   <div style={{ maxHeight: 280, overflowY: "auto", marginBottom: 12, border: "1px solid var(--border)", borderRadius: 8 }}>
-                    {Object.entries(
-                      bulkFlatCases.reduce<Record<string, { tc: any; idx: number }[]>>((acc, tc, idx) => {
+                    {(() => {
+                      const bySuite = bulkFlatCases.reduce<Record<string, { tc: any; idx: number }[]>>((acc, tc, idx) => {
                         const k = String(tc.suggested_suite || "Imported");
                         if (!acc[k]) acc[k] = [];
                         acc[k].push({ tc, idx });
                         return acc;
-                      }, {}),
-                    ).map(([suiteName, rows]) => (
-                      <div key={suiteName}>
-                        <div style={{ padding: "8px 10px", background: "rgba(99,102,241,.12)", fontWeight: 600, fontSize: 11 }}>{suiteName}</div>
-                        {rows.map(({ tc, idx }) => (
-                          <div key={idx} style={{ padding: 10, borderBottom: "1px solid var(--border)", display: "grid", gridTemplateColumns: "28px 1fr", gap: 8, alignItems: "start", opacity: tc.import === false ? 0.5 : 1 }}>
-                            <input type="checkbox" checked={!!tc.import} onChange={() => setBulkFlatCases(p => p.map((t, j) => j === idx ? { ...t, import: !t.import } : t))} />
-                            <div>
-                              <div style={{ fontWeight: 600, fontSize: 12 }}>{tc.name || `Case ${idx + 1}`}</div>
-                              <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>
-                                {Array.isArray(tc.steps) ? `${tc.steps.length} steps` : "—"} · {tc.source_file ? String(tc.source_file) : ""}
+                      }, {});
+                      const collections = bulkImportResult?.collections || {};
+                      const hasCollections = Object.keys(collections).length > 0;
+                      const claimedSuites = new Set(Object.values(collections).flat());
+
+                      const renderSuite = (suiteName: string, rows: { tc: any; idx: number }[]) => (
+                        <div key={suiteName}>
+                          <div style={{ padding: "6px 10px", background: "rgba(99,102,241,.12)", fontWeight: 600, fontSize: 11 }}>{suiteName}</div>
+                          {rows.map(({ tc, idx }) => (
+                            <div key={idx} style={{ padding: 10, borderBottom: "1px solid var(--border)", display: "grid", gridTemplateColumns: "28px 1fr", gap: 8, alignItems: "start", opacity: tc.import === false ? 0.5 : 1 }}>
+                              <input type="checkbox" checked={!!tc.import} onChange={() => setBulkFlatCases(p => p.map((t, j) => j === idx ? { ...t, import: !t.import } : t))} />
+                              <div>
+                                <div style={{ fontWeight: 600, fontSize: 12 }}>{tc.name || `Case ${idx + 1}`}</div>
+                                <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>
+                                  {Array.isArray(tc.steps) ? `${tc.steps.length} steps` : "—"}{tc.acceptance_criteria ? ` · ${String(tc.acceptance_criteria).slice(0, 60)}` : ""}{tc.source_file ? ` · ${String(tc.source_file)}` : ""}
+                                </div>
                               </div>
                             </div>
-                          </div>
-                        ))}
-                      </div>
-                    ))}
+                          ))}
+                        </div>
+                      );
+
+                      if (!hasCollections) {
+                        return Object.entries(bySuite).map(([sn, rows]) => renderSuite(sn, rows));
+                      }
+
+                      return (
+                        <>
+                          {Object.entries(collections).map(([collName, collSuites]) => (
+                            <div key={collName}>
+                              <div style={{ padding: "8px 10px", background: "rgba(139,92,246,.18)", fontWeight: 700, fontSize: 11, borderBottom: "1px solid var(--border)" }}>
+                                📁 {collName}
+                              </div>
+                              {collSuites.map(sn => bySuite[sn] ? renderSuite(sn, bySuite[sn]) : null)}
+                            </div>
+                          ))}
+                          {Object.entries(bySuite).filter(([sn]) => !claimedSuites.has(sn)).map(([sn, rows]) => renderSuite(sn, rows))}
+                        </>
+                      );
+                    })()}
                   </div>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <button type="button" className="run-now-btn" style={{ padding: "8px 16px", fontSize: 11 }} disabled={busy || !bulkFlatCases.some(t => t.import)} onClick={async () => {
@@ -3151,8 +3843,10 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
                           module_id: bulkModuleId ?? undefined,
                           test_cases: bulkFlatCases.filter(t => t.import),
                           platform,
+                          collections: bulkImportResult?.collections,
                         });
-                        toast(`Imported ${r.created} test(s) · ${(r.created_suites ?? []).length} new suite(s)`, "success");
+                        const modulesMsg = (r.created_modules?.length ?? 0) > 0 ? ` · ${r.created_modules!.length} collection(s)` : "";
+                        toast(`Imported ${r.created} test(s) · ${(r.created_suites ?? []).length} suite(s)${modulesMsg}`, "success");
                         setBulkImportResult(null);
                         setBulkFlatCases([]);
                         setShowImport(false);
@@ -3297,7 +3991,7 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
             <textarea value={newAcceptanceCriteria} onChange={e => setNewAcceptanceCriteria(e.target.value)} placeholder="What this test must validate. e.g. Login: Email+Password must appear; fail if password field absent" rows={2} className="form-input" style={{ width: "100%", fontSize: 11 }} />
           </div>
           {newSelectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {newSelectorPickStepIndex + 1} selector</div>}
-          <StepBuilder steps={newSteps} setSteps={setNewSteps} selectorPickStepIndex={newSelectorPickStepIndex} onPickStep={(i) => setNewSelectorPickStepIndex(prev => prev === i ? null : i)} figmaNames={figmaNames} />
+          <StepBuilder steps={newSteps} setSteps={setNewSteps} selectorPickStepIndex={newSelectorPickStepIndex} onPickStep={(i) => setNewSelectorPickStepIndex(prev => prev === i ? null : i)} figmaNames={figmaNames} platform={platform} />
           {newXml && (
             <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
@@ -3343,6 +4037,27 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
               {editRelated.similar.length > 0 && <div style={{ color: "var(--muted)", marginTop: 4 }}>{editRelated.similar.length} test{editRelated.similar.length !== 1 ? "s" : ""} share similar steps: {editRelated.similar.map(s => s.test.name).join(", ")}. When fixing via AI in Execution, use &quot;Fix all related&quot; to update them.</div>}
             </div>
           )}
+          {editPrerequisiteId != null && (() => {
+            const prereqT = tests.find(t => t.id === editPrerequisiteId);
+            if (!prereqT) return null;
+            return (
+              <div style={{ marginBottom: 12, padding: 10, background: "rgba(251,191,36,.1)", borderRadius: 6, border: "1px solid rgba(251,191,36,.35)", fontSize: 11 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4, color: "var(--warn)" }}>Prerequisite</div>
+                <div style={{ color: "var(--muted)", marginBottom: 8 }}>
+                  &quot;{prereqT.name}&quot; runs first at execution time. The step list below is <strong>only</strong> for this test (TC-{editId}). To change prerequisite steps, open that test.
+                </div>
+                <button
+                  type="button"
+                  className="btn-ghost btn-sm"
+                  onClick={() => {
+                    if (confirm("Switch to prerequisite test? Unsaved changes on this test will be lost.")) openEdit(prereqT);
+                  }}
+                >
+                  Edit prerequisite (TC-{prereqT.id})
+                </button>
+              </div>
+            );
+          })()}
           <div style={{ display: "flex", gap: 0, marginBottom: 12, borderRadius: 8, overflow: "hidden", border: "1px solid var(--border)" }}>
             {(["android", "ios_sim"] as const).map(p => (
               <button key={p} type="button" onClick={() => setEditPfTab(p)} style={{ flex: 1, padding: "8px 6px", fontSize: 11, border: "none", cursor: "pointer", background: editPfTab === p ? "var(--accent)" : "rgba(99,102,241,.12)", color: editPfTab === p ? "#042" : "var(--muted)", fontFamily: "var(--mono)" }}>
@@ -3353,23 +4068,9 @@ function LibraryView({ project, tests, runs, modules, suites, devices, onRefresh
           <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
             <input value={aiEditPrompt} onChange={e => setAiEditPrompt(e.target.value)} className="form-input" placeholder={`AI edit · ${editPfTab === "android" ? "Android" : "iOS"} steps`} style={{ flex: 1 }} />
             <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiEditRun} disabled={busy}>🤖 AI Edit</button>
-            <button className="btn-ghost btn-sm" onClick={async () => { setBusy(true); try { const ps = await api.capturePageSource(); if (ps.ok) { setEditXml(ps.xml); toast("Page source captured", "success"); } else toast(ps.message || "No active session", "error"); } catch (e: any) { toast(e.message, "error"); } finally { setBusy(false); } }} disabled={busy} title="Capture current screen XML from Appium (device must be connected)">📄 Capture XML</button>
           </div>
           {aiEditStatus && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>{aiEditStatus}</div>}
-          {selectorPickStepIndex !== null && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>Click an element in the XML tree below to fill step {selectorPickStepIndex + 1} selector</div>}
-          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} selectorPickStepIndex={selectorPickStepIndex} onPickStep={(i) => setSelectorPickStepIndex(prev => prev === i ? null : i)} figmaNames={figmaNames} />
-          {editXml && (
-            <div className="panel" style={{ marginTop: 12, padding: 12, border: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>Page Source — click an element to fill selector</div>
-              <XmlElementTree xml={editXml} onCopy={(msg) => toast(msg, "success")} onNodeClick={(sel) => {
-                if (selectorPickStepIndex !== null && selectorPickStepIndex < editSteps.length) {
-                  setEditSteps(prev => { const n = [...prev]; n[selectorPickStepIndex] = { ...n[selectorPickStepIndex], selector: { using: sel.using, value: sel.value } }; return n; });
-                  setSelectorPickStepIndex(null);
-                  toast(`Filled step ${selectorPickStepIndex + 1} selector`, "success");
-                }
-              }} />
-            </div>
-          )}
+          <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} figmaNames={figmaNames} platform={editPfTab} />
           <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
             <button className="btn-primary btn-sm" onClick={saveEdit} disabled={busy}>Save Changes</button>
             <button className="btn-ghost btn-sm" onClick={cancelEdit}>Cancel</button>
@@ -4247,7 +4948,7 @@ function ReportsView({ project, runs, tests, modules, suites, onRefresh }: { pro
 }
 
 /* ── Builds ────────────────────────────────────────── */
-function BuildsView({ project, builds, runs, onRefresh }: { project: Project; builds: Build[]; runs: Run[]; onRefresh: () => void }) {
+function BuildsView({ project, builds, runs, onRefresh, onRunTest }: { project: Project; builds: Build[]; runs: Run[]; onRefresh: () => void; onRunTest: (b: Build) => void }) {
   const [platform, setPlatform] = useState<Build["platform"]>("android");
   const fileRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -4293,6 +4994,15 @@ function BuildsView({ project, builds, runs, onRefresh }: { project: Project; bu
               <div className="bcm-stats">
                 <div className="bcm-stat"><div className="bcm-stat-val" style={{ color: bRate >= 90 ? "var(--accent)" : "var(--warn)" }}>{bRate}%</div><div className="bcm-stat-lbl">Pass rate</div></div>
                 <div className="bcm-stat"><div className="bcm-stat-val">{bRuns.length}</div><div className="bcm-stat-lbl">Runs</div></div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+                <button className="btn-primary" style={{ flex: 1, fontSize: 11, padding: "7px 0" }} onClick={(e) => { e.stopPropagation(); onRunTest(b); }}>▶ Run Test</button>
+                <button className="btn-ghost btn-sm" style={{ fontSize: 11, padding: "7px 12px", color: "var(--danger)", borderColor: "rgba(255,59,92,.3)" }} onClick={async (e) => {
+                  e.stopPropagation();
+                  if (!confirm(`Delete build "${b.file_name}"? Runs using this build will not be deleted.`)) return;
+                  try { await api.deleteBuild(b.id); toast("Build deleted", "success"); onRefresh(); }
+                  catch (err: any) { toast(err.message, "error"); }
+                }}>🗑 Delete</button>
               </div>
             </div>
           );

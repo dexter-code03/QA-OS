@@ -19,7 +19,9 @@ from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, Web
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from .db import SessionLocal, init_db, Project, Module, TestSuite, Build, TestDefinition, Run, ScreenLibrary, ScreenFolder, _classify_error
+from .compose_detection import is_compose_screen
+from .swiftui_detection import is_swiftui_screen
+from .db import SessionLocal, init_db, Project, Module, TestSuite, Build, TestDefinition, Run, BatchRun, ScreenLibrary, ScreenFolder, _classify_error
 from .events import event_bus, RunEvent
 from .schemas import (
     ProjectCreate,
@@ -34,6 +36,9 @@ from .schemas import (
     TestOut,
     RunCreate,
     RunOut,
+    BatchRunCreate,
+    BatchRunOut,
+    BatchRunChildOut,
 )
 from .settings import ensure_dirs, load_encrypted_json, save_encrypted_json, settings
 from .parser.script_generator import generate_katalon_zip, safe_katalon_name, steps_to_groovy
@@ -45,7 +50,11 @@ from .parser.script_parser import (
     parse_test_sheet,
     sheet_row_combined_steps,
 )
-from .parser.zip_importer import ParsedFile, extract_folder_name, parse_folder_files, parse_zip
+from .parser.zip_importer import (
+    ParsedFile, extract_folder_name, parse_folder_files, parse_zip,
+    parse_object_repo_from_zip, parse_object_repo_from_files,
+    parse_katalon_project, KatalonProjectStructure, _normalize_katalon_path, _tc_id_from_groovy_path,
+)
 from .runner.appium_service import ensure_appium_running
 from .runner.engine import run_engine
 from .runner.screen_capture_session import (
@@ -212,6 +221,7 @@ def _run_to_out(r: Run) -> RunOut:
         project_id=r.project_id,
         build_id=r.build_id,
         test_id=r.test_id,
+        batch_run_id=getattr(r, "batch_run_id", None),
         status=r.status,
         platform=r.platform,
         device_target=r.device_target,
@@ -554,6 +564,7 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
     xml_context = ""
     grounded = False
     screen_images: list[tuple[str, str]] = []  # (name, base64_png)
+    screens_for_prompt: list[ScreenLibrary] = []
 
     if payload.project_id and (payload.folder_id or payload.screen_names):
         with SessionLocal() as db:
@@ -571,6 +582,7 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
             q = _filter_screen_library_by_build(q, payload.build_ids, payload.build_id)
             screens = q.all()
             if screens:
+                screens_for_prompt = list(screens)
                 xml_context = _build_xml_context(screens)
                 grounded = True
                 for scr in screens:
@@ -581,15 +593,35 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
                             if img_b64:
                                 screen_images.append((scr.name, img_b64))
 
+    using_choices = (
+        "accessibilityId|id|xpath|-android uiautomator"
+        if payload.platform == "android"
+        else "accessibilityId|id|xpath|-ios predicate string|-ios class chain"
+    )
+
     if grounded and xml_context:
+        android_rules = _android_selector_generation_rules(screens_for_prompt) if payload.platform == "android" else ""
+        ios_rules = _ios_selector_generation_rules(screens_for_prompt) if payload.platform == "ios_sim" else ""
+        sel_json_key = '{"using":"' + using_choices + '","value":"..."}'
         system_prompt = (
             "You are a mobile QA automation expert generating Appium test steps.\n"
             "You will receive real XML page source from the app under test.\n"
             "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
-            'Return ONLY valid JSON: {"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
-            ' "text": "...", "ms": 1000, "expect":"..."}]}\n\n'
-            "SELECTOR PRIORITY ORDER (use first match found in XML):\n"
+            'Return ONLY valid JSON: {"steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_json_key + ","
+            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}\n\n'
+            "Available step types:\n"
+            "  Tapping: tap, doubleTap, longPress, tapByCoordinates (meta.x, meta.y)\n"
+            "  Text: type, clear, clearAndType\n"
+            "  Wait: wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled\n"
+            "  Gesture: swipe, scroll (text=direction; scroll optionally has selector to scroll-until-visible)\n"
+            "  Assert: assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute (meta.attribute + expect)\n"
+            "  Keyboard: pressKey (text=key), keyboardAction (legacy alias), hideKeyboard\n"
+            "  App: launchApp, closeApp, resetApp (text=bundleId/package, optional)\n"
+            "  Capture: takeScreenshot, getPageSource\n\n"
+            + android_rules
+            + ios_rules
+            + "SELECTOR PRIORITY ORDER for native Android / iOS (use first match found in XML; skip for Compose-only steps where rules above say uiautomator):\n"
             "1. resource-id (most stable)\n"
             "2. content-desc / accessibility id (stable)\n"
             "3. text (fragile — only if no ID available)\n"
@@ -601,17 +633,49 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
         )
         user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
     else:
+        compose_from_live_xml = (
+            payload.platform == "android"
+            and bool(payload.page_source_xml.strip())
+            and is_compose_screen(payload.page_source_xml)
+        )
+        swiftui_from_live_xml = (
+            payload.platform == "ios_sim"
+            and bool(payload.page_source_xml.strip())
+            and is_swiftui_screen(payload.page_source_xml)
+        )
+        sel_json_key_ng = '{"using":"' + using_choices + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
             "Return ONLY valid JSON with this shape:\n"
-            '{"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
-            ' "text": "...", "ms": 1000, "expect":"..."}]}\n'
-            "IMPORTANT: For keyboard keys (return, done, go, next, search), use keyboardAction instead of tap.\n"
+            '{"steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_json_key_ng + ","
+            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}\n'
+            "Available step types:\n"
+            "  Tapping: tap, doubleTap, longPress, tapByCoordinates (meta.x, meta.y)\n"
+            "  Text: type, clear, clearAndType\n"
+            "  Wait: wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled\n"
+            "  Gesture: swipe, scroll (text=direction)\n"
+            "  Assert: assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute (meta.attribute + expect)\n"
+            "  Keyboard: pressKey (text=key), keyboardAction (legacy alias), hideKeyboard\n"
+            "  App: launchApp, closeApp, resetApp (text=bundleId/package, optional)\n"
+            "  Capture: takeScreenshot, getPageSource\n\n"
+            "IMPORTANT: For keyboard keys (return, done, go, next, search), use pressKey or keyboardAction instead of tap.\n"
             "Use hideKeyboard when you need to dismiss the keyboard without pressing a specific key.\n"
             "Keep selectors realistic for Appium. Use accessibilityId where possible.\n"
             "No markdown, no explanation, only JSON."
         )
+        if compose_from_live_xml:
+            system_prompt += (
+                "\n\nJETPACK COMPOSE (detected from XML): NEVER use selector.using \"id\" for taps/types on this UI. "
+                'ALWAYS use "-android uiautomator" with UiSelector Java, e.g. '
+                'new UiSelector().resourceId("com.app:id/foo"), or .descriptionContains("..."), .textContains("...").\n'
+            )
+        if swiftui_from_live_xml:
+            system_prompt += (
+                "\n\nSWIFTUI (detected from XML): Prefer \"-ios predicate string\" with name == 'id' or label CONTAINS '...'. "
+                "Avoid selector.using \"id\" for taps. Use \"-ios class chain\" to disambiguate (e.g. **/XCUIElementTypeButton[`name == 'x'`]). "
+                "Avoid xpath on iOS unless necessary.\n"
+            )
         user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}"
         if payload.page_source_xml:
             user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
@@ -669,6 +733,7 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
 
     xml_context = ""
     screen_images: list[tuple[str, str]] = []
+    screens_for_prompt: list[ScreenLibrary] = []
     if payload.folder_id:
         with SessionLocal() as db:
             q = db.query(ScreenLibrary).filter(
@@ -678,6 +743,7 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             q = _filter_screen_library_by_build(q, payload.build_ids, None)
             screens = q.all()
             if screens:
+                screens_for_prompt = list(screens)
                 xml_context = _build_xml_context(screens)
                 for scr in screens:
                     if scr.screenshot_path:
@@ -688,39 +754,77 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                                 screen_images.append((scr.name, img_b64))
 
     grounded = bool(xml_context)
+    using_choices_suite = (
+        "accessibilityId|id|xpath|-android uiautomator"
+        if payload.platform == "android"
+        else "accessibilityId|id|xpath|-ios predicate string|-ios class chain"
+    )
     if grounded:
+        android_rules = _android_selector_generation_rules(screens_for_prompt) if payload.platform == "android" else ""
+        ios_rules = _ios_selector_generation_rules(screens_for_prompt) if payload.platform == "ios_sim" else ""
+        sel_tc = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
             "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
             "You will receive real XML page source and screenshots from the app under test.\n"
             "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
             "Return ONLY valid JSON with this shape:\n"
-            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
-            "SELECTOR PRIORITY ORDER (use first match found in XML):\n"
+            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_tc + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...]}\n'
+            "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+            "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+            "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+            "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
+            + android_rules
+            + ios_rules
+            + "SELECTOR PRIORITY ORDER for native Android / iOS (use first match; follow per-screen Compose rules above when applicable):\n"
             "1. resource-id (most stable)\n"
             "2. content-desc / accessibility id (stable)\n"
             "3. text (fragile — only if no ID available)\n"
             "4. xpath (last resort — only if nothing else exists)\n"
             "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
             "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
-            "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
+            "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
             "Every selector you use must be found verbatim in the XML below.\n"
             "No markdown, no explanation, only JSON."
         )
         user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
     else:
+        compose_from_live_xml = (
+            payload.platform == "android"
+            and bool((payload.page_source_xml or "").strip())
+            and is_compose_screen(payload.page_source_xml)
+        )
+        swiftui_from_live_xml = (
+            payload.platform == "ios_sim"
+            and bool((payload.page_source_xml or "").strip())
+            and is_swiftui_screen(payload.page_source_xml)
+        )
+        sel_tc_ng = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
             "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
             "Return ONLY valid JSON with this shape:\n"
-            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
-            ' "selector": {"using":"accessibilityId|id|xpath","value":"..."}, "text": "...", "ms": 1000, "expect":"..."}]}, ...]}\n'
+            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_tc_ng + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...]}\n'
+            "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+            "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+            "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+            "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
             "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
             "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
-            "For keyboard keys (return, done, go), use keyboardAction. Use hideKeyboard when needed.\n"
+            "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
             "No markdown, no explanation, only JSON."
         )
+        if compose_from_live_xml:
+            system_prompt += (
+                "\n\nJETPACK COMPOSE (detected from XML): NEVER use selector.using \"id\" for taps/types on this UI. "
+                'ALWAYS use "-android uiautomator" with UiSelector Java.\n'
+            )
+        if swiftui_from_live_xml:
+            system_prompt += (
+                "\n\nSWIFTUI (detected from XML): Prefer \"-ios predicate string\" and \"-ios class chain\"; avoid bare \"id\" and avoid xpath unless necessary.\n"
+            )
         user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
         if payload.page_source_xml:
             user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
@@ -795,10 +899,17 @@ def _build_tap_diagnosis_for_ai(
     step_results: list[dict[str, Any]],
     page_source_xml: str,
     page_source_xml_raw: str = "",
+    target_platform: str = "android",
 ) -> tuple[dict[str, Any] | None, str]:
     tap_diagnosis: dict[str, Any] | None = None
     tap_diagnosis_text = ""
-    if failed_step.get("type") not in ("tap", "type", "waitForVisible", "assertVisible"):
+    _DIAGNOSABLE_TYPES = {
+        "tap", "doubleTap", "longPress", "type", "clear", "clearAndType",
+        "waitForVisible", "waitForNotVisible", "waitForEnabled", "waitForDisabled",
+        "assertText", "assertTextContains", "assertVisible", "assertNotVisible",
+        "assertEnabled", "assertChecked", "assertAttribute", "scroll",
+    }
+    if failed_step.get("type") not in _DIAGNOSABLE_TYPES:
         return tap_diagnosis, tap_diagnosis_text
     sel = failed_step.get("selector") or {}
     strategy = sel.get("using", "accessibilityId")
@@ -814,6 +925,7 @@ def _build_tap_diagnosis_for_ai(
         step_index=failed_step_index,
         all_steps=all_steps,
         step_results=step_results,
+        platform=target_platform,
     )
 
     tap_diagnosis = {
@@ -895,6 +1007,7 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         payload.step_results,
         payload.page_source_xml,
         payload.page_source_xml_raw,
+        payload.target_platform,
     )
 
     android_pkg = parse_android_package(payload.app_context or "")
@@ -942,14 +1055,19 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
         '  * Tap on the next field or a non-keyboard button to move focus\n'
         "- If the failed step was tapping 'return', 'done', 'go' etc., ALWAYS replace with keyboardAction.\n\n"
         "Available step types:\n"
-        "- tap, type, wait, waitForVisible, assertText, assertVisible, takeScreenshot, swipe\n"
-        "- keyboardAction (text = key name: return|done|go|next|search|send)\n"
-        "- hideKeyboard (no selector needed)\n\n"
+        "  Tapping: tap, doubleTap, longPress, tapByCoordinates (meta.x, meta.y)\n"
+        "  Text: type, clear, clearAndType\n"
+        "  Wait: wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled\n"
+        "  Gesture: swipe, scroll (text=direction)\n"
+        "  Assert: assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute (meta.attribute + expect)\n"
+        "  Keyboard: pressKey (text=key: return|done|go|next|search|send|back|home|enter|delete), keyboardAction (legacy alias), hideKeyboard (no selector needed)\n"
+        "  App: launchApp, closeApp, resetApp (text=bundleId/package, optional)\n"
+        "  Capture: takeScreenshot, getPageSource\n\n"
         "Return ONLY valid JSON with this shape:\n"
         '{"analysis": "Brief explanation of what went wrong and how you fixed it",'
-        ' "fixed_steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|keyboardAction|hideKeyboard",'
+        ' "fixed_steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
-        ' "text": "...", "ms": 1000, "expect":"..."}],'
+        ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
         ' "changes": [{"step_index": 0, "was": "...", "now": "...", "reason": "..."}]}\n\n'
         "IMPORTANT: fixed_steps must be the COMPLETE list (all steps, not just changed ones).\n"
         "Use accessibilityId or resource-id where possible, xpath as fallback.\n"
@@ -1099,6 +1217,7 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
         payload.step_results,
         payload.page_source_xml,
         payload.page_source_xml_raw,
+        payload.target_platform,
     )
 
     system_prompt = (
@@ -1236,10 +1355,14 @@ async def edit_steps(payload: EditStepsRequest) -> dict[str, Any]:
         "The user has an existing set of Appium test steps and wants to modify them.\n"
         "Apply the user's instruction to the steps and return the updated full list.\n\n"
         "Return ONLY valid JSON:\n"
-        '{"steps": [{"type": "tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe",'
+        '{"steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
-        ' "text": "...", "ms": 1000, "expect":"..."}],'
+        ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
         ' "summary": "Brief description of what was changed"}\n\n'
+        "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+        "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+        "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+        "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
         "Return the COMPLETE step list (not just changed ones).\n"
         "No markdown, no explanation outside JSON."
     )
@@ -1310,6 +1433,74 @@ def _compress_screenshot(fpath: Path, max_dim: int = 512) -> str:
         return ""
 
 
+def _effective_screen_type(screen: ScreenLibrary) -> str:
+    """Android: compose | native. iOS: swiftui | uikit."""
+    st = getattr(screen, "screen_type", None)
+    plat = (screen.platform or "").lower()
+    if plat in ("ios_sim", "ios"):
+        if st in ("swiftui", "uikit"):
+            return st
+        if st == "native":
+            return "uikit"
+        xml = screen.xml_snapshot or ""
+        return "swiftui" if is_swiftui_screen(xml) else "uikit"
+    if plat != "android":
+        return "native"
+    if st in ("compose", "native"):
+        return st
+    return "compose" if is_compose_screen(screen.xml_snapshot) else "native"
+
+
+def _android_selector_generation_rules(screens: list[ScreenLibrary]) -> str:
+    """Extra prompt text: per-screen Compose vs native Android rules."""
+    android_screens = [s for s in screens if s.platform == "android"]
+    if not android_screens:
+        return ""
+    lines = [
+        "ANDROID — PER-SCREEN SELECTOR MODE (must match each screen block header in DOM CONTEXT):",
+    ]
+    for s in android_screens:
+        st = _effective_screen_type(s)
+        if st == "compose":
+            lines.append(
+                f'  • "{s.name}" [compose]: NEVER use selector.using "id". '
+                'ALWAYS use "-android uiautomator" with UiSelector Java, e.g. '
+                'new UiSelector().resourceId("com.package:id/element"), or .descriptionContains("..."), .textContains("...") '
+                "when resource-id is absent."
+            )
+        else:
+            lines.append(
+                f'  • "{s.name}" [native]: prefer stable resource-id using Appium "id" strategy; '
+                "then content-desc/accessibilityId, then text, then xpath as in the priority order."
+            )
+    return "\n".join(lines) + "\n\n"
+
+
+def _ios_selector_generation_rules(screens: list[ScreenLibrary]) -> str:
+    """Extra prompt text: per-screen SwiftUI vs UIKit iOS rules."""
+    ios_screens = [s for s in screens if (s.platform or "").lower() in ("ios_sim", "ios")]
+    if not ios_screens:
+        return ""
+    lines = [
+        "iOS — PER-SCREEN SELECTOR MODE (must match each screen block header in DOM CONTEXT):",
+    ]
+    for s in ios_screens:
+        st = _effective_screen_type(s)
+        if st == "swiftui":
+            lines.append(
+                f'  • "{s.name}" [swiftui]: Prefer "-ios predicate string" with name (accessibility identifier) or label, '
+                'e.g. {"using": "-ios predicate string", "value": "name == \'my_id\'"}. '
+                "If multiple matches, use \"-ios class chain\" with **/XCUIElementType...[`name == '...'`]. "
+                'Avoid bare "id" for taps; try "accessibility id" only when the XML shows a stable name= attribute.'
+            )
+        else:
+            lines.append(
+                '  • "' + s.name + '" [uikit]: Prefer {"using": "accessibility id", "value": "<name from XML>"} when name= is set; '
+                'otherwise "-ios predicate string" on label or type; class chain if nested; xpath last resort.'
+            )
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_xml_context(screens: list[ScreenLibrary]) -> str:
     """Extract interactive elements from page source XML to reduce token usage."""
     import xml.etree.ElementTree as ET
@@ -1330,7 +1521,7 @@ def _build_xml_context(screens: list[ScreenLibrary]) -> str:
             continue
         elements = []
         for el in root.iter():
-            cls = el.get("class", "")
+            cls = el.get("class", "") or el.get("type", "")
             clickable = el.get("clickable") == "true"
             focusable = el.get("focusable") == "true"
             rid = el.get("resource-id", "")
@@ -1356,7 +1547,15 @@ def _build_xml_context(screens: list[ScreenLibrary]) -> str:
             if clickable:
                 parts.append('clickable="true"')
             elements.append("  " + " ".join(parts))
-        chunks.append(f"=== {screen.name} ===\n" + "\n".join(elements))
+        if screen.platform == "android":
+            st = _effective_screen_type(screen)
+            header = f"=== {screen.name} (Android selector_strategy={st}) ==="
+        elif (screen.platform or "").lower() in ("ios_sim", "ios"):
+            st = _effective_screen_type(screen)
+            header = f"=== {screen.name} (iOS selector_strategy={st}) ==="
+        else:
+            header = f"=== {screen.name} ==="
+        chunks.append(header + "\n" + "\n".join(elements))
     return "\n\n".join(chunks)
 
 
@@ -1370,6 +1569,7 @@ def _screen_to_dict(s: ScreenLibrary, include_xml: bool = False) -> dict[str, An
         "captured_by": s.captured_by, "notes": s.notes,
         "auto_captured": bool(s.auto_captured),
         "xml_length": len(s.xml_snapshot) if s.xml_snapshot else 0,
+        "screen_type": getattr(s, "screen_type", None),
     }
     if include_xml:
         d["xml_snapshot"] = s.xml_snapshot
@@ -1888,6 +2088,13 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
     if not xml:
         raise HTTPException(status_code=502, detail="Appium returned empty page source")
 
+    if platform_val == "android":
+        screen_type_val = "compose" if is_compose_screen(xml) else "native"
+    elif (platform_val or "").lower() in ("ios_sim", "ios"):
+        screen_type_val = "swiftui" if is_swiftui_screen(xml) else "uikit"
+    else:
+        screen_type_val = "native"
+
     screenshot_path_val = None
     if shot_b64:
         import base64
@@ -1913,6 +2120,7 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
             existing.captured_at = datetime.utcnow()
             existing.notes = notes or existing.notes
             existing.folder_id = folder_id or existing.folder_id
+            existing.screen_type = screen_type_val
             db.commit()
             db.refresh(existing)
             return _screen_to_dict(existing)
@@ -1926,6 +2134,7 @@ async def capture_screen(body: dict[str, Any]) -> dict[str, Any]:
             xml_snapshot=xml,
             screenshot_path=screenshot_path_val,
             notes=notes,
+            screen_type=screen_type_val,
         )
         db.add(entry)
         db.commit()
@@ -2342,6 +2551,23 @@ def list_builds(project_id: int) -> list[BuildOut]:
         ]
 
 
+@app.delete("/api/builds/{build_id}")
+def delete_build(build_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        b = db.query(Build).filter(Build.id == build_id).first()
+        if not b:
+            raise HTTPException(status_code=404, detail="Build not found")
+        file_path = Path(b.file_path) if b.file_path else None
+        db.delete(b)
+        db.commit()
+    if file_path and file_path.exists():
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
+    return {"ok": True}
+
+
 # ── Tests ─────────────────────────────────────────────────────────────
 
 def _steps_for_platform_record(t: TestDefinition, platform: str) -> list[dict]:
@@ -2688,8 +2914,12 @@ def cancel_run(run_id: int) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         if r.status not in ("queued", "running"):
             return {"ok": True, "status": r.status, "message": f"Run already {r.status}"}
-    run_engine.request_cancel(run_id)
-    return {"ok": True, "message": "Cancel requested"}
+        run_engine.request_cancel(run_id)
+        r.status = "cancelled"
+        r.finished_at = r.finished_at or datetime.utcnow()
+        db.commit()
+    RunEngine._sync_batch_counters(run_id)
+    return {"ok": True, "message": "Run cancelled"}
 
 
 @app.delete("/api/runs/{run_id}")
@@ -2701,6 +2931,185 @@ def delete_run(run_id: int) -> dict[str, Any]:
         db.delete(r)
         db.commit()
         return {"ok": True}
+
+
+# ── Batch Runs ────────────────────────────────────────────────────────
+
+
+def _batch_to_out(b: BatchRun, db) -> BatchRunOut:
+    child_runs = db.query(Run).filter(Run.batch_run_id == b.id).order_by(Run.id).all()
+    children: list[BatchRunChildOut] = []
+    for cr in child_runs:
+        t = db.query(TestDefinition).filter(TestDefinition.id == cr.test_id).first() if cr.test_id else None
+        children.append(BatchRunChildOut(
+            run_id=cr.id,
+            test_id=cr.test_id or 0,
+            test_name=t.name if t else f"Run #{cr.id}",
+            status=cr.status,
+            started_at=cr.started_at,
+            finished_at=cr.finished_at,
+            error_message=cr.error_message,
+        ))
+    first_child = child_runs[0] if child_runs else None
+    return BatchRunOut(
+        id=b.id,
+        project_id=b.project_id,
+        mode=b.mode,
+        source_id=b.source_id,
+        source_name=b.source_name,
+        platform=b.platform,
+        status=b.status,
+        total=b.total,
+        passed=b.passed,
+        failed=b.failed,
+        build_id=first_child.build_id if first_child else None,
+        device_target=first_child.device_target if first_child else "",
+        started_at=b.started_at,
+        finished_at=b.finished_at,
+        children=children,
+    )
+
+
+def _update_batch_counters(db, batch_id: int) -> None:
+    """Recount child statuses and update the batch row."""
+    batch = db.query(BatchRun).filter(BatchRun.id == batch_id).first()
+    if not batch:
+        return
+    children = db.query(Run).filter(Run.batch_run_id == batch_id).all()
+    passed = sum(1 for c in children if c.status == "passed")
+    failed = sum(1 for c in children if c.status in ("failed", "error"))
+    done = passed + failed + sum(1 for c in children if c.status == "cancelled")
+    batch.passed = passed
+    batch.failed = failed
+    if done >= batch.total:
+        batch.finished_at = datetime.utcnow()
+        if failed == 0 and passed == batch.total:
+            batch.status = "passed"
+        elif passed == 0 and failed == batch.total:
+            batch.status = "failed"
+        else:
+            batch.status = "partial"
+    elif any(c.status == "running" for c in children):
+        batch.status = "running"
+    db.commit()
+
+
+@app.post("/api/batch-runs", response_model=BatchRunOut)
+async def create_batch_run(payload: BatchRunCreate) -> BatchRunOut:
+    with SessionLocal() as db:
+        p = db.query(Project).filter(Project.id == payload.project_id).first()
+        if not p:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if payload.mode == "suite":
+            suite = db.query(TestSuite).filter(TestSuite.id == payload.source_id).first()
+            if not suite:
+                raise HTTPException(status_code=404, detail="Suite not found")
+            source_name = suite.name
+            test_ids = [t.id for t in db.query(TestDefinition).filter(TestDefinition.suite_id == payload.source_id).all()]
+        elif payload.mode == "collection":
+            module = db.query(Module).filter(Module.id == payload.source_id).first()
+            if not module:
+                raise HTTPException(status_code=404, detail="Collection not found")
+            source_name = module.name
+            suite_ids = [s.id for s in db.query(TestSuite).filter(TestSuite.module_id == payload.source_id).all()]
+            test_ids = [t.id for t in db.query(TestDefinition).filter(TestDefinition.suite_id.in_(suite_ids)).all()] if suite_ids else []
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid mode: {payload.mode}")
+
+        if not test_ids:
+            raise HTTPException(status_code=400, detail="No tests found for the selected scope")
+
+        batch = BatchRun(
+            project_id=payload.project_id,
+            mode=payload.mode,
+            source_id=payload.source_id,
+            source_name=source_name,
+            platform=payload.platform,
+            status="queued",
+            total=len(test_ids),
+            started_at=datetime.utcnow(),
+        )
+        db.add(batch)
+        db.commit()
+        db.refresh(batch)
+
+        child_runs: list[Run] = []
+        for tid in test_ids:
+            r = Run(
+                project_id=payload.project_id,
+                build_id=payload.build_id,
+                test_id=tid,
+                batch_run_id=batch.id,
+                status="queued",
+                device_target=payload.device_target,
+                platform=payload.platform,
+                artifacts={},
+                summary={},
+            )
+            db.add(r)
+            child_runs.append(r)
+        db.commit()
+        for r in child_runs:
+            db.refresh(r)
+
+        batch.status = "running"
+        db.commit()
+
+        for r in child_runs:
+            await event_bus.publish(RunEvent(run_id=r.id, type="queued", payload={"runId": r.id, "batchRunId": batch.id}))
+            await run_engine.enqueue(r.id)
+
+        return _batch_to_out(batch, db)
+
+
+@app.get("/api/batch-runs/{batch_id}", response_model=BatchRunOut)
+def get_batch_run(batch_id: int) -> BatchRunOut:
+    with SessionLocal() as db:
+        batch = db.query(BatchRun).filter(BatchRun.id == batch_id).first()
+        if not batch:
+            raise HTTPException(status_code=404, detail="Batch run not found")
+        return _batch_to_out(batch, db)
+
+
+@app.get("/api/projects/{project_id}/batch-runs")
+def list_batch_runs(project_id: int) -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        batches = db.query(BatchRun).filter(BatchRun.project_id == project_id).order_by(BatchRun.id.desc()).limit(20).all()
+        return [_batch_to_out(b, db).dict() for b in batches]
+
+
+@app.post("/api/batch-runs/{batch_id}/cancel")
+def cancel_batch_run(batch_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        batch = db.query(BatchRun).filter(BatchRun.id == batch_id).first()
+        if not batch:
+            raise HTTPException(status_code=404, detail="Batch run not found")
+        children = db.query(Run).filter(Run.batch_run_id == batch_id, Run.status.in_(("queued", "running"))).all()
+        cancelled_count = 0
+        for r in children:
+            if r.status == "running":
+                run_engine.request_cancel(r.id)
+            r.status = "cancelled"
+            r.finished_at = r.finished_at or datetime.utcnow()
+            cancelled_count += 1
+        db.commit()
+
+        all_children = db.query(Run).filter(Run.batch_run_id == batch_id).all()
+        passed = sum(1 for c in all_children if c.status == "passed")
+        failed = sum(1 for c in all_children if c.status in ("failed", "error"))
+        cancelled_n = sum(1 for c in all_children if c.status == "cancelled")
+        batch.passed = passed
+        batch.failed = failed
+        batch.finished_at = batch.finished_at or datetime.utcnow()
+        if cancelled_n == batch.total:
+            batch.status = "cancelled"
+        elif failed == 0 and passed == batch.total:
+            batch.status = "passed"
+        else:
+            batch.status = "partial"
+        db.commit()
+    return {"ok": True, "message": f"Cancelled {cancelled_count} runs"}
 
 
 # ── Artifacts ─────────────────────────────────────────────────────────
@@ -2965,7 +3374,11 @@ async def _ai_parse_python_script(source: str, platform: str, api_key: str, mode
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     prompt = (
         f"Parse this Appium Python test script into test cases for platform {platform}. "
-        "Map driver.find_element, element.click, element.send_keys to tap/type/waitForVisible. "
+        "Map driver.find_element+click to tap, send_keys to type, WebDriverWait+visibility to waitForVisible, assertions to assertText/assertVisible. "
+        "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+        "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+        "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+        "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n"
         'Return ONLY JSON: {"test_cases": [{"name": "...", "steps": [...], "acceptance_criteria": "..."}]}.\n\n'
         + source[:6000]
     )
@@ -3102,6 +3515,10 @@ async def _ai_parse_katalon_source(
     api_key: str,
     model: str,
     fallback_cases: list[dict[str, Any]],
+    *,
+    object_repo: Optional[dict[str, dict[str, str]]] = None,
+    xml_context: str = "",
+    platform_selector_rules: str = "",
 ) -> tuple[list[dict[str, Any]] | None, list[str]]:
     """Parse Katalon Groovy/Java mobile scripts with Gemini; None = caller uses heuristic fallback."""
     extra_warnings: list[str] = []
@@ -3117,10 +3534,14 @@ async def _ai_parse_katalon_source(
         "Output ONLY valid JSON:\n"
         '{"test_cases":[{"name":"...","steps":[...],"acceptance_criteria":"..."}]}\n\n'
         "Step object shape:\n"
-        '{"type":"tap|type|wait|waitForVisible|assertText|assertVisible|takeScreenshot|swipe|hideKeyboard|keyboardAction",'
+        '{"type":"<step_type>",'
         '"selector":{"using":"accessibilityId|id|xpath|className","value":"..."},'
-        '"text":"...","ms":1000,"expect":"..."}\n'
-        "Omit selector on: wait, takeScreenshot, swipe (use text for direction: up|down|left|right), hideKeyboard, keyboardAction.\n\n"
+        '"text":"...","ms":1000,"expect":"...","meta":{...}}\n'
+        "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+        "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+        "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+        "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n"
+        "Omit selector on: wait, takeScreenshot, tapByCoordinates, pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, getPageSource.\n\n"
         "SELECTOR RULES (mandatory):\n"
         "- For EVERY element, resolve TestObject/def variables: `TestObject x = findTestObject('Object Repository/.../leafName')`. "
         "The locator token is the substring AFTER the final '/' — e.g. txtBox_libiPrompt, btn_TextEnterButton. "
@@ -3142,6 +3563,30 @@ async def _ai_parse_katalon_source(
         f'Default name: "{stem}".\n'
         f"Source file path hint: {logical_path}\n"
     )
+
+    # Append Object Repository locator table when available
+    if object_repo:
+        repo_lines = [f"  {leaf}: using={info['strategy']} value={info['value']}" for leaf, info in sorted(object_repo.items())]
+        system += (
+            "\n--- OBJECT REPOSITORY (leafName → real locator) ---\n"
+            "When a findTestObject leaf matches an entry below, use its exact strategy and value "
+            "instead of guessing accessibilityId:\n"
+            + "\n".join(repo_lines[:500]) + "\n"
+        )
+
+    # Append Screen Library XML context as fallback grounding
+    if xml_context:
+        system += (
+            "\n--- SCREEN LIBRARY XML (captured page sources) ---\n"
+            "Use the elements below to ground selectors to real attributes from the device. "
+            "Prefer resource-id, content-desc, or accessibility id over xpath.\n"
+            + xml_context[:30_000] + "\n"
+        )
+
+    # Inject platform-specific Compose/SwiftUI selector rules when Screen Library context is present
+    if platform_selector_rules:
+        system += "\n" + platform_selector_rules
+
     body = {
         "contents": [{"parts": [{"text": system + "\n--- SOURCE ---\n" + src}]}],
         "generationConfig": {"temperature": 0.08, "responseMimeType": "application/json"},
@@ -3167,6 +3612,10 @@ async def _rewrite_katalon_parsed_files_with_ai(
     platform: str,
     api_key: str,
     model: str,
+    *,
+    object_repo: Optional[dict[str, dict[str, str]]] = None,
+    xml_context: str = "",
+    platform_selector_rules: str = "",
 ) -> None:
     if not api_key:
         return
@@ -3180,7 +3629,11 @@ async def _rewrite_katalon_parsed_files_with_ai(
             return
         async with sem:
             fallback = list(pf.test_cases)
-            ai_cases, ai_notes = await _ai_parse_katalon_source(raw, platform, pf.path, api_key, model, fallback)
+            ai_cases, ai_notes = await _ai_parse_katalon_source(
+                raw, platform, pf.path, api_key, model, fallback,
+                object_repo=object_repo, xml_context=xml_context,
+                platform_selector_rules=platform_selector_rules,
+            )
         if ai_cases:
             pf.test_cases = ai_cases
             pf.warnings.extend(ai_notes)
@@ -3227,7 +3680,10 @@ async def _ai_complete_sheet_rows(rows: list, platform: str, api_key: str, model
             f"Rules:\n"
             f"- test_cases MUST have exactly {n} entries in the SAME ORDER as the rows below.\n"
             "- For each row, set acceptance_criteria from the Expected column (expected).\n"
-            "- Expand steps_description into atomic steps: tap, type, wait, waitForVisible, assertText, assertVisible, swipe, hideKeyboard, keyboardAction.\n"
+            "- Expand steps_description into atomic steps: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+            "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
+            "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
+            "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n"
             "- Include selector_value in the right steps when it clearly identifies a control.\n"
             "- End with assertText or assertVisible reflecting the Expected outcome when applicable.\n"
             "- Each step: {\"type\":\"...\",\"selector\":{\"using\":\"accessibilityId|id|xpath\",\"value\":\"...\"},\"text\",\"ms\",\"expect\"}\n\n"
@@ -3411,6 +3867,8 @@ async def import_zip(
     project_id: int,
     platform: str,
     file: UploadFile = File(...),
+    folder_id: Optional[int] = None,
+    build_ids: Optional[str] = None,
 ) -> dict[str, Any]:
     """Parse a ZIP of scripts; preview grouped by folder (suite). Does not persist."""
     with SessionLocal() as db:
@@ -3423,37 +3881,120 @@ async def import_zip(
         raise HTTPException(status_code=400, detail="Expected a .zip file")
 
     parsed_files = parse_zip(content)
+    obj_repo = parse_object_repo_from_zip(content)
+    katalon = parse_katalon_project(content)
+
+    xml_ctx = ""
+    sel_rules = ""
+    if not obj_repo and folder_id:
+        _bid_list = [int(b) for b in (build_ids or "").split(",") if b.strip().isdigit()]
+        with SessionLocal() as db:
+            q = db.query(ScreenLibrary).filter(
+                ScreenLibrary.folder_id == folder_id,
+                ScreenLibrary.xml_snapshot.isnot(None),
+            )
+            if _bid_list:
+                q = q.filter(ScreenLibrary.build_id.in_(_bid_list))
+            screens = q.all()
+            if screens:
+                xml_ctx = _build_xml_context(screens)
+                if platform == "android":
+                    sel_rules = _android_selector_generation_rules(screens)
+                elif platform == "ios_sim":
+                    sel_rules = _ios_selector_generation_rules(screens)
+
     s = _load_settings()
     zip_ai_key, zip_model = _ai_creds(s)
-    await _rewrite_katalon_parsed_files_with_ai(parsed_files, platform, zip_ai_key, zip_model)
+    await _rewrite_katalon_parsed_files_with_ai(
+        parsed_files, platform, zip_ai_key, zip_model,
+        object_repo=obj_repo or None, xml_context=xml_ctx,
+        platform_selector_rules=sel_rules,
+    )
 
-    groups: dict[str, list[dict[str, Any]]] = {}
-    warnings: list[str] = []
-    total_cases = 0
-
+    # Build tc_id → parsed test case lookup
+    tc_by_id: dict[str, dict[str, Any]] = {}
     for pf in parsed_files:
-        suite_name = extract_folder_name(pf.path)
-        groups.setdefault(suite_name, [])
+        norm = _normalize_katalon_path(pf.path)
+        tc_id = _tc_id_from_groovy_path(norm)
         for tc in pf.test_cases:
             steps = tc.get("steps") or []
             if any(s.get("type") == "python_raw" for s in steps):
-                warnings.append(f"{pf.path}: Python script needs AI completion")
                 tc["import"] = False
             else:
                 tc.setdefault("import", True)
             tc["source_file"] = pf.path
-            tc["suggested_suite"] = suite_name
-            groups[suite_name].append(tc)
-            total_cases += 1
+            # Enrich with .tc metadata
+            meta = katalon.tc_metadata.get(tc_id)
+            if meta:
+                if meta.description and not tc.get("acceptance_criteria"):
+                    tc["acceptance_criteria"] = meta.description
+                if meta.tags:
+                    tc["tags"] = meta.tags
+                if meta.comment and meta.comment != tc.get("name"):
+                    tc.setdefault("comment", meta.comment)
+            tc_by_id[tc_id] = tc
+
+    # Group by .ts suites if available, else fall back to folder hierarchy
+    groups: dict[str, list[dict[str, Any]]] = {}
+    warnings: list[str] = []
+    assigned_tc_ids: set[str] = set()
+
+    if katalon.suites:
+        for suite in katalon.suites:
+            suite_cases: list[dict[str, Any]] = []
+            for ref in suite.tc_ids:
+                tc = tc_by_id.get(ref)
+                if tc:
+                    tc["suggested_suite"] = suite.name
+                    suite_cases.append(tc)
+                    assigned_tc_ids.add(ref)
+            if suite_cases:
+                groups[suite.name] = suite_cases
+
+    # Anything not claimed by a .ts suite goes into folder-derived groups
+    for pf in parsed_files:
+        norm = _normalize_katalon_path(pf.path)
+        tc_id = _tc_id_from_groovy_path(norm)
+        if tc_id in assigned_tc_ids:
+            continue
+        tc = tc_by_id.get(tc_id)
+        if not tc:
+            continue
+        suite_name = extract_folder_name(pf.path)
+        tc["suggested_suite"] = suite_name
+        groups.setdefault(suite_name, []).append(tc)
+        assigned_tc_ids.add(tc_id)
+
+    total_cases = sum(len(tcs) for tcs in groups.values())
+
+    for pf in parsed_files:
         if pf.error:
             warnings.append(f"{pf.path}: {pf.error}")
         warnings.extend(pf.warnings)
+
+    # Build collection → suite mapping for the frontend
+    collections_map: dict[str, list[str]] = {}
+    suite_names = {s.name for s in katalon.suites}
+    for coll in katalon.collections:
+        coll_suites = [ref.split("/")[-1] for ref in coll.suite_refs if ref.split("/")[-1] in suite_names]
+        if coll_suites:
+            collections_map[coll.name] = coll_suites
+
+    grounding = "object_repo" if obj_repo else ("screen_library" if xml_ctx else "none")
+    if obj_repo:
+        warnings.insert(0, f"Object Repository: {len(obj_repo)} locator(s) extracted from .rs files")
+    if katalon.suites:
+        warnings.insert(0, f"Katalon project: {len(katalon.suites)} suite(s), {len(katalon.collections)} collection(s), {len(katalon.tc_metadata)} .tc metadata file(s)")
 
     return {
         "groups": groups,
         "total_cases": total_cases,
         "total_files": len(parsed_files),
         "warnings": warnings,
+        "grounding": grounding,
+        "object_repo_count": len(obj_repo),
+        "collections": collections_map,
+        "katalon_detected": bool(katalon.suites or katalon.collections),
         "files": [
             {
                 "path": pf.path,
@@ -3470,6 +4011,8 @@ async def import_folder(
     project_id: int,
     platform: str,
     files: list[UploadFile] = File(...),
+    folder_id: Optional[int] = None,
+    build_ids: Optional[str] = None,
 ) -> dict[str, Any]:
     """Multiple files from webkitdirectory upload."""
     with SessionLocal() as db:
@@ -3489,9 +4032,34 @@ async def import_folder(
         file_data.append((rel, raw))
 
     parsed_files = parse_folder_files(file_data)
+    obj_repo = parse_object_repo_from_files(file_data)
+
+    xml_ctx = ""
+    sel_rules = ""
+    if not obj_repo and folder_id:
+        _bid_list = [int(b) for b in (build_ids or "").split(",") if b.strip().isdigit()]
+        with SessionLocal() as db:
+            q = db.query(ScreenLibrary).filter(
+                ScreenLibrary.folder_id == folder_id,
+                ScreenLibrary.xml_snapshot.isnot(None),
+            )
+            if _bid_list:
+                q = q.filter(ScreenLibrary.build_id.in_(_bid_list))
+            screens = q.all()
+            if screens:
+                xml_ctx = _build_xml_context(screens)
+                if platform == "android":
+                    sel_rules = _android_selector_generation_rules(screens)
+                elif platform == "ios_sim":
+                    sel_rules = _ios_selector_generation_rules(screens)
+
     s = _load_settings()
     folder_ai_key, folder_model = _ai_creds(s)
-    await _rewrite_katalon_parsed_files_with_ai(parsed_files, platform, folder_ai_key, folder_model)
+    await _rewrite_katalon_parsed_files_with_ai(
+        parsed_files, platform, folder_ai_key, folder_model,
+        object_repo=obj_repo or None, xml_context=xml_ctx,
+        platform_selector_rules=sel_rules,
+    )
 
     groups: dict[str, list[dict[str, Any]]] = {}
     warnings: list[str] = []
@@ -3515,11 +4083,17 @@ async def import_folder(
             warnings.append(f"{pf.path}: {pf.error}")
         warnings.extend(pf.warnings)
 
+    grounding = "object_repo" if obj_repo else ("screen_library" if xml_ctx else "none")
+    if obj_repo:
+        warnings.insert(0, f"Object Repository: {len(obj_repo)} locator(s) extracted from .rs files")
+
     return {
         "groups": groups,
         "total_cases": total_cases,
         "total_files": len(parsed_files),
         "warnings": warnings,
+        "grounding": grounding,
+        "object_repo_count": len(obj_repo),
         "files": [
             {
                 "path": pf.path,
@@ -3533,7 +4107,9 @@ async def import_folder(
 
 @app.post("/api/projects/{project_id}/import/zip/confirm")
 def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Persist ZIP/folder preview. Optional suite_map, auto-create suites under module_id."""
+    """Persist ZIP/folder preview. Optional suite_map, auto-create suites under module_id.
+    When `collections` is provided (from a Katalon project), modules are created per collection
+    and suites are placed underneath the appropriate module."""
     suite_map_raw = payload.get("suite_map") or {}
     suite_map: dict[str, int] = {}
     for k, v in suite_map_raw.items():
@@ -3552,7 +4128,10 @@ def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> 
         except (TypeError, ValueError):
             module_id = None
 
+    collections_raw: dict[str, list[str]] = payload.get("collections") or {}
+
     test_cases: list[dict[str, Any]] = payload.get("test_cases", [])
+    created_modules: dict[str, int] = {}
     created_suites: dict[str, int] = {}
     created_tests: list[dict[str, Any]] = []
 
@@ -3560,6 +4139,28 @@ def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> 
         p = db.query(Project).filter(Project.id == project_id).first()
         if not p:
             raise HTTPException(status_code=404, detail="Project not found")
+
+        # Pre-create modules from Katalon collections
+        suite_to_module: dict[str, int] = {}
+        if collections_raw:
+            for coll_name, coll_suites in collections_raw.items():
+                mod = Module(project_id=project_id, name=str(coll_name)[:200])
+                db.add(mod)
+                db.flush()
+                created_modules[coll_name] = mod.id
+                for s_name in coll_suites:
+                    suite_to_module[s_name] = mod.id
+
+        # If no collections but a module_id is given, use a single fallback module
+        # for suites not claimed by any collection
+        fallback_module_id = module_id
+
+        # Also create a default "Imported" module for orphan suites when collections exist
+        if collections_raw:
+            orphan_mod = Module(project_id=project_id, name="Imported (uncategorised)")
+            db.add(orphan_mod)
+            db.flush()
+            fallback_module_id = orphan_mod.id
 
         for tc in test_cases:
             if not tc.get("import", True):
@@ -3576,12 +4177,14 @@ def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> 
             if suite_id is None:
                 suite_id = created_suites.get(suite_name)
 
-            if suite_id is None and module_id is not None:
-                new_suite = TestSuite(module_id=module_id, name=suite_name)
-                db.add(new_suite)
-                db.flush()
-                created_suites[suite_name] = new_suite.id
-                suite_id = new_suite.id
+            if suite_id is None:
+                target_module_id = suite_to_module.get(suite_name, fallback_module_id)
+                if target_module_id is not None:
+                    new_suite = TestSuite(module_id=target_module_id, name=suite_name)
+                    db.add(new_suite)
+                    db.flush()
+                    created_suites[suite_name] = new_suite.id
+                    suite_id = new_suite.id
 
             ac = tc.get("acceptance_criteria")
             st = list(steps)
@@ -3597,11 +4200,21 @@ def confirm_zip_import(project_id: int, payload: dict[str, Any] = Body(...)) -> 
             db.flush()
             created_tests.append({"id": t.id, "name": t.name, "suite": suite_name})
 
+        # Remove the orphan module if nothing was placed in it
+        if collections_raw and fallback_module_id and not any(
+            db.query(TestSuite).filter(TestSuite.module_id == fallback_module_id).first()
+            for _ in [1]
+        ):
+            orphan = db.query(Module).filter(Module.id == fallback_module_id).first()
+            if orphan:
+                db.delete(orphan)
+
         db.commit()
 
     return {
         "created": len(created_tests),
         "created_suites": list(created_suites.keys()),
+        "created_modules": list(created_modules.keys()),
         "tests": created_tests,
     }
 

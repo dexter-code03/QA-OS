@@ -8,6 +8,7 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 
+from ..swiftui_detection import is_swiftui_screen
 from .tap_debugger import _bool_attr, _strategy_matches_node, _walk
 
 # Causes referenced by system prompt RULES
@@ -16,6 +17,8 @@ CAUSE_ELEMENT_NOT_DISPLAYED = "ELEMENT_NOT_DISPLAYED"
 CAUSE_COMPOSE_ID_UNRELIABLE = "COMPOSE_ID_SELECTOR_UNRELIABLE"
 CAUSE_STALE_OR_STRATEGY = "STALE_OR_STRATEGY_MISMATCH"
 CAUSE_UNKNOWN = "UNKNOWN"
+CAUSE_SWIFTUI_SELECTOR_UNRELIABLE = "SWIFTUI_SELECTOR_UNRELIABLE"
+CAUSE_IOS_NO_ACCESSIBILITY_IDENTIFIER = "IOS_NO_ACCESSIBILITY_IDENTIFIER"
 
 
 def parse_android_package(app_context: str) -> Optional[str]:
@@ -76,6 +79,8 @@ def build_failure_diagnosis_block(diagnosis: dict[str, Any]) -> str:
     for e in diagnosis.get("evidence") or []:
         if e:
             lines.append(f"Evidence: {e}")
+    if diagnosis.get("message"):
+        lines.append(f"Message: {diagnosis['message']}")
     if diagnosis.get("recommended_fix"):
         lines.append(f"Recommended fix: {diagnosis['recommended_fix']}")
     if diagnosis.get("recommended_strategy"):
@@ -83,6 +88,143 @@ def build_failure_diagnosis_block(diagnosis: dict[str, Any]) -> str:
     if diagnosis.get("recommended_value"):
         lines.append(f"Recommended selector value: {diagnosis['recommended_value']}")
     return "\n".join(lines)
+
+
+def _ios_id_appears_in_xml(xml: str, value: str) -> bool:
+    if not value or not xml:
+        return False
+    if f'name="{value}"' in xml:
+        return True
+    if f'label="{value}"' in xml:
+        return True
+    return bool(re.search(rf'name\s*=\s*"{re.escape(value)}"', xml)) or bool(
+        re.search(rf"label\s*=\s*'{re.escape(value)}'", xml)
+    )
+
+
+def _classify_failure_ios(
+    failed_step: dict[str, Any],
+    error_message: str,
+    page_source_raw: str,
+    page_source_fallback: str,
+    tap_diagnosis: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    diagnosis: dict[str, Any] = {
+        "cause": CAUSE_UNKNOWN,
+        "evidence": [],
+        "recommended_fix": None,
+        "recommended_strategy": None,
+        "recommended_value": None,
+    }
+
+    stype = (failed_step.get("type") or "").lower()
+    if stype not in ("tap", "type", "waitforvisible", "assertvisible", "asserttext"):
+        diagnosis["evidence"].append(f"Step type {stype!r} — structured locator classification skipped.")
+        return diagnosis
+
+    sel = failed_step.get("selector") or {}
+    strategy = (sel.get("using") or "accessibilityId").strip()
+    value = (sel.get("value") or "").strip()
+    if not value:
+        diagnosis["evidence"].append("No selector value on failed step.")
+        return diagnosis
+
+    xml = (page_source_raw or page_source_fallback or "").strip()
+    if not xml:
+        diagnosis["evidence"].append("No page source XML available for classification.")
+        if tap_diagnosis:
+            diagnosis["evidence"].append(f"Tap debugger: root_cause={tap_diagnosis.get('root_cause')}")
+        return diagnosis
+
+    hints = _error_hints(error_message)
+    swiftui = is_swiftui_screen(xml)
+    strat_l = strategy.lower().replace("_", "").replace("-", "").replace(" ", "")
+    is_id_like = strat_l in ("id", "resourceid", "accessibilityid")
+
+    if swiftui and is_id_like and not _ios_id_appears_in_xml(xml, value):
+        diagnosis["cause"] = CAUSE_IOS_NO_ACCESSIBILITY_IDENTIFIER
+        diagnosis["evidence"].append(
+            "SwiftUI screen: selector value does not appear as name= or label= in page source — "
+            "developers should add .accessibilityIdentifier() on the SwiftUI view."
+        )
+        diagnosis["recommended_fix"] = "dev_fix_required"
+        diagnosis["message"] = (
+            f"Cannot automate reliably without accessibility: ask dev to add .accessibilityIdentifier('{value}') "
+            "or ensure label is stable."
+        )
+        return diagnosis
+
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        diagnosis["evidence"].append("Page source is not strict XML — skipping ElementTree classification.")
+        if tap_diagnosis:
+            diagnosis["evidence"].append(
+                f"Rely on TAP DEBUGGER: found={tap_diagnosis.get('found')} root_cause={tap_diagnosis.get('root_cause')}"
+            )
+        return diagnosis
+
+    nodes = [n for n in _walk(root) if _strategy_matches_node(n.attrib, strategy, value)]
+
+    if not nodes:
+        diagnosis["cause"] = CAUSE_ELEMENT_NOT_IN_XML
+        diagnosis["evidence"].append("No element node matches the failing selector in the current page source.")
+        diagnosis["recommended_fix"] = "wrong_screen_or_navigation"
+        if tap_diagnosis and tap_diagnosis.get("root_cause") in ("wrong_screen", "element_missing"):
+            diagnosis["evidence"].append(f"Tap debugger agrees: {tap_diagnosis.get('root_cause_detail', '')}")
+        return diagnosis
+
+    n = nodes[0]
+    attrib = n.attrib
+    displayed = _bool_attr(attrib, "displayed", True)
+    visible = _bool_attr(attrib, "visible", True)
+    shown = displayed and visible
+    enabled = _bool_attr(attrib, "enabled", True)
+    name_attr = (attrib.get("name") or "").strip()
+    label_attr = (attrib.get("label") or "").strip()
+    if name_attr:
+        pred_val = f'name == "{name_attr}"'
+    elif label_attr:
+        pred_val = f'label == "{label_attr}"'
+    else:
+        pred_val = ""
+
+    if not shown:
+        diagnosis["cause"] = CAUSE_ELEMENT_NOT_DISPLAYED
+        diagnosis["evidence"].append("Matching node exists but is not visible in the hierarchy.")
+        diagnosis["recommended_fix"] = "scroll_or_wait"
+        return diagnosis
+
+    if not enabled:
+        diagnosis["evidence"].append("Element matches but enabled=false — may need different flow or wait.")
+        return diagnosis
+
+    if swiftui and is_id_like:
+        diagnosis["cause"] = CAUSE_SWIFTUI_SELECTOR_UNRELIABLE
+        diagnosis["evidence"].append("Page source suggests SwiftUI (many XCUIElementTypeOther / sparse identifiers).")
+        diagnosis["evidence"].append("Standard id/accessibility id can be unreliable — prefer XCUITest predicate.")
+        diagnosis["recommended_fix"] = "switch_to_ios_predicate"
+        diagnosis["recommended_strategy"] = "-ios predicate string"
+        if pred_val:
+            diagnosis["recommended_value"] = pred_val
+        return diagnosis
+
+    if is_id_like and hints & {"stale", "interact", "timeout", "missing"} and shown:
+        diagnosis["cause"] = CAUSE_STALE_OR_STRATEGY
+        diagnosis["evidence"].append(
+            "Element present and visible but error suggests stale element, interaction, or locate timeout."
+        )
+        diagnosis["recommended_fix"] = "switch_to_ios_predicate"
+        diagnosis["recommended_strategy"] = "-ios predicate string"
+        if pred_val:
+            diagnosis["recommended_value"] = pred_val
+        return diagnosis
+
+    if tap_diagnosis:
+        diagnosis["evidence"].append(
+            f"Tap debugger: found={tap_diagnosis.get('found')} root_cause={tap_diagnosis.get('root_cause')}"
+        )
+    return diagnosis
 
 
 def classify_failure_for_ai_fix(
@@ -108,8 +250,9 @@ def classify_failure_for_ai_fix(
 
     pf = (platform or "").lower().replace("-", "_")
     if pf in ("ios", "ios_sim"):
-        diagnosis["evidence"].append("iOS — no Compose/UiAutomator classification; use XCUITest-appropriate fixes.")
-        return diagnosis
+        return _classify_failure_ios(
+            failed_step, error_message, page_source_raw, page_source_fallback, tap_diagnosis
+        )
 
     if pf != "android":
         diagnosis["evidence"].append(f"Platform {platform!r} — classification tuned for Android.")
@@ -214,16 +357,22 @@ def classify_failure_for_ai_fix(
 AI_FIX_CLASSIFICATION_RULES = """
 STRUCTURED FAILURE CLASSIFICATION — MANDATORY RULES:
 1. Read the section "=== STRUCTURED FAILURE CLASSIFICATION ===" in the user message. It states a confirmed cause from server-side analysis of the page source and failing step.
-2. If Cause is COMPOSE_ID_SELECTOR_UNRELIABLE or STALE_OR_STRATEGY_MISMATCH:
+2. If Cause is COMPOSE_ID_SELECTOR_UNRELIABLE or STALE_OR_STRATEGY_MISMATCH (Android):
    - You MUST change the failing step's selector to use strategy "-android uiautomator" (or equivalent Appium JSON: using "-android uiautomator").
    - Use the Recommended selector value exactly when provided (UiSelector().resourceId(...)).
    - Do NOT fix the failure by only increasing wait/ms or timeout — that is not sufficient for these causes.
-3. If Cause is ELEMENT_NOT_DISPLAYED:
+3. If Cause is SWIFTUI_SELECTOR_UNRELIABLE or STALE_OR_STRATEGY_MISMATCH on iOS:
+   - Prefer "-ios predicate string" with the Recommended selector value when provided (e.g. name == "id").
+   - If still ambiguous, use "-ios class chain" to narrow (e.g. **/XCUIElementTypeButton[`name == 'x'`]).
+   - Do NOT fix by only increasing wait/ms — insufficient when classification says switch strategy.
+4. If Cause is IOS_NO_ACCESSIBILITY_IDENTIFIER:
+   - Do not invent locators — state that the developer must add .accessibilityIdentifier(...) or stable labels in SwiftUI.
+5. If Cause is ELEMENT_NOT_DISPLAYED:
    - Add a scroll/swipe or waitForVisible before the failing step; keep added waits at most 10000ms unless clearly justified.
    - Do not only bump timeout on the same tap.
-4. If Cause is ELEMENT_NOT_IN_XML:
+6. If Cause is ELEMENT_NOT_IN_XML:
    - The app is likely on the wrong screen — adjust earlier steps or add navigation; do NOT invent a new selector for an element absent from the XML.
-5. If Cause is UNKNOWN:
+7. If Cause is UNKNOWN:
    - Timeout increases are allowed only as a last resort when no better explanation exists.
 Still obey all other rules (keyboard actions, acceptance_criteria, complete fixed_steps JSON).
 """

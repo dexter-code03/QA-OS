@@ -57,11 +57,53 @@ def _norm_rid(rid: str) -> str:
     return rid
 
 
+def _ios_predicate_matches(attrib: dict[str, str], value: str) -> bool:
+    """Match common -ios predicate string forms against a single node's attributes."""
+    v = (value or "").strip()
+    if not v:
+        return False
+    name = (attrib.get("name") or "").strip()
+    label = (attrib.get("label") or "").strip()
+    m = re.search(r"name\s*==\s*['\"]([^'\"]+)['\"]", v, re.I)
+    if m:
+        return name == m.group(1)
+    m = re.search(r"label\s*==\s*['\"]([^'\"]+)['\"]", v, re.I)
+    if m:
+        return label == m.group(1)
+    m = re.search(r"label\s+CONTAINS\s+['\"]([^'\"]+)['\"]", v, re.I)
+    if m:
+        return m.group(1).lower() in label.lower()
+    m = re.search(r"label\s+BEGINSWITH\s+['\"]([^'\"]+)['\"]", v, re.I)
+    if m:
+        return label.lower().startswith(m.group(1).lower())
+    return False
+
+
+def _ios_class_chain_matches(attrib: dict[str, str], value: str) -> bool:
+    """Best-effort: extract inner `name == 'x'` / `label ...` from class chain and match node."""
+    v = (value or "").strip()
+    if not v:
+        return False
+    inner = re.findall(r"`([^`]+)`", v)
+    for chunk in inner:
+        if _ios_predicate_matches(attrib, chunk):
+            return True
+    return False
+
+
+def _norm_strategy_key(strategy: str) -> str:
+    return "".join(((strategy or "").lower()).split()).replace("-", "").replace("_", "")
+
+
 def _strategy_matches_node(attrib: dict[str, str], strategy: str, value: str) -> bool:
-    s = (strategy or "accessibilityId").lower().replace("_", "").replace("-", "")
+    s = _norm_strategy_key(strategy or "accessibilityId")
     val = (value or "").strip()
     if not val:
         return False
+    if s == "iospredicatestring" or "iospredicate" in s:
+        return _ios_predicate_matches(attrib, value)
+    if s == "iosclasschain" or "iosclasschain" in s:
+        return _ios_class_chain_matches(attrib, value)
     if s in ("id", "resourceid"):
         rid = attrib.get("resource-id") or attrib.get("name") or ""
         return rid == val or _norm_rid(rid) == _norm_rid(val) or val in rid
@@ -88,9 +130,12 @@ def _strategy_matches_node(attrib: dict[str, str], strategy: str, value: str) ->
     return False
 
 
-def _collect_suggestions(attrib: dict[str, str], value: str) -> list[SelectorSuggestion]:
+def _collect_suggestions(attrib: dict[str, str], value: str, platform: str = "android") -> list[SelectorSuggestion]:
     """Rank alternative locators for a node that relates to ``value``."""
     out: list[SelectorSuggestion] = []
+    pf = (platform or "android").lower().replace("-", "_")
+    is_ios = pf in ("ios", "ios_sim")
+
     rid = (attrib.get("resource-id") or "").strip()
     if rid:
         out.append(SelectorSuggestion("id", rid, 92, "resource-id"))
@@ -103,6 +148,34 @@ def _collect_suggestions(attrib: dict[str, str], value: str) -> list[SelectorSug
     nm = (attrib.get("name") or "").strip()
     if nm and nm not in {cd, tx, rid}:
         out.append(SelectorSuggestion("accessibilityId", nm, 85, "name"))
+    # iOS: name (accessibility identifier) and label are primary
+    if is_ios:
+        if nm:
+            out.append(SelectorSuggestion("accessibilityId", nm, 90, "name (accessibility id)"))
+            pred = f'name == "{nm}"'
+            out.append(SelectorSuggestion("-ios predicate string", pred, 88, "predicate by name"))
+        lb = (attrib.get("label") or "").strip()
+        if lb:
+            out.append(SelectorSuggestion("accessibilityId", lb, 75 if len(lb) > 35 else 82, "label"))
+            if nm:
+                out.append(
+                    SelectorSuggestion(
+                        "-ios predicate string",
+                        f'name == "{nm}" AND label CONTAINS "{lb[:32]}"',
+                        80,
+                        "predicate name+label",
+                    )
+                )
+        typ = (attrib.get("type") or "").strip()
+        if typ and nm:
+            out.append(
+                SelectorSuggestion(
+                    "-ios class chain",
+                    f"**/{typ}[`name == '{nm}'`]",
+                    72,
+                    "class chain",
+                )
+            )
     # Dedupe by (strategy, value), keep best score
     best: dict[tuple[str, str], SelectorSuggestion] = {}
     for sug in out:
@@ -149,6 +222,7 @@ def diagnose_tap_failure(
     step_index: int,
     all_steps: list[dict[str, Any]],
     step_results: list[dict[str, Any]],
+    platform: str = "android",
 ) -> TapDiagnosis:
     """
     Inspect XML and the failing locator to infer root cause and suggest locators.
@@ -249,7 +323,7 @@ def diagnose_tap_failure(
         else:
             root_cause = RC_WRONG_SCREEN
             root_detail = "Locator matched an element; failure may be wrong screen/state or strict visibility."
-        suggestions = _collect_suggestions(ch.attrib, value)[:5]
+        suggestions = _collect_suggestions(ch.attrib, value, platform)[:5]
     elif fuzzy_nodes:
         found = True
         root_cause = RC_WRONG_SELECTOR
@@ -260,7 +334,7 @@ def diagnose_tap_failure(
             f"Nothing matched {strategy}='{value}', but similar text/id appears elsewhere in the tree. "
             "Try a different locator attribute."
         )
-        suggestions = _collect_suggestions(pick.attrib, value)[:5]
+        suggestions = _collect_suggestions(pick.attrib, value, platform)[:5]
         if overlayish:
             root_cause = RC_OVERLAY
             root_detail += " An overlay/dialog may also be present."

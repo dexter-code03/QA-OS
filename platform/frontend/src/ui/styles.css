@@ -92,7 +92,9 @@ body {
   background: var(--bg3); border: 1px solid var(--border2);
   border-radius: 6px; padding: 6px 12px; color: var(--text);
   font-family: var(--mono); font-size: 12px; cursor: pointer;
+  transition: border-color .12s;
 }
+.project-sel:hover { border-color: var(--accent); }
 .status-pill {
   background: rgba(0,229,160,.1); border: 1px solid rgba(0,229,160,.3);
   color: var(--accent); padding: 4px 10px; border-radius: 20px;
@@ -402,6 +404,7 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
   gap: 10px; align-items: start; cursor: pointer;
 }
 .step-item:last-child { border-bottom: none; }
+.step-item:hover { background: rgba(255,255,255,.02); }
 .step-item.running { background: rgba(0,229,160,.04); }
 .step-item.fail { background: rgba(255,59,92,.04); }
 .step-num { font-size: 10px; color: var(--muted); margin-top: 1px; }
@@ -507,12 +510,14 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
   font-family: var(--mono); border-radius: 8px 8px 0 0;
   background: var(--bg3); color: var(--muted); transition: all .12s;
 }
+.report-tab:not(.active):hover { color: var(--text); background: rgba(255,255,255,.04); }
 .report-tab.active { background: var(--bg2); color: var(--accent); border-bottom: 2px solid var(--accent); }
 
 .report-metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 20px; }
 @media (max-width: 900px) { .report-metrics { grid-template-columns: repeat(3, 1fr); } }
-.metric-card { text-align: center; padding: 14px 8px; background: var(--bg3); border-radius: 8px; border: 1px solid var(--border); }
-.metric-val { font-size: 26px; font-family: var(--sans); font-weight: 700; }
+.report-metrics .metric-card { text-align: center; padding: 14px 8px; background: var(--bg3); border-radius: 8px; border: 1px solid var(--border); }
+.report-metrics .metric-card::before { display: none; }
+.report-metrics .metric-val { font-size: 26px; }
 .metric-lbl { font-size: 10px; text-transform: uppercase; color: var(--muted); margin-top: 4px; letter-spacing: .5px; }
 
 /* Health list rows */
@@ -548,7 +553,7 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
 }
 .step-row--failed { background: rgba(255,59,92,.06); border-radius: 6px; padding: 8px 6px; margin: 2px 0; }
 .step-row--skipped { opacity: .4; }
-.step-num { font-weight: 600; text-align: right; color: var(--muted); font-size: 10px; }
+.step-row .step-num { font-weight: 600; text-align: right; }
 .step-dot { width: 10px; height: 10px; border-radius: 50%; }
 .step-selector { font-family: var(--mono); font-size: 10px; color: #93a3b8; }
 .step-dur { font-size: 10px; color: var(--muted); min-width: 40px; text-align: right; }

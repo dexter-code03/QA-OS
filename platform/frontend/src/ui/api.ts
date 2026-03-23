@@ -26,6 +26,7 @@ export type Run = {
   project_id: number;
   build_id: number | null;
   test_id: number | null;
+  batch_run_id?: number | null;
   status: string;
   platform: "android" | "ios_sim";
   device_target: string;
@@ -34,6 +35,32 @@ export type Run = {
   error_message: string | null;
   summary: Record<string, unknown>;
   artifacts: Record<string, unknown>;
+};
+export type BatchRunChild = {
+  run_id: number;
+  test_id: number;
+  test_name: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
+};
+export type BatchRun = {
+  id: number;
+  project_id: number;
+  mode: "suite" | "collection";
+  source_id: number;
+  source_name: string;
+  platform: string;
+  status: string;
+  total: number;
+  passed: number;
+  failed: number;
+  build_id: number | null;
+  device_target: string;
+  started_at: string | null;
+  finished_at: string | null;
+  children: BatchRunChild[];
 };
 export type DeviceList = {
   android: Array<Record<string, string>>;
@@ -231,6 +258,8 @@ export const api = {
     if (!res.ok) throw new Error(await res.text());
     return (await res.json()) as Build;
   },
+  deleteBuild: (buildId: number) =>
+    http<{ ok: boolean }>(`/api/builds/${buildId}`, { method: "DELETE" }),
 
   // Tests
   listTests: (projectId: number) => http<TestDef[]>(`/api/projects/${projectId}/tests`),
@@ -322,13 +351,19 @@ export const api = {
 
   getReportsHierarchy: (projectId: number) => http<any>(`/api/projects/${projectId}/reports/hierarchy`),
 
-  importZip: async (projectId: number, platform: string, file: File, opts?: UploadProgressOpts) => {
-    const url = `/api/projects/${projectId}/import/zip?platform=${encodeURIComponent(platform)}`;
+  importZip: async (projectId: number, platform: string, file: File, opts?: UploadProgressOpts & { folderId?: number | null; buildIds?: number[] }) => {
+    let url = `/api/projects/${projectId}/import/zip?platform=${encodeURIComponent(platform)}`;
+    if (opts?.folderId) url += `&folder_id=${opts.folderId}`;
+    if (opts?.buildIds?.length) url += `&build_ids=${opts.buildIds.join(",")}`;
     return xhrPostFormDataJson<{
       groups: Record<string, any[]>;
       total_cases: number;
       total_files: number;
       warnings: string[];
+      grounding: string;
+      object_repo_count: number;
+      collections: Record<string, string[]>;
+      katalon_detected: boolean;
       files: { path: string; cases_count: number; status: string }[];
     }>(url, () => {
       const fd = new FormData();
@@ -339,9 +374,9 @@ export const api = {
 
   confirmZipImport: (
     projectId: number,
-    payload: { suite_map?: Record<string, number>; module_id?: number; test_cases: any[]; platform: string },
+    payload: { suite_map?: Record<string, number>; module_id?: number; test_cases: any[]; platform: string; collections?: Record<string, string[]> },
   ) =>
-    http<{ created: number; created_suites: string[]; tests: any[] }>(
+    http<{ created: number; created_suites: string[]; created_modules?: string[]; tests: any[] }>(
       `/api/projects/${projectId}/import/zip/confirm`,
       { method: "POST", body: JSON.stringify(payload) },
     ),
@@ -350,18 +385,24 @@ export const api = {
     projectId: number,
     platform: string,
     files: File[] | FileList,
-    opts?: UploadProgressOpts,
+    opts?: UploadProgressOpts & { folderId?: number | null; buildIds?: number[] },
   ) => {
     const list = Array.isArray(files) ? files : Array.from(files);
     if (!list.length) {
       throw new Error("No files to upload — folder picker returned empty (try Browse folder again).");
     }
-    const url = `/api/projects/${projectId}/import/folder?platform=${encodeURIComponent(platform)}`;
+    let url = `/api/projects/${projectId}/import/folder?platform=${encodeURIComponent(platform)}`;
+    if (opts?.folderId) url += `&folder_id=${opts.folderId}`;
+    if (opts?.buildIds?.length) url += `&build_ids=${opts.buildIds.join(",")}`;
     return xhrPostFormDataJson<{
       groups: Record<string, any[]>;
       total_cases: number;
       total_files: number;
       warnings: string[];
+      grounding: string;
+      object_repo_count: number;
+      collections: Record<string, string[]>;
+      katalon_detected: boolean;
       files: { path: string; cases_count: number; status: string }[];
     }>(
       url,
@@ -405,6 +446,19 @@ export const api = {
     a.download = `${safe}_katalon.zip`;
     a.click();
   },
+
+  // Batch Runs
+  createBatchRun: (payload: {
+    project_id: number;
+    build_id?: number | null;
+    mode: "suite" | "collection";
+    source_id: number;
+    platform: Run["platform"];
+    device_target?: string;
+  }) => http<BatchRun>("/api/batch-runs", { method: "POST", body: JSON.stringify(payload) }),
+  getBatchRun: (batchId: number) => http<BatchRun>(`/api/batch-runs/${batchId}`),
+  listBatchRuns: (projectId: number) => http<BatchRun[]>(`/api/projects/${projectId}/batch-runs`),
+  cancelBatchRun: (batchId: number) => http<{ ok: boolean; message?: string }>(`/api/batch-runs/${batchId}/cancel`, { method: "POST" }),
 
   // Runs
   listRuns: (projectId: number) => http<Run[]>(`/api/projects/${projectId}/runs`),
@@ -738,6 +792,8 @@ export interface ScreenEntry {
   notes: string | null;
   auto_captured: boolean;
   xml_length: number;
+  /** android: compose | native; ios: native; omitted on older rows */
+  screen_type?: string | null;
   stale?: boolean;
   /** True when this was the first capture in an empty folder — backend uninstalled + reinstalled the build */
   fresh_install?: boolean;

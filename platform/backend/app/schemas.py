@@ -100,6 +100,7 @@ class RunOut(BaseModel):
     project_id: int
     build_id: Optional[int]
     test_id: Optional[int]
+    batch_run_id: Optional[int] = None
     status: str
     platform: str
     device_target: str
@@ -108,3 +109,40 @@ class RunOut(BaseModel):
     error_message: Optional[str]
     summary: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, Any] = Field(default_factory=dict)
+
+
+# ── Batch Run ─────────────────────────────────────────────────────────
+
+class BatchRunCreate(BaseModel):
+    project_id: int
+    build_id: Optional[int] = None
+    mode: str  # suite|collection
+    source_id: int  # suite_id or module_id
+    platform: str
+    device_target: str = ""
+
+class BatchRunChildOut(BaseModel):
+    run_id: int
+    test_id: int
+    test_name: str
+    status: str
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+class BatchRunOut(BaseModel):
+    id: int
+    project_id: int
+    mode: str
+    source_id: int
+    source_name: str
+    platform: str
+    status: str
+    total: int
+    passed: int
+    failed: int
+    build_id: Optional[int] = None
+    device_target: str = ""
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    children: list[BatchRunChildOut] = Field(default_factory=list)
