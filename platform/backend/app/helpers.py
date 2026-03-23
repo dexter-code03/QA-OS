@@ -12,10 +12,8 @@ from typing import Any, Optional
 from fastapi import HTTPException, Request, WebSocket
 
 from .compose_detection import is_compose_screen
-from .db import SessionLocal
 from .models import (
     BatchRun,
-    Build,
     Run,
     ScreenLibrary,
     TestDefinition,
@@ -235,28 +233,6 @@ def batch_to_out(b: BatchRun, db) -> BatchRunOut:
     )
 
 
-def update_batch_counters(db, batch_id: int) -> None:
-    """Recount child statuses and update the batch row."""
-    batch = db.query(BatchRun).filter(BatchRun.id == batch_id).first()
-    if not batch:
-        return
-    children = db.query(Run).filter(Run.batch_run_id == batch_id).all()
-    passed = sum(1 for c in children if c.status == "passed")
-    failed = sum(1 for c in children if c.status in ("failed", "error"))
-    done = passed + failed + sum(1 for c in children if c.status == "cancelled")
-    batch.passed = passed
-    batch.failed = failed
-    if done >= batch.total:
-        batch.finished_at = datetime.utcnow()
-        if failed == 0 and passed == batch.total:
-            batch.status = "passed"
-        elif passed == 0 and failed == batch.total:
-            batch.status = "failed"
-        else:
-            batch.status = "partial"
-    elif any(c.status == "running" for c in children):
-        batch.status = "running"
-    db.commit()
 
 
 # ── Failure classification ────────────────────────────────────────────

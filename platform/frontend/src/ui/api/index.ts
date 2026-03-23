@@ -1,95 +1,51 @@
-export type Project = { id: number; name: string; created_at: string };
-export type ModuleDef = { id: number; project_id: number; name: string; created_at: string };
-export type SuiteDef = { id: number; module_id: number; name: string; created_at: string };
-export type Build = {
-  id: number;
-  project_id: number;
-  platform: "android" | "ios_sim";
-  file_name: string;
-  created_at: string;
-  metadata: Record<string, unknown>;
-};
-export type TestDef = {
-  id: number;
-  project_id: number;
-  suite_id: number | null;
-  prerequisite_test_id?: number | null;
-  name: string;
-  steps: Array<Record<string, unknown>>;
-  platform_steps?: { android?: Array<Record<string, unknown>>; ios_sim?: Array<Record<string, unknown>> };
-  acceptance_criteria?: string | null;
-  fix_history?: Array<Record<string, unknown>>;
-  created_at: string;
-};
-export type Run = {
-  id: number;
-  project_id: number;
-  build_id: number | null;
-  test_id: number | null;
-  batch_run_id?: number | null;
-  status: string;
-  platform: "android" | "ios_sim";
-  device_target: string;
-  started_at: string | null;
-  finished_at: string | null;
-  error_message: string | null;
-  summary: Record<string, unknown>;
-  artifacts: Record<string, unknown>;
-};
-export type BatchRunChild = {
-  run_id: number;
-  test_id: number;
-  test_name: string;
-  status: string;
-  started_at: string | null;
-  finished_at: string | null;
-  error_message: string | null;
-};
-export type BatchRun = {
-  id: number;
-  project_id: number;
-  mode: "suite" | "collection";
-  source_id: number;
-  source_name: string;
-  platform: string;
-  status: string;
-  total: number;
-  passed: number;
-  failed: number;
-  build_id: number | null;
-  device_target: string;
-  started_at: string | null;
-  finished_at: string | null;
-  children: BatchRunChild[];
-};
-export type DeviceList = {
-  android: Array<Record<string, string>>;
-  ios_simulators: Array<{ udid: string; name: string; state: string; runtime: string }>;
-};
+export type {
+  Project,
+  ModuleDef,
+  SuiteDef,
+  Build,
+  TestDef,
+  Run,
+  BatchRunChild,
+  BatchRun,
+  DeviceList,
+  TapDiagnosisOut,
+  AiFixResponse,
+  UploadProgressOpts,
+  TestHealthRow,
+  SuiteHealthResponse,
+  SuiteTrendItem,
+  StepCoverageItem,
+  TriageResponse,
+  CollectionHealthResponse,
+  BlockerItem,
+  ScreenFolder,
+  ScreenEntry,
+  ScreenEntryFull,
+} from "../types";
 
-export type TapDiagnosisOut = {
-  found: boolean;
-  root_cause: string;
-  root_cause_detail: string;
-  is_clickable: boolean;
-  is_visible: boolean;
-  recommended_wait_ms: number;
-  suggestions: { strategy: string; value: string; score: number; label: string }[];
-};
-
-export type AiFixResponse = {
-  analysis: string;
-  fixed_steps: any[];
-  changes: any[];
-  tap_diagnosis: TapDiagnosisOut | null;
-  failure_diagnosis?: {
-    cause?: string;
-    evidence?: string[];
-    recommended_fix?: string | null;
-    recommended_strategy?: string | null;
-    recommended_value?: string | null;
-  } | null;
-};
+import type {
+  Project,
+  ModuleDef,
+  SuiteDef,
+  Build,
+  TestDef,
+  Run,
+  BatchRunChild,
+  BatchRun,
+  DeviceList,
+  TapDiagnosisOut,
+  AiFixResponse,
+  UploadProgressOpts,
+  SuiteHealthResponse,
+  SuiteTrendItem,
+  StepCoverageItem,
+  TriageResponse,
+  CollectionHealthResponse,
+  BlockerItem,
+  ScreenFolder,
+  ScreenEntry,
+  ScreenEntryFull,
+} from "../types";
 
 let authBootstrapped = false;
 let authBootstrapPromise: Promise<string> | null = null;
@@ -111,8 +67,6 @@ async function bootstrapAuth(force = false): Promise<string> {
 
   return authBootstrapPromise;
 }
-
-export type UploadProgressOpts = { onUploadProgress?: (pct: number | null) => void };
 
 function errorFromResponseText(raw: string, status: number): Error {
   try {
@@ -634,7 +588,6 @@ export const api = {
     name: string;
     platform: string;
     notes?: string;
-    /** Android serial or iOS simulator UDID — must match the device you are looking at */
     device_target?: string;
   }) => http<ScreenEntry>("/api/screens/capture", { method: "POST", body: JSON.stringify(body) }),
   listScreens: (projectId: number, opts?: { buildId?: number | null; folderId?: number | null; platform?: string }) => {
@@ -677,130 +630,3 @@ export const api = {
     window.open(`/api/collections/${collectionId}/export/html?days=${days}&platform=${encodeURIComponent(platform)}`, "_blank");
   },
 };
-
-// ── Report types ──────────────────────────────────────
-
-export interface TestHealthRow {
-  id: number;
-  name: string;
-  status: "passing" | "failing" | "flaky" | "not_run";
-  acceptance_criteria: string;
-  steps_ran: number;
-  steps_total: number;
-  platform: string;
-  pass_rate_pct: number;
-  fail_streak: number;
-  last_passed_at: string | null;
-  ai_fixes_count: number;
-  run_history: { id: number; status: string; platform: string }[];
-  last_failed_run: {
-    id: number;
-    error_message: string | null;
-    failure_category: string;
-    step_results: {
-      index: number;
-      type: string;
-      selector: any;
-      status: string;
-      duration_ms: number | null;
-      error: string | null;
-      screenshot: string | null;
-    }[];
-    ai_fix: { analysis: string; fixed_steps: any[]; changes: any[] } | null;
-    platform: string;
-    started_at: string | null;
-  } | null;
-}
-
-export interface SuiteHealthResponse {
-  suite: { id: number; name: string; module_name: string; last_run_at: string | null; pass_rate: number };
-  metrics: { total: number; passing: number; failing: number; flaky: number; never_run: number; avg_steps_pct: number };
-  tests: TestHealthRow[];
-}
-
-export interface SuiteTrendItem {
-  test_case_id: number;
-  test_name: string;
-  pass_count: number;
-  total_runs: number;
-  pass_rate_pct: number;
-}
-
-export interface StepCoverageItem {
-  test_case_id: number;
-  test_name: string;
-  avg_steps_ran: number;
-  avg_steps_total: number;
-  coverage_pct: number;
-}
-
-export interface TriageResponse {
-  categories: {
-    category: string;
-    count: number;
-    pct: number;
-    affected_tests: { id: number; name: string; error_message: string }[];
-  }[];
-  total_failures: number;
-}
-
-export interface CollectionHealthResponse {
-  collection: { id: number; name: string; pass_rate: number; verdict: string };
-  metrics: { total: number; passing: number; failing: number; blockers: number; flaky: number; never_run: number };
-  suites: {
-    id: number;
-    name: string;
-    pass_rate_pct: number;
-    pass_count: number;
-    fail_count: number;
-    blocker_count: number;
-    last_run_at: string | null;
-    total: number;
-  }[];
-  trend_30d: { date: string; pass_rate_pct: number }[];
-}
-
-export interface BlockerItem {
-  test_id: number;
-  test_name: string;
-  suite_name: string;
-  error_message: string;
-  fail_streak: number;
-  run_id: number;
-  screenshot_path: string | null;
-  ai_fix_available: boolean;
-}
-
-export interface ScreenFolder {
-  id: number;
-  project_id: number;
-  name: string;
-  screen_count: number;
-  created_at: string | null;
-}
-
-export interface ScreenEntry {
-  id: number;
-  project_id: number;
-  build_id: number | null;
-  folder_id: number | null;
-  name: string;
-  platform: string;
-  screenshot_path: string | null;
-  captured_at: string | null;
-  captured_by: string | null;
-  notes: string | null;
-  auto_captured: boolean;
-  xml_length: number;
-  /** android: compose | native; ios: native; omitted on older rows */
-  screen_type?: string | null;
-  stale?: boolean;
-  /** True when this was the first capture in an empty folder — backend uninstalled + reinstalled the build */
-  fresh_install?: boolean;
-  /** True when you selected a different build than existing screens in this folder — old app(s) removed and new build installed */
-  build_changed?: boolean;
-}
-
-export interface ScreenEntryFull extends ScreenEntry {
-  xml_snapshot: string;
-}

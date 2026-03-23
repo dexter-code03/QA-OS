@@ -42,8 +42,6 @@ from ..parser.zip_importer import (
     _normalize_katalon_path,
     _tc_id_from_groovy_path,
 )
-from ..schemas import TestOut  # noqa: F401
-from ..settings import ensure_dirs, settings  # noqa: F401
 
 router = APIRouter()
 

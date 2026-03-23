@@ -18,7 +18,6 @@ from ..helpers import (
     gemini_extract_text,
     ios_selector_generation_rules,
     load_settings,
-    test_out,
 )
 from ..models import Build, Project, ScreenLibrary, TestDefinition, TestSuite
 from ..runner.ai_fix_diagnosis import (
@@ -28,7 +27,6 @@ from ..runner.ai_fix_diagnosis import (
     parse_android_package,
 )
 from ..runner.tap_debugger import diagnose_tap_failure
-from ..schemas import TestOut
 from ..settings import settings
 from ..swiftui_detection import is_swiftui_screen
 
@@ -179,7 +177,8 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
         if payload.page_source_xml:
             user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gemini_headers = {"x-goog-api-key": api_key}
     parts: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
     for img_name, img_b64 in screen_images[:6]:
         parts.append({"text": f"\n[Screenshot: {img_name}]"})
@@ -192,7 +191,7 @@ async def generate_steps(payload: GenerateStepsRequest) -> dict[str, Any]:
     screens_used = len(screen_images) if grounded else 0
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, headers=gemini_headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
@@ -328,7 +327,8 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
         if payload.page_source_xml:
             user_msg += f"\n\nCurrent page source XML:\n{payload.page_source_xml[:8000]}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gemini_headers = {"x-goog-api-key": api_key}
     parts_list: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
     for img_name, img_b64 in screen_images[:6]:
         parts_list.append({"text": f"\n[Screenshot: {img_name}]"})
@@ -340,7 +340,7 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, headers=gemini_headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
@@ -625,7 +625,8 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
     if payload.page_source_xml:
         user_msg += f"\n=== PAGE SOURCE XML (current screen) ===\n{payload.page_source_xml[:12000]}\n"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gemini_headers = {"x-goog-api-key": api_key}
 
     parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
     if payload.screenshot_base64:
@@ -641,7 +642,7 @@ async def fix_steps(payload: FixStepsRequest) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, headers=gemini_headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
@@ -798,7 +799,8 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
     if payload.page_source_xml:
         user_msg += f"=== PAGE SOURCE XML ===\n{payload.page_source_xml[:12000]}\n"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gemini_headers = {"x-goog-api-key": api_key}
     parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
     if payload.screenshot_base64:
         raw = payload.screenshot_base64
@@ -810,7 +812,7 @@ async def refine_fix(payload: RefineFixRequest) -> dict[str, Any]:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, headers=gemini_headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()
@@ -871,14 +873,15 @@ async def edit_steps(payload: EditStepsRequest) -> dict[str, Any]:
         f"=== INSTRUCTION ===\n{payload.instruction}"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    gemini_headers = {"x-goog-api-key": api_key}
     body = {
         "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_msg}"}]}],
         "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
     }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=body)
+            resp = await client.post(url, json=body, headers=gemini_headers)
             if resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
             data = resp.json()

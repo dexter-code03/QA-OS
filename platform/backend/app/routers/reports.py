@@ -9,10 +9,8 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from ..db import SessionLocal, _classify_error
-from ..helpers import classify_failure_message  # noqa: F401
 from ..helpers import steps_for_platform_record as _steps_for_platform_record
 from ..models import (
-    BatchRun,  # noqa: F401
     Build,
     Module,
     Project,
