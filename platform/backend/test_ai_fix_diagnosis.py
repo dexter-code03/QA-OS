@@ -75,5 +75,7 @@ def test_stale_strategy_mismatch():
 def test_ios_unknown():
     step = {"type": "tap", "selector": {"using": "id", "value": "foo"}}
     d = classify_failure_for_ai_fix(step, "", "<hierarchy/>", "", "ios_sim", None, None)
-    assert d["cause"] == "UNKNOWN"
-    assert any("iOS" in e for e in d["evidence"])
+    # Element "foo" is not in the empty hierarchy, so classification is ELEMENT_NOT_IN_XML
+    assert d["cause"] == "ELEMENT_NOT_IN_XML"
+    assert any("selector" in e.lower() or "element" in e.lower() for e in d["evidence"])
+

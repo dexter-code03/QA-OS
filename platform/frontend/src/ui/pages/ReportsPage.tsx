@@ -93,7 +93,7 @@ export function ReportsPage({ project, runs, tests, modules, suites, onRefresh }
         <React.Fragment key={t.id}>
           <div className="health-row" onClick={() => setExpandedId(expandedId === t.id ? null : t.id)}>
             <div style={{ width: 12, height: 12, borderRadius: "50%", background: statusColor(t.status) }} />
-            <div className="h-name">{t.name}</div>
+            <div className="h-name" title={t.name}>{t.name}</div>
             <div className="h-steps" style={{ color: t.steps_total > 0 && t.steps_ran / t.steps_total < 0.5 ? "var(--danger)" : "var(--text)" }}>{t.steps_ran} of {t.steps_total} steps</div>
             <div className="h-platform" style={{ color: t.platform === "both" ? "var(--text)" : "var(--warn)" }}>{t.platform === "both" ? "Both" : t.platform === "ios_sim" ? "iOS" : "Android"}</div>
             <div className="run-strip">
@@ -105,6 +105,9 @@ export function ReportsPage({ project, runs, tests, modules, suites, onRefresh }
             <div className="health-expanded">
               {t.acceptance_criteria && <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>{t.acceptance_criteria}</div>}
               <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 12, fontSize: 11, color: "var(--muted)" }}>
+                {t.latest_run && (
+                  <span>Latest run: <strong style={{ color: t.latest_run.status === "passed" ? "var(--accent)" : t.latest_run.status === "failed" ? "var(--danger)" : "var(--text)" }}>#{t.latest_run.id} {t.latest_run.status.toUpperCase()}</strong></span>
+                )}
                 <span>Fail streak: <strong style={{ color: t.fail_streak > 0 ? "var(--danger)" : "var(--text)" }}>{t.fail_streak}</strong></span>
                 <span>Last passed: {t.last_passed_at ? new Date(t.last_passed_at).toLocaleDateString() : "Never"}</span>
                 <span>AI fixes used: {t.ai_fixes_count}</span>
@@ -112,11 +115,14 @@ export function ReportsPage({ project, runs, tests, modules, suites, onRefresh }
               {t.last_failed_run && (
                 <>
                   <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: "var(--muted)" }}>
-                    {t.steps_ran} of {t.steps_total} steps executed — {t.steps_ran < t.steps_total
-                      ? `test stopped at step ${t.steps_ran + 1}`
-                      : t.last_failed_run.step_results.some(sr => sr.status === "failed")
-                        ? `failed at step ${(t.last_failed_run.step_results.findIndex(sr => sr.status === "failed") + 1)}`
-                        : "all steps passed"}
+                    {t.latest_run && t.latest_run.status === "passed" && t.latest_run.id !== t.last_failed_run.id
+                      ? <span style={{ color: "var(--accent)" }}>Latest run passed. Last failure details below (Run #{t.last_failed_run.id}):</span>
+                      : <>{t.steps_ran} of {t.steps_total} steps executed — {t.steps_ran < t.steps_total
+                        ? `test stopped at step ${t.steps_ran + 1}`
+                        : t.last_failed_run.step_results.some(sr => sr.status === "failed")
+                          ? `failed at step ${(t.last_failed_run.step_results.findIndex(sr => sr.status === "failed") + 1)}`
+                          : "all steps passed"}</>
+                    }
                   </div>
                   {t.last_failed_run.step_results.map(sr => {
                     const isFailed = sr.status === "failed";
@@ -168,9 +174,9 @@ export function ReportsPage({ project, runs, tests, modules, suites, onRefresh }
         <div className="chart-title">Pass Rate by Test Case ({days}d)</div>
         {trendData && trendData.length > 0 ? (
           <ResponsiveContainer width="100%" height={Math.max(200, trendData.length * 32)}>
-            <BarChart data={trendData} layout="vertical" margin={{ left: 120, right: 20 }}>
+            <BarChart data={trendData} layout="vertical" margin={{ left: 160, right: 20 }}>
               <XAxis type="number" domain={[0, 100]} tickFormatter={v => `${v}%`} stroke="#555" fontSize={10} />
-              <YAxis type="category" dataKey="test_name" width={110} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 18 ? v.slice(0, 16) + "…" : v} />
+              <YAxis type="category" dataKey="test_name" width={150} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 32 ? v.slice(0, 30) + "…" : v} />
               <Tooltip formatter={(v: any) => `${v}%`} contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} />
               <Bar dataKey="pass_rate_pct" radius={[0, 4, 4, 0]}>
                 {trendData.map((d, i) => <Cell key={i} fill={d.pass_rate_pct >= 80 ? "#00e5a0" : d.pass_rate_pct >= 50 ? "#ffb020" : "#ff3b5c"} />)}
@@ -185,9 +191,9 @@ export function ReportsPage({ project, runs, tests, modules, suites, onRefresh }
         <div className="chart-title">Steps Executed vs Skipped</div>
         {stepCov && stepCov.length > 0 ? (
           <ResponsiveContainer width="100%" height={Math.max(200, stepCov.length * 32)}>
-            <BarChart data={stepCov.map(s => ({ ...s, skipped: Math.max(0, s.avg_steps_total - s.avg_steps_ran) }))} layout="vertical" margin={{ left: 120, right: 20 }}>
+            <BarChart data={stepCov.map(s => ({ ...s, skipped: Math.max(0, s.avg_steps_total - s.avg_steps_ran) }))} layout="vertical" margin={{ left: 160, right: 20 }}>
               <XAxis type="number" stroke="#555" fontSize={10} />
-              <YAxis type="category" dataKey="test_name" width={110} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 18 ? v.slice(0, 16) + "…" : v} />
+              <YAxis type="category" dataKey="test_name" width={150} tick={{ fontSize: 10, fill: "#8a8f98" }} tickFormatter={v => v.length > 32 ? v.slice(0, 30) + "…" : v} />
               <Tooltip contentStyle={{ background: "#131920", border: "1px solid #1e2430", fontSize: 11 }} />
               <Bar dataKey="avg_steps_ran" stackId="a" fill="#00e5a0" name="Ran" radius={[0, 0, 0, 0]} />
               <Bar dataKey="skipped" stackId="a" fill="#555" name="Skipped" radius={[0, 4, 4, 0]} />

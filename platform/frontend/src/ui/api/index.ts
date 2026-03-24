@@ -20,6 +20,7 @@ export type {
   BlockerItem,
   DataFolder,
   DataSet,
+  ManualTestCase,
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
@@ -46,6 +47,7 @@ import type {
   BlockerItem,
   DataFolder,
   DataSet,
+  ManualTestCase,
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
@@ -476,8 +478,9 @@ export const api = {
     pageSourceXml?: string,
     folderId?: number | null,
     buildIds?: number[],
+    manualTests?: ManualTestCase[],
   ) =>
-    http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[] }>("/api/ai/generate-suite", {
+    http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[]; data_set_id?: number | null }>("/api/ai/generate-suite", {
       method: "POST",
       body: JSON.stringify({
         platform,
@@ -487,6 +490,7 @@ export const api = {
         page_source_xml: pageSourceXml || "",
         ...(folderId ? { folder_id: folderId } : {}),
         ...(buildIds && buildIds.length > 0 ? { build_ids: buildIds } : {}),
+        ...(manualTests && manualTests.length > 0 ? { manual_tests: manualTests } : {}),
       }),
     }),
   editSteps: (platform: string, currentSteps: any[], instruction: string) =>
@@ -505,7 +509,6 @@ export const api = {
     failed_step_index: number;
     error_message: string;
     page_source_xml: string;
-    /** Raw Appium page source for server tap diagnosis (strict XML). */
     page_source_xml_raw?: string;
     test_name: string;
     screenshot_base64: string;
@@ -513,6 +516,9 @@ export const api = {
     acceptance_criteria?: string;
     app_context?: string;
     target_platform?: string;
+    data_context?: Record<string, string>;
+    data_set_id?: number | null;
+    template_steps?: any[];
   }) =>
     http<AiFixResponse>("/api/ai/fix-steps", {
       method: "POST",

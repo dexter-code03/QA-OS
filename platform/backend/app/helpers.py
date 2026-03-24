@@ -343,7 +343,7 @@ def android_selector_generation_rules(screens: list[ScreenLibrary]) -> str:
             lines.append(
                 f'  • "{s.name}" [compose]: NEVER use selector.using "id". '
                 'ALWAYS use "-android uiautomator" with UiSelector Java, e.g. '
-                'new UiSelector().resourceId("com.package:id/element"), or .descriptionContains("..."), .textContains("...") '
+                'new UiSelector().resourceId("<exact resource-id from XML>"), or .descriptionContains("..."), .textContains("...") '
                 "when resource-id is absent."
             )
         else:

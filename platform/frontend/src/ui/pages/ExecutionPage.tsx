@@ -391,6 +391,10 @@ export function ExecutionPage({
       const metaAgent = (buildInfoAgent?.metadata || {}) as any;
       const appContextAgent = [metaAgent.display_name, metaAgent.package].filter(Boolean).join(" · ") || undefined;
       try {
+        const agentSummary = completed.summary as any;
+        const agentTemplateSteps = agentSummary?.templateSteps || [];
+        const agentDataContext = agentSummary?.dataContext || {};
+
         const fixRes = await api.fixSteps({
           platform,
           target_platform: completed.platform,
@@ -405,6 +409,9 @@ export function ExecutionPage({
           already_tried_fixes: [...(targetTest.fix_history || []), ...lastFailedFix],
           acceptance_criteria: targetTest.acceptance_criteria || "",
           app_context: appContextAgent,
+          ...(agentTemplateSteps.length > 0 ? { template_steps: agentTemplateSteps } : {}),
+          ...(Object.keys(agentDataContext).length > 0 ? { data_context: agentDataContext } : {}),
+          ...(completed.data_set_id ? { data_set_id: completed.data_set_id } : {}),
         });
         if (fixRes.tap_diagnosis) {
           const d = fixRes.tap_diagnosis;
@@ -450,6 +457,12 @@ export function ExecutionPage({
     const toRun: TestDef[] = runMode === "single" ? (testId ? tests.filter(t => t.id === testId) : []) : batchTests;
     if (toRun.length === 0) { toast(runMode === "single" ? "Select a test" : runMode === "suite" ? "Select a suite" : "Select a collection", "error"); return; }
     if (!buildId) { toast("Select a build", "error"); return; }
+    const noStepTests = toRun.filter(t => stepsForPlatform(t, platform).length === 0);
+    if (noStepTests.length > 0) {
+      const names = noStepTests.slice(0, 3).map(t => t.name).join(", ");
+      toast(`No ${platform === "ios_sim" ? "iOS" : "Android"} steps for: ${names}${noStepTests.length > 3 ? ` (+${noStepTests.length - 3} more)` : ""}. Generate steps for this platform first.`, "error");
+      return;
+    }
     setBusy(true);
     try {
       if (agentMode) {
@@ -505,7 +518,7 @@ export function ExecutionPage({
 
   // AI Fix state
   const [fixBusy, setFixBusy] = useState(false);
-  const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[] } | null>(null);
+  const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[]; fix_type?: string; data_fixes?: Record<string, string>; data_set_updated?: boolean } | null>(null);
   const [tapDiagnosis, setTapDiagnosis] = useState<TapDiagnosisOut | null>(null);
   const [showFixPanel, setShowFixPanel] = useState(false);
   const [fixSuggestion, setFixSuggestion] = useState("");
@@ -653,6 +666,10 @@ export function ExecutionPage({
     const appContext = [meta.display_name, meta.package].filter(Boolean).join(" · ") || undefined;
 
     try {
+      const summary = displayRun.summary as any;
+      const templateSteps = summary?.templateSteps || [];
+      const dataContext = summary?.dataContext || {};
+
       const res = await api.fixSteps({
         platform: displayRun.platform,
         target_platform: displayRun.platform,
@@ -667,6 +684,9 @@ export function ExecutionPage({
         already_tried_fixes: targetTest.fix_history || [],
         acceptance_criteria: targetTest.acceptance_criteria || "",
         app_context: appContext,
+        ...(templateSteps.length > 0 ? { template_steps: templateSteps } : {}),
+        ...(Object.keys(dataContext).length > 0 ? { data_context: dataContext } : {}),
+        ...(displayRun.data_set_id ? { data_set_id: displayRun.data_set_id } : {}),
       });
       setFixResult(res);
       setTapDiagnosis(res.tap_diagnosis ?? null);
@@ -675,7 +695,11 @@ export function ExecutionPage({
       if (targetTest) {
         void api.getRelatedTests(targetTest.id).then(rel => setRelatedTests(rel)).catch(() => {});
       }
-      toast(`AI found ${res.changes.length} fix${res.changes.length !== 1 ? "es" : ""}`, "success");
+      const fixLabel = res.fix_type === "data" ? "data fix" : res.fix_type === "both" ? "step + data fix" : "step fix";
+      const changeCount = res.changes?.length || 0;
+      let fixMsg = `AI found ${changeCount} ${fixLabel}${changeCount !== 1 ? "es" : ""}`;
+      if (res.data_set_updated) fixMsg += " · DataSet updated";
+      toast(fixMsg, "success");
     } catch (e: any) {
       toast(e.message, "error");
       setShowFixPanel(false);
@@ -891,6 +915,8 @@ ${meta.display_name ? `<div class="label">App Name</div><div class="val">${meta.
 ${meta.package ? `<div class="label">Package</div><div class="val" style="font-family:monospace;font-size:12px;color:#7dd3fc">${meta.package}</div>` : ""}
 ${meta.main_activity ? `<div class="label">Activity</div><div class="val" style="font-family:monospace;font-size:11px;color:#7dd3fc">${meta.main_activity}</div>` : ""}` : `<div class="label">Build</div><div class="val" style="color:#8a8f98">No build attached</div>`}</div>
 </div>
+
+${testForRun.acceptance_criteria ? `<h2>Test Description / Acceptance Criteria</h2><div class="card" style="font-size:13px;line-height:1.8;white-space:pre-wrap">${testForRun.acceptance_criteria.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ""}
 
 <h2>Run Summary</h2>
 <div class="card" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center">
@@ -1335,8 +1361,26 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                         ) : null;
                       })()}
                       <div style={{ flex: 1, minWidth: 0, padding: 12, background: "rgba(99,102,241,.08)", borderRadius: 6, fontSize: 12, lineHeight: 1.7, color: "var(--text)", whiteSpace: "pre-wrap", wordBreak: "break-word", overflowWrap: "anywhere" }}>
-                        <div style={{ fontWeight: 600, marginBottom: 4, color: "#a78bfa", fontFamily: "var(--sans)" }}>Root Cause</div>
+                        <div style={{ display: "flex", gap: 8, alignItems: "center", fontWeight: 600, marginBottom: 4, color: "#a78bfa", fontFamily: "var(--sans)" }}>
+                          Root Cause
+                          {fixResult.fix_type && (
+                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: fixResult.fix_type === "data" ? "rgba(34,197,94,.15)" : fixResult.fix_type === "both" ? "rgba(255,176,32,.15)" : "rgba(99,102,241,.15)", color: fixResult.fix_type === "data" ? "#22c55e" : fixResult.fix_type === "both" ? "#ffb020" : "#818cf8" }}>
+                              {fixResult.fix_type === "data" ? "Data Fix" : fixResult.fix_type === "both" ? "Step + Data Fix" : "Step Fix"}
+                            </span>
+                          )}
+                          {fixResult.data_set_updated && (
+                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: "rgba(34,197,94,.15)", color: "#22c55e" }}>DataSet updated</span>
+                          )}
+                        </div>
                         {fixResult.analysis}
+                        {fixResult.data_fixes && Object.keys(fixResult.data_fixes).length > 0 && (
+                          <div style={{ marginTop: 8, padding: 8, background: "rgba(34,197,94,.08)", borderRadius: 4, fontSize: 11 }}>
+                            <div style={{ fontWeight: 600, marginBottom: 4, color: "#22c55e" }}>Data Fixes Applied</div>
+                            {Object.entries(fixResult.data_fixes).map(([k, v]) => (
+                              <div key={k}><code>${"{" + k + "}"}</code> → <code>{v}</code></div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </div>
 

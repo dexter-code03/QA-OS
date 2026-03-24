@@ -162,6 +162,12 @@ class RunEngine:
             if not r:
                 self.clear_cancel(run_id)
                 return
+            # If already cancelled by batch cancel while queued, skip execution
+            if r.status == "cancelled":
+                self.clear_cancel(run_id)
+                await event_bus.publish(RunEvent(run_id=run_id, type="finished", payload={"status": "cancelled"}))
+                self._sync_batch_counters(run_id)
+                return
             t = db.query(TestDefinition).filter(TestDefinition.id == r.test_id).first() if r.test_id else None
             b = db.query(Build).filter(Build.id == r.build_id).first() if r.build_id else None
             if not t:
@@ -186,10 +192,8 @@ class RunEngine:
         build_meta = b.build_metadata if b else {}
         platform = self._platform_for_run(run_id)
         device_target = self._device_for_run(run_id)
-        raw_steps = self._resolve_steps(run_id)
+        raw_steps, template_steps, data_context = self._resolve_steps(run_id)
 
-        # All blocking Appium/driver work runs in a thread so the event loop stays free
-        # for HTTP requests, WebSocket messages, and other async tasks.
         _result: dict = {}
 
         def _blocking_work() -> None:
@@ -264,6 +268,10 @@ class RunEngine:
                 self.clear_cancel(run_id)
                 verdict = "cancelled" if cancelled else ("passed" if summary.get("failedSteps", 0) == 0 else "failed")
                 summary["stepDefinitions"] = raw_steps
+                if template_steps:
+                    summary["templateSteps"] = template_steps
+                if data_context:
+                    summary["dataContext"] = data_context
 
                 _result["summary"] = summary
                 _result["artifacts"] = artifacts
@@ -330,16 +338,23 @@ class RunEngine:
             return (r.device_target if r else "") or ""
 
     @staticmethod
-    def _resolve_steps(run_id: int) -> list[dict]:
+    def _resolve_steps(run_id: int) -> tuple[list[dict], list[dict], dict[str, str]]:
+        """Return (resolved_steps, template_steps, data_context).
+
+        template_steps are the pre-resolution steps with ${var} references.
+        data_context is the flattened variable dict used for resolution.
+        Both are stored in the run summary so AI Fix can access them.
+        """
+        import copy
         from .variables import build_context, resolve_step
 
         with SessionLocal() as db:
             r = db.query(Run).filter(Run.id == run_id).first()
             if not r or not r.test_id:
-                return []
+                return [], [], {}
             t = db.query(TestDefinition).filter(TestDefinition.id == r.test_id).first()
             if not t:
-                return []
+                return [], [], {}
 
             platform = (r.platform or "android").strip() or "android"
 
@@ -355,7 +370,9 @@ class RunEngine:
                 if prereq:
                     steps = _resolve(prereq) + steps
 
-            # Variable resolution: load bound data set or project default
+            template_steps = copy.deepcopy(steps)
+            data_context: dict[str, str] = {}
+
             ds_vars: dict | None = None
             ds_rows: list[dict] | None = None
             data_set_id = getattr(r, "data_set_id", None)
@@ -384,9 +401,10 @@ class RunEngine:
                     run_id=run_id,
                     platform=platform,
                 )
+                data_context = dict(ctx)
                 steps = [resolve_step(s, ctx) for s in steps]
 
-            return steps
+            return steps, template_steps, data_context
 
 
 run_engine = RunEngine()

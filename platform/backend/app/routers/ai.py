@@ -9,6 +9,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from ..ai_rules import UNIVERSAL_RULES, build_rules_block
 from ..compose_detection import is_compose_screen
 from ..db import SessionLocal
 from ..helpers import (
@@ -147,6 +148,17 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
     if grounded and xml_context:
         android_rules = android_selector_generation_rules(screens_for_prompt) if payload.platform == "android" else ""
         ios_rules = ios_selector_generation_rules(screens_for_prompt) if payload.platform == "ios_sim" else ""
+
+        # Detect screen_type for contextual rule injection
+        _any_xml = "".join(getattr(s, "xml_snapshot", "") or "" for s in screens_for_prompt[:3])
+        if payload.platform == "android" and _any_xml and is_compose_screen(_any_xml):
+            _screen_type = "compose"
+        elif payload.platform == "ios_sim" and _any_xml and is_swiftui_screen(_any_xml):
+            _screen_type = "swiftui"
+        else:
+            _screen_type = "native"
+        rules_block = build_rules_block(payload.prompt, xml_context, payload.platform, _screen_type)
+
         sel_json_key = '{"using":"' + using_choices + '","value":"..."}'
         system_prompt = (
             "You are a mobile QA automation expert generating Appium test steps.\n"
@@ -154,7 +166,10 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
             'Return ONLY valid JSON: {"steps": [{"type": "<step_type>",'
             ' "selector": ' + sel_json_key + ","
-            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}\n\n'
+            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
+            ' "test_data": {"variable_name": "value", ...}}\n'
+            "IMPORTANT: Extract ALL test data (emails, phones, passwords, OTPs, URLs, names, amounts) into the test_data object. "
+            "Use ${variable_name} syntax in step text/expect fields instead of hardcoded values.\n\n"
             "Available step types:\n"
             "  Tapping: tap, doubleTap, longPress, tapByCoordinates (meta.x, meta.y)\n"
             "  Text: type, clear, clearAndType\n"
@@ -164,6 +179,7 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             "  Keyboard: pressKey (text=key), keyboardAction (legacy alias), hideKeyboard\n"
             "  App: launchApp, closeApp, resetApp (text=bundleId/package, optional)\n"
             "  Capture: takeScreenshot, getPageSource\n\n"
+            + rules_block + "\n\n"
             + android_rules
             + ios_rules
             + "SELECTOR PRIORITY ORDER for native Android / iOS (use first match found in XML; skip for Compose-only steps where rules above say uiautomator):\n"
@@ -179,23 +195,30 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
         var_hint = _variable_hint(payload.project_id)
         user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}{var_hint}\n\nDOM CONTEXT\n==========\n{xml_context}"
     else:
-        compose_from_live_xml = (
-            payload.platform == "android"
-            and bool(payload.page_source_xml.strip())
-            and is_compose_screen(payload.page_source_xml)
-        )
-        swiftui_from_live_xml = (
-            payload.platform == "ios_sim"
-            and bool(payload.page_source_xml.strip())
-            and is_swiftui_screen(payload.page_source_xml)
-        )
+        _live_xml = (payload.page_source_xml or "").strip()
+        if payload.platform == "android" and _live_xml and is_compose_screen(payload.page_source_xml):
+            _screen_type_ng = "compose"
+        elif payload.platform == "ios_sim" and _live_xml and is_swiftui_screen(payload.page_source_xml):
+            _screen_type_ng = "swiftui"
+        else:
+            _screen_type_ng = "native"
+
+        live_xml_str = ""
+        if _live_xml:
+            live_xml_str = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
+
+        rules_block_ng = build_rules_block(payload.prompt, live_xml_str, payload.platform, _screen_type_ng)
+
         sel_json_key_ng = '{"using":"' + using_choices + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
             "Return ONLY valid JSON with this shape:\n"
             '{"steps": [{"type": "<step_type>",'
             ' "selector": ' + sel_json_key_ng + ","
-            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}\n'
+            ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
+            ' "test_data": {"variable_name": "value", ...}}\n'
+            "IMPORTANT: Extract ALL test data (emails, phones, passwords, OTPs, URLs, names, amounts) into the test_data object. "
+            "Use ${variable_name} syntax in step text/expect fields instead of hardcoded values.\n"
             "Available step types:\n"
             "  Tapping: tap, doubleTap, longPress, tapByCoordinates (meta.x, meta.y)\n"
             "  Text: type, clear, clearAndType\n"
@@ -205,28 +228,16 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             "  Keyboard: pressKey (text=key), keyboardAction (legacy alias), hideKeyboard\n"
             "  App: launchApp, closeApp, resetApp (text=bundleId/package, optional)\n"
             "  Capture: takeScreenshot, getPageSource\n\n"
+            + rules_block_ng + "\n\n"
             "IMPORTANT: For keyboard keys (return, done, go, next, search), use pressKey or keyboardAction instead of tap.\n"
             "Use hideKeyboard when you need to dismiss the keyboard without pressing a specific key.\n"
             "Keep selectors realistic for Appium. Use accessibilityId where possible.\n"
             "No markdown, no explanation, only JSON."
         )
-        if compose_from_live_xml:
-            system_prompt += (
-                "\n\nJETPACK COMPOSE (detected from XML): NEVER use selector.using \"id\" for taps/types on this UI. "
-                'ALWAYS use "-android uiautomator" with UiSelector Java, e.g. '
-                'new UiSelector().resourceId("com.app:id/foo"), or .descriptionContains("..."), .textContains("...").\n'
-            )
-        if swiftui_from_live_xml:
-            system_prompt += (
-                "\n\nSWIFTUI (detected from XML): Prefer \"-ios predicate string\" with name == 'id' or label CONTAINS '...'. "
-                "Avoid selector.using \"id\" for taps. Use \"-ios class chain\" to disambiguate (e.g. **/XCUIElementTypeButton[`name == 'x'`]). "
-                "Avoid xpath on iOS unless necessary.\n"
-            )
         var_hint = _variable_hint(payload.project_id)
         user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}{var_hint}"
-        if payload.page_source_xml:
-            filtered_xml = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
-            user_msg += f"\n\nCurrent page source (filtered):\n{filtered_xml}"
+        if live_xml_str:
+            user_msg += f"\n\nCurrent page source (filtered):\n{live_xml_str}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -251,14 +262,106 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             steps = parsed.get("steps")
             if not isinstance(steps, list):
                 raise HTTPException(status_code=502, detail="AI did not return steps[]")
-            return {"steps": steps, "grounded": grounded, "screens_used": screens_used}
+
+            # Auto-extract data layer from AI response or fallback
+            test_data = parsed.get("test_data") or {}
+            data_set_id: int | None = None
+            if not test_data:
+                from ..helpers_data_extraction import extract_variables_from_steps
+                steps, test_data = extract_variables_from_steps(steps)
+            if test_data and payload.project_id:
+                data_set_id = _auto_create_data_layer(
+                    payload.project_id,
+                    payload.prompt[:60].strip() or "AI Generated",
+                    test_data,
+                )
+
+            return {"steps": steps, "grounded": grounded, "screens_used": screens_used, "data_set_id": data_set_id, "test_data": test_data}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI generate steps failed: {e}")
 
 
+# ── Data Layer Auto-Creation ───────────────────────────────────────────
+
+
+def _auto_create_data_layer(
+    project_id: int,
+    context_name: str,
+    test_data: dict[str, str],
+) -> int | None:
+    """Auto-create a DataFolder + DataSet from AI-extracted test_data.
+
+    ``context_name`` is typically the suite or test name, used to name the folder/set.
+    Returns the new DataSet id, or None if no data was extracted.
+    """
+    if not test_data:
+        return None
+
+    from ..models import DataFolder, DataSet
+
+    with SessionLocal() as db:
+        folder = (
+            db.query(DataFolder)
+            .filter(DataFolder.project_id == project_id, DataFolder.name == context_name)
+            .first()
+        )
+        if not folder:
+            folder = DataFolder(
+                project_id=project_id,
+                name=context_name,
+                description=f"Auto-generated for '{context_name}'",
+            )
+            db.add(folder)
+            db.commit()
+            db.refresh(folder)
+
+        ds_name = f"{context_name} Data"
+        existing = (
+            db.query(DataSet)
+            .filter(DataSet.project_id == project_id, DataSet.folder_id == folder.id, DataSet.name == ds_name)
+            .first()
+        )
+        if existing:
+            existing.variables = {**(existing.variables or {}), **test_data}
+            db.commit()
+            return existing.id
+
+        ds = DataSet(
+            project_id=project_id,
+            folder_id=folder.id,
+            name=ds_name,
+            variables=test_data,
+        )
+        db.add(ds)
+        db.commit()
+        db.refresh(ds)
+        return ds.id
+
+
 # ── AI Generate Test Suite (bulk) ─────────────────────────────────────
+
+class ManualTestCase(BaseModel):
+    name: str
+    steps: list[str]
+    expected: Optional[str] = None
+    priority: Optional[str] = None
+
+
+def _format_manual_tests(tests: list[ManualTestCase]) -> str:
+    lines: list[str] = []
+    for i, t in enumerate(tests, 1):
+        lines.append(f"TEST {i}: {t.name}")
+        for j, step in enumerate(t.steps, 1):
+            lines.append(f"  Step {j}: {step}")
+        if t.expected:
+            lines.append(f"  Expected Result: {t.expected}")
+        if t.priority:
+            lines.append(f"  Priority: {t.priority}")
+        lines.append("")
+    return "\n".join(lines)
+
 
 class GenerateSuiteRequest(BaseModel):
     platform: str
@@ -268,6 +371,7 @@ class GenerateSuiteRequest(BaseModel):
     suite_id: int
     folder_id: Optional[int] = None
     build_ids: Optional[list[int]] = None
+    manual_tests: Optional[list[ManualTestCase]] = None
 
 
 @router.post("/api/ai/generate-suite")
@@ -311,6 +415,16 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
     if grounded:
         android_rules = android_selector_generation_rules(screens_for_prompt) if payload.platform == "android" else ""
         ios_rules = ios_selector_generation_rules(screens_for_prompt) if payload.platform == "ios_sim" else ""
+
+        _suite_xml = "".join(getattr(s, "xml_snapshot", "") or "" for s in screens_for_prompt[:3])
+        if payload.platform == "android" and _suite_xml and is_compose_screen(_suite_xml):
+            _suite_screen_type = "compose"
+        elif payload.platform == "ios_sim" and _suite_xml and is_swiftui_screen(_suite_xml):
+            _suite_screen_type = "swiftui"
+        else:
+            _suite_screen_type = "native"
+        suite_rules_block = build_rules_block(payload.prompt, xml_context, payload.platform, _suite_screen_type)
+
         sel_tc = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
@@ -318,12 +432,16 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             "You will receive real XML page source and screenshots from the app under test.\n"
             "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
             "Return ONLY valid JSON with this shape:\n"
-            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "<step_type>",'
-            ' "selector": ' + sel_tc + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...]}\n'
+            '{"test_cases": [{"name": "...", "acceptance_criteria": "...", "steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_tc + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...],'
+            ' "test_data": {"variable_name": "value", ...}}\n'
+            "IMPORTANT: Extract ALL test data (emails, phones, passwords, OTPs, URLs, names, amounts) into the test_data object. "
+            "Use ${variable_name} syntax in step text/expect fields instead of hardcoded values.\n"
             "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
             "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
             "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
             "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
+            + suite_rules_block + "\n\n"
             + android_rules
             + ios_rules
             + "SELECTOR PRIORITY ORDER for native Android / iOS (use first match; follow per-screen Compose rules above when applicable):\n"
@@ -331,53 +449,78 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             "2. content-desc / accessibility id (stable)\n"
             "3. text (fragile — only if no ID available)\n"
             "4. xpath (last resort — only if nothing else exists)\n"
-            "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
             "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
             "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
             "Every selector you use must be found verbatim in the XML below.\n"
             "No markdown, no explanation, only JSON."
         )
-        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}\n\nDOM CONTEXT\n==========\n{xml_context}"
+        if payload.manual_tests:
+            system_prompt += (
+                "\n\nSTRICT RULES — CSV Translation Mode:\n"
+                "- Preserve the exact test name from each manual test case. Do NOT rename.\n"
+                "- Generate exactly one test_case per manual test provided. Do NOT invent new tests or merge existing ones.\n"
+                "- Each manual step should expand into multiple Appium steps (e.g. 'Log in' = waitForVisible + tap + type + tap).\n"
+                "- Every Expected Result must become an assertText or assertVisible step at the end of that test case.\n"
+                "- Use real selectors from the DOM CONTEXT. Do not invent resource-ids.\n"
+                "- Do NOT skip manual steps — every step must produce at least one Appium step.\n"
+            )
+        else:
+            system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+
+        var_hint_suite = _variable_hint(payload.project_id)
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}{var_hint_suite}\n\nDOM CONTEXT\n==========\n{xml_context}"
+        if payload.manual_tests:
+            user_msg += f"\n\nMANUAL TEST CASES TO TRANSLATE:\n{_format_manual_tests(payload.manual_tests)}"
     else:
-        compose_from_live_xml = (
-            payload.platform == "android"
-            and bool((payload.page_source_xml or "").strip())
-            and is_compose_screen(payload.page_source_xml)
-        )
-        swiftui_from_live_xml = (
-            payload.platform == "ios_sim"
-            and bool((payload.page_source_xml or "").strip())
-            and is_swiftui_screen(payload.page_source_xml)
-        )
+        _suite_live = (payload.page_source_xml or "").strip()
+        if payload.platform == "android" and _suite_live and is_compose_screen(payload.page_source_xml):
+            _suite_st_ng = "compose"
+        elif payload.platform == "ios_sim" and _suite_live and is_swiftui_screen(payload.page_source_xml):
+            _suite_st_ng = "swiftui"
+        else:
+            _suite_st_ng = "native"
+
+        suite_live_xml_str = ""
+        if _suite_live:
+            suite_live_xml_str = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
+
+        suite_rules_ng = build_rules_block(payload.prompt, suite_live_xml_str, payload.platform, _suite_st_ng)
+
         sel_tc_ng = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
             "You are a senior mobile QA automation engineer.\n"
             "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
             "Return ONLY valid JSON with this shape:\n"
-            '{"test_cases": [{"name": "Test case name", "acceptance_criteria": "What this test must validate (expected outcome, fail conditions)", "steps": [{"type": "<step_type>",'
-            ' "selector": ' + sel_tc_ng + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...]}\n'
+            '{"test_cases": [{"name": "...", "acceptance_criteria": "...", "steps": [{"type": "<step_type>",'
+            ' "selector": ' + sel_tc_ng + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...],'
+            ' "test_data": {"variable_name": "value", ...}}\n'
+            "IMPORTANT: Extract ALL test data into the test_data object. Use ${variable_name} in step text/expect fields.\n"
             "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
             "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
             "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
             "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
-            "Generate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+            + suite_rules_ng + "\n\n"
             "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
             "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
             "No markdown, no explanation, only JSON."
         )
-        if compose_from_live_xml:
+        if payload.manual_tests:
             system_prompt += (
-                "\n\nJETPACK COMPOSE (detected from XML): NEVER use selector.using \"id\" for taps/types on this UI. "
-                'ALWAYS use "-android uiautomator" with UiSelector Java.\n'
+                "\n\nSTRICT RULES — CSV Translation Mode:\n"
+                "- Preserve the exact test name from each manual test case. Do NOT rename.\n"
+                "- Generate exactly one test_case per manual test provided. Do NOT invent new tests or merge existing ones.\n"
+                "- Each manual step should expand into multiple Appium steps.\n"
+                "- Every Expected Result must become an assertText or assertVisible step at the end of that test case.\n"
             )
-        if swiftui_from_live_xml:
-            system_prompt += (
-                "\n\nSWIFTUI (detected from XML): Prefer \"-ios predicate string\" and \"-ios class chain\"; avoid bare \"id\" and avoid xpath unless necessary.\n"
-            )
-        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}"
-        if payload.page_source_xml:
-            filtered_xml = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.prompt)
-            user_msg += f"\n\nCurrent page source (filtered):\n{filtered_xml}"
+        else:
+            system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+
+        var_hint_suite_ng = _variable_hint(payload.project_id)
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}{var_hint_suite_ng}"
+        if suite_live_xml_str:
+            user_msg += f"\n\nCurrent page source (filtered):\n{suite_live_xml_str}"
+        if payload.manual_tests:
+            user_msg += f"\n\nMANUAL TEST CASES TO TRANSLATE:\n{_format_manual_tests(payload.manual_tests)}"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     gemini_headers = {"x-goog-api-key": api_key}
@@ -402,13 +545,20 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             if not isinstance(raw_cases, list):
                 raise HTTPException(status_code=502, detail="AI did not return test_cases[]")
 
+        # Extract test_data and auto-create data layer
+        suite_test_data = parsed.get("test_data") or {}
+        if not suite_test_data:
+            from ..helpers_data_extraction import extract_variables_from_steps
+            all_steps = [s for tc in raw_cases if isinstance(tc.get("steps"), list) for s in tc["steps"]]
+            _, suite_test_data = extract_variables_from_steps(all_steps)
+
         created: list[dict] = []
         with SessionLocal() as db:
             p = db.query(Project).filter(Project.id == payload.project_id).first()
             if not p:
                 raise HTTPException(status_code=404, detail="Project not found")
-            s = db.query(TestSuite).filter(TestSuite.id == payload.suite_id).first()
-            if not s:
+            suite_obj = db.query(TestSuite).filter(TestSuite.id == payload.suite_id).first()
+            if not suite_obj:
                 raise HTTPException(status_code=404, detail="Suite not found")
             for tc in raw_cases:
                 name = tc.get("name") or f"Generated {len(created) + 1}"
@@ -433,7 +583,15 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                 db.refresh(t)
                 created.append({"id": t.id, "name": t.name, "steps_count": len(steps)})
 
-        return {"created": len(created), "test_cases": created}
+        suite_data_set_id: int | None = None
+        if suite_test_data:
+            suite_data_set_id = _auto_create_data_layer(
+                payload.project_id,
+                suite_obj.name if suite_obj else "AI Suite",
+                suite_test_data,
+            )
+
+        return {"created": len(created), "test_cases": created, "data_set_id": suite_data_set_id}
     except HTTPException:
         raise
     except Exception as e:
@@ -531,14 +689,18 @@ class FixStepsRequest(BaseModel):
     step_results: list[dict[str, Any]]
     failed_step_index: int
     error_message: str = ""
-    page_source_xml: str = ""  # simplified for LLM; may not be strict XML
-    page_source_xml_raw: str = ""  # raw Appium XML for tap diagnosis (recommended)
+    page_source_xml: str = ""
+    page_source_xml_raw: str = ""
     test_name: str = ""
     screenshot_base64: str = ""
-    already_tried_fixes: list[dict[str, Any]] = []  # [{analysis, fixed_steps}, ...] from test.fix_history
-    acceptance_criteria: str = ""  # Source of truth: what this test must validate (from test definition)
-    app_context: str = ""  # App name, package, etc. from build metadata for correct context
-    target_platform: str = "android"  # slot the fixed steps will be saved into
+    already_tried_fixes: list[dict[str, Any]] = []
+    acceptance_criteria: str = ""
+    app_context: str = ""
+    target_platform: str = "android"
+    # Data layer context for variable-aware fixing
+    data_context: dict[str, str] = {}
+    data_set_id: Optional[int] = None
+    template_steps: list[dict[str, Any]] = []
 
 
 @router.post("/api/ai/fix-steps")
@@ -571,12 +733,24 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         payload.target_platform,
         android_pkg,
         tap_diagnosis,
+        step_results=payload.step_results,
     )
 
     passed_steps = []
     for i, r in enumerate(payload.step_results):
         if r.get("status") == "passed" and i < len(payload.original_steps):
             passed_steps.append({"index": i, "step": payload.original_steps[i]})
+
+    # Build contextual rules for fix prompt using the available XML
+    _fix_xml = payload.page_source_xml_raw or payload.page_source_xml or ""
+    _fix_desc = payload.error_message + " " + payload.test_name
+    if payload.target_platform == "android" and _fix_xml and is_compose_screen(_fix_xml):
+        _fix_screen_type = "compose"
+    elif payload.target_platform in ("ios", "ios_sim") and _fix_xml and is_swiftui_screen(_fix_xml):
+        _fix_screen_type = "swiftui"
+    else:
+        _fix_screen_type = "native"
+    fix_rules_block = build_rules_block(_fix_desc, _fix_xml, payload.target_platform, _fix_screen_type)
 
     system_prompt = (
         "You are a senior mobile QA automation engineer debugging a failed Appium test.\n"
@@ -592,6 +766,7 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         "3. Cross-reference the screenshot with the page source XML to find the CORRECT selector\n"
         "4. Return FIXED steps that will work based on the actual screen state\n"
         "5. Keep steps that passed unchanged. Only fix the failed step and any subsequent steps that need updating.\n\n"
+        + fix_rules_block + "\n\n"
         "SOURCE OF TRUTH (when provided): If acceptance_criteria is given, your fix MUST preserve the intended behavior. "
         "Do NOT change what the test validates. If the failure is because the app is on the WRONG screen (e.g., Sign Up instead of Login), "
         "do NOT change the test to validate the wrong screen. The fix should either navigate back to the correct flow, or add an assertion that fails when on the wrong screen. "
@@ -617,10 +792,23 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         "  Capture: takeScreenshot, getPageSource\n\n"
         "Return ONLY valid JSON with this shape:\n"
         '{"analysis": "Brief explanation of what went wrong and how you fixed it",'
+        ' "fix_type": "step|data|both",'
         ' "fixed_steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
         ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
+        ' "data_fixes": {"variable_name": "new_value", ...},'
         ' "changes": [{"step_index": 0, "was": "...", "now": "...", "reason": "..."}]}\n\n'
+        "fix_type: 'step' = fix selector/structure only, 'data' = update variable values only, 'both' = fix steps AND update data.\n"
+        "data_fixes: put ALL variable values here — both updated existing variables AND newly created ones. The backend will auto-apply them to the DataSet.\n\n"
+        "CRITICAL DATA RULES (NEVER VIOLATE):\n"
+        "1. NEVER hardcode raw test data (emails, phones, passwords, OTPs, URLs, names, amounts, codes, dates) in fixed_steps text/expect fields.\n"
+        "2. If a fix introduces ANY new data value, CREATE a new variable. Add it to data_fixes and use ${new_variable_name} in the step.\n"
+        "   - CRITICAL: The dictionary key in data_fixes MUST be the raw variable name ONLY. Do NOT wrap the key in ${}.\n"
+        "   - CORRECT: \"data_fixes\": {\"amountToSplit\": 100}\n"
+        "   - INCORRECT (WILL FAIL): \"data_fixes\": {\"${amountToSplit}\": 100}\n"
+        "3. Existing ${variable_name} references must stay as ${variable_name}. If the value needs changing, update it ONLY in data_fixes (using the raw name as key).\n"
+        "4. set fix_type to 'both' whenever data_fixes is non-empty.\n"
+        "Example: if adding a step that types '12345' as OTP, create data_fixes: {\"otp_code\": \"12345\"} and use ${otp_code} in the step text.\n\n"
         "IMPORTANT: fixed_steps must be the COMPLETE list (all steps, not just changed ones).\n"
         "Use accessibilityId or resource-id where possible, xpath as fallback.\n"
         "No markdown, no explanation outside the JSON."
@@ -635,10 +823,22 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
     )
     if payload.app_context:
         user_msg += f"App context: {payload.app_context}\n"
-    user_msg += (
-        f"\n=== ORIGINAL STEPS ===\n{json.dumps(payload.original_steps, indent=2)}\n\n"
-        f"=== STEP RESULTS ===\n"
-    )
+
+    if payload.template_steps and payload.data_context:
+        user_msg += (
+            f"\n=== TEMPLATE STEPS (with ${{var}} references — what is stored) ===\n"
+            f"{json.dumps(payload.template_steps, indent=2)}\n\n"
+            f"=== DATA CONTEXT (resolved variables from DataSet) ===\n"
+            f"{json.dumps(payload.data_context, indent=2)}\n\n"
+            f"=== RESOLVED STEPS (what actually ran) ===\n"
+            f"{json.dumps(payload.original_steps, indent=2)}\n\n"
+        )
+    else:
+        user_msg += (
+            f"\n=== ORIGINAL STEPS ===\n{json.dumps(payload.original_steps, indent=2)}\n\n"
+        )
+
+    user_msg += "=== STEP RESULTS ===\n"
     for i, r in enumerate(payload.step_results):
         status = r.get("status", "pending")
         details = r.get("details", "")
@@ -675,6 +875,31 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
             user_msg += f"Attempt {i}: {analysis}... | steps: {steps_preview}...\n"
         user_msg += "Try a DIFFERENT approach. Do not suggest the same or similar fix.\n\n"
 
+        # Escalation: after 3+ failed attempts on InvalidElementStateException, force childSelector pattern
+        _err_lower = (payload.error_message or "").lower()
+        if len(payload.already_tried_fixes) >= 2 and (
+            "cannot set the element" in _err_lower
+            or "invalidelementstate" in _err_lower
+        ):
+            user_msg += (
+                "=== ESCALATION: MANDATORY FIX PATTERN ===\n"
+                "You have failed this fix multiple times. The error is InvalidElementStateException.\n"
+                "This ALWAYS means you are targeting a WRAPPER element instead of the actual input.\n\n"
+                "MANDATORY PATTERN (Android):\n"
+                '1. tap the wrapper: {"type":"tap","selector":{"using":"-android uiautomator","value":"new UiSelector().resourceId(\\"<wrapper_id>\\")"}}\n'
+                '2. type into child: {"type":"type","selector":{"using":"-android uiautomator","value":"new UiSelector().resourceId(\\"<wrapper_id>\\").childSelector(new UiSelector().className(\\"android.widget.EditText\\"))"},"text":"..."}\n'
+                '3. hideKeyboard: {"type":"hideKeyboard"}\n\n'
+                "MANDATORY PATTERN (iOS):\n"
+                '1. tap the wrapper: {"type":"tap","selector":{"using":"-ios predicate string","value":"name == \'<wrapper_name>\'"}}\n'
+                '2. type into child: {"type":"type","selector":{"using":"-ios class chain","value":"**/XCUIElementTypeTextField"},"text":"..."}\n'
+                '3. hideKeyboard: {"type":"hideKeyboard"}\n\n'
+                "Do NOT try adding waits, scrolls, or timeout bumps. The element IS present and visible — "
+                "you are simply targeting the wrong node in the hierarchy.\n"
+                "Look at the XML: find the resource-id from the failed selector, check its class — if it's NOT EditText/TextField, "
+                "use .childSelector() to target the child EditText.\n"
+                "=== END ESCALATION ===\n\n"
+            )
+
     if payload.page_source_xml:
         filtered_xml = preprocess_live_xml(
             payload.page_source_xml,
@@ -709,10 +934,29 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
             fixed = parsed.get("fixed_steps")
             if not isinstance(fixed, list):
                 raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
+
+            # Auto-apply data fixes to DataSet
+            fix_type = parsed.get("fix_type", "step")
+            data_fixes = parsed.get("data_fixes") or {}
+            if isinstance(data_fixes, dict):
+                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
+            data_set_updated = False
+            if data_fixes and payload.data_set_id:
+                from ..models import DataSet as DataSetModel
+                with SessionLocal() as db:
+                    ds = db.query(DataSetModel).filter(DataSetModel.id == payload.data_set_id).first()
+                    if ds:
+                        ds.variables = {**(ds.variables or {}), **data_fixes}
+                        db.commit()
+                        data_set_updated = True
+
             return {
                 "analysis": parsed.get("analysis", ""),
                 "fixed_steps": fixed,
                 "changes": parsed.get("changes", []),
+                "fix_type": fix_type,
+                "data_fixes": data_fixes,
+                "data_set_updated": data_set_updated,
                 "tap_diagnosis": tap_diagnosis,
                 "failure_diagnosis": failure_diagnosis,
             }
@@ -794,10 +1038,31 @@ async def refine_fix(request: Request, payload: RefineFixRequest) -> dict[str, A
         "Return ONLY valid JSON:\n"
         '{"analysis": "Updated explanation reflecting the refinement",'
         ' "fixed_steps": [...],'
+        ' "data_fixes": {"variable_name": "new_value", ...},'
         ' "changes": [{"step_index": N, "was": "...", "now": "...", "reason": "..."}]}\n\n'
+        "CRITICAL DATA RULES (NEVER VIOLATE):\n"
+        "1. NEVER hardcode raw test data (emails, phones, passwords, OTPs, URLs, names, amounts, codes, dates) in fixed_steps text/expect fields.\n"
+        "2. If the user's suggestion relies on ANY new data value, CREATE a new variable. Add it to data_fixes and use ${new_variable_name} in the step.\n"
+        "   - CRITICAL: The dictionary key in data_fixes MUST be the raw variable name ONLY. Do NOT wrap the key in ${}.\n"
+        "   - CORRECT: \"data_fixes\": {\"amountToSplit\": 100}\n"
+        "   - INCORRECT (WILL FAIL): \"data_fixes\": {\"${amountToSplit}\": 100}\n"
+        "3. Existing ${variable_name} references must stay as ${variable_name}. If the value needs changing, update it ONLY in data_fixes (using the raw name as key).\n"
+        "Example: if adding a step that types '12345' as OTP, create data_fixes: {\"otp_code\": \"12345\"} and use ${otp_code} in the step text.\n\n"
         "fixed_steps must be the COMPLETE list. No markdown."
         + AI_FIX_CLASSIFICATION_RULES
     )
+
+    # Build contextual rules for refine-fix prompt
+    _rf_xml = payload.page_source_xml_raw or payload.page_source_xml or ""
+    _rf_desc = payload.error_message + " " + payload.test_name
+    if payload.target_platform == "android" and _rf_xml and is_compose_screen(_rf_xml):
+        _rf_screen_type = "compose"
+    elif payload.target_platform in ("ios", "ios_sim") and _rf_xml and is_swiftui_screen(_rf_xml):
+        _rf_screen_type = "swiftui"
+    else:
+        _rf_screen_type = "native"
+    rf_rules_block = build_rules_block(_rf_desc, _rf_xml, payload.target_platform, _rf_screen_type)
+    system_prompt += "\n\n" + rf_rules_block
 
     android_pkg_rf = parse_android_package(payload.app_context or "")
     failure_diagnosis_rf = classify_failure_for_ai_fix(
@@ -808,6 +1073,7 @@ async def refine_fix(request: Request, payload: RefineFixRequest) -> dict[str, A
         payload.target_platform,
         android_pkg_rf,
         tap_diagnosis,
+        step_results=payload.step_results,
     )
 
     user_msg = (
@@ -885,10 +1151,15 @@ async def refine_fix(request: Request, payload: RefineFixRequest) -> dict[str, A
             fixed = parsed.get("fixed_steps")
             if not isinstance(fixed, list):
                 raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
+            data_fixes = parsed.get("data_fixes") or {}
+            if isinstance(data_fixes, dict):
+                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
+                
             return {
                 "analysis": parsed.get("analysis", ""),
                 "fixed_steps": fixed,
                 "changes": parsed.get("changes", []),
+                "data_fixes": data_fixes,
                 "tap_diagnosis": tap_diagnosis,
                 "failure_diagnosis": failure_diagnosis_rf,
             }
@@ -924,7 +1195,16 @@ async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, A
         '{"steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
         ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
+        ' "data_fixes": {"variable_name": "new_value", ...},'
         ' "summary": "Brief description of what was changed"}\n\n'
+        "CRITICAL DATA RULES (NEVER VIOLATE):\n"
+        "1. NEVER hardcode raw test data (emails, phones, passwords, OTPs, URLs, names, amounts, codes, dates) in steps text/expect fields.\n"
+        "2. If the user's instruction relies on ANY new data value, CREATE a new variable. Add it to data_fixes and use ${new_variable_name} in the step.\n"
+        "   - CRITICAL: The dictionary key in data_fixes MUST be the raw variable name ONLY. Do NOT wrap the key in ${}.\n"
+        "   - CORRECT: \"data_fixes\": {\"amountToSplit\": 100}\n"
+        "   - INCORRECT (WILL FAIL): \"data_fixes\": {\"${amountToSplit}\": 100}\n"
+        "3. Existing ${variable_name} references must stay as ${variable_name}. If the value needs changing, update it ONLY in data_fixes (using the raw name as key).\n"
+        "Example: if adding a step that types '12345' as OTP, create data_fixes: {\"otp_code\": \"12345\"} and use ${otp_code} in the step text.\n\n"
         "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
         "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
         "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
@@ -955,7 +1235,15 @@ async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, A
             steps = parsed.get("steps")
             if not isinstance(steps, list):
                 raise HTTPException(status_code=502, detail="AI did not return steps[]")
-            return {"steps": steps, "summary": parsed.get("summary", "")}
+            data_fixes = parsed.get("data_fixes") or {}
+            if isinstance(data_fixes, dict):
+                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
+                
+            return {
+                "steps": steps,
+                "summary": parsed.get("summary", ""),
+                "data_fixes": data_fixes
+            }
     except HTTPException:
         raise
     except Exception as e:

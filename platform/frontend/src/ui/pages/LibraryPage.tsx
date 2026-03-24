@@ -19,6 +19,8 @@ import {
 } from "../api";
 import { XmlElementTree } from "../XmlElementTree";
 import { guessModule, statusDot, stepsForPlatform, toast } from "../helpers";
+import { parseCSV, detectColumns, isDetectionConfident } from "../utils/csvParser";
+import type { ManualTestCase, ColumnMapping } from "../utils/csvParser";
 
 /* ── Library ───────────────────────────────────────── */
 const STEP_TYPES = [
@@ -343,6 +345,15 @@ export function LibraryPage({
   const [genSuiteFolderScreens, setGenSuiteFolderScreens] = useState<ScreenEntry[]>([]);
   const [genSuiteBuildIds, setGenSuiteBuildIds] = useState<number[]>([]);
 
+  // CSV Import for Generate Suite
+  const csvFileRef = useRef<HTMLInputElement>(null);
+  const [csvParsed, setCsvParsed] = useState<import("../utils/csvParser").ManualTestCase[]>([]);
+  const [csvMapping, setCsvMapping] = useState<import("../utils/csvParser").ColumnMapping | null>(null);
+  const [csvHeaders, setCsvHeaders] = useState<string[]>([]);
+  const [csvNeedsMapping, setCsvNeedsMapping] = useState(false);
+  const [showCsvPreview, setShowCsvPreview] = useState(false);
+  const [csvRawText, setCsvRawText] = useState("");
+
   // Import script / sheet (preview → confirm)
   const [showImport, setShowImport] = useState(false);
   const [importSuiteId, setImportSuiteId] = useState<number | null>(null);
@@ -662,8 +673,47 @@ export function LibraryPage({
     finally { setBusy(false); }
   };
 
+  const handleCsvUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target?.result as string;
+      setCsvRawText(text);
+      const lines = text.trim().split(/\r?\n/);
+      if (lines.length < 2) { toast("CSV has no data rows", "error"); return; }
+      const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
+      setCsvHeaders(headers);
+      const mapping = detectColumns(headers);
+      setCsvMapping(mapping);
+      const confident = isDetectionConfident(headers, mapping);
+      setCsvNeedsMapping(!confident);
+      const parsed = parseCSV(text, mapping);
+      setCsvParsed(parsed);
+      setShowCsvPreview(true);
+      toast(`Parsed ${parsed.length} test case(s) from CSV`, "success");
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }, []);
+
+  const clearCsv = useCallback(() => {
+    setCsvParsed([]);
+    setCsvMapping(null);
+    setCsvHeaders([]);
+    setCsvNeedsMapping(false);
+    setShowCsvPreview(false);
+    setCsvRawText("");
+  }, []);
+
+  const reapplyMapping = useCallback((m: ColumnMapping) => {
+    setCsvMapping(m);
+    const parsed = parseCSV(csvRawText, m);
+    setCsvParsed(parsed);
+  }, [csvRawText]);
+
   const aiGenerateSuite = async () => {
-    if (!genSuitePrompt.trim()) { toast("Describe the feature to test", "error"); return; }
+    if (!genSuitePrompt.trim() && csvParsed.length === 0) { toast("Describe the feature or upload CSV", "error"); return; }
     if (!genSuiteTargetId) { toast("Select a Test Suite", "error"); return; }
     if (genSuiteFolderId) {
       const hasTagged = genSuiteFolderScreens.some((s) => s.build_id != null);
@@ -684,16 +734,19 @@ export function LibraryPage({
       setGenSuiteStatus("AI generating test cases...");
       const res = await api.generateSuite(
         platform,
-        genSuitePrompt,
+        genSuitePrompt || (csvParsed.length > 0 ? `Convert ${csvParsed.length} manual test cases to Appium automation` : ""),
         project.id,
         genSuiteTargetId,
         xml,
         genSuiteFolderId,
         genSuiteBuildIds.length > 0 ? genSuiteBuildIds : undefined,
+        csvParsed.length > 0 ? csvParsed : undefined,
       );
-      setGenSuiteStatus(`Created ${res.created} test cases`);
-      toast(`Generated ${res.created} test cases`, "success");
+      const dsMsg = res.data_set_id ? ` · Data Set #${res.data_set_id} created` : "";
+      setGenSuiteStatus(`Created ${res.created} test cases${dsMsg}`);
+      toast(`Generated ${res.created} test cases${dsMsg}`, "success");
       setGenSuitePrompt("");
+      clearCsv();
       onRefresh();
     } catch (e: any) {
       setGenSuiteStatus("");
@@ -1250,9 +1303,64 @@ export function LibraryPage({
             </div>
           )}
           {genSuiteFolderId && <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8 }}>AI will use real selectors + screenshots from the selected folder and builds above.</div>}
-          <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder="Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..." rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
+          <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder={csvParsed.length > 0 ? "Optional context to supplement CSV import..." : "Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..."} rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
+
+          {/* CSV Import Section */}
+          <div style={{ borderTop: "1px dashed var(--border)", margin: "8px 0 12px", position: "relative" }}>
+            <span style={{ position: "absolute", top: -8, left: "50%", transform: "translateX(-50%)", background: "var(--bg)", padding: "0 12px", fontSize: 10, color: "var(--muted)" }}>OR</span>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+            <input ref={csvFileRef} type="file" accept=".csv" onChange={handleCsvUpload} style={{ display: "none" }} />
+            <button className="btn-ghost btn-sm" onClick={() => csvFileRef.current?.click()} style={{ fontSize: 11 }}>📎 Upload Manual Tests (CSV)</button>
+            <a href="/template.csv" download="qa_os_template.csv" style={{ fontSize: 10, color: "var(--accent)", textDecoration: "underline" }}>Download template CSV</a>
+            {csvParsed.length > 0 && <button className="btn-ghost btn-sm" onClick={clearCsv} style={{ fontSize: 10, color: "var(--danger)" }}>✕ Clear CSV</button>}
+          </div>
+
+          {/* Column Mapping UI (shown when auto-detection uncertain) */}
+          {csvNeedsMapping && csvHeaders.length > 0 && csvMapping && (
+            <div className="panel" style={{ padding: 10, marginBottom: 10, background: "rgba(255,176,32,.05)", border: "1px solid rgba(255,176,32,.2)" }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6 }}>Column Mapping — auto-detection uncertain</div>
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", fontSize: 11 }}>
+                {(["name", "steps", "expected", "priority"] as const).map((field) => (
+                  <label key={field} style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                    <span style={{ minWidth: 60, fontWeight: 500 }}>{field === "name" ? "Test Name*" : field === "steps" ? "Steps*" : field === "expected" ? "Expected" : "Priority"}</span>
+                    <select
+                      value={csvMapping[field] ?? ""}
+                      onChange={(e) => {
+                        const m = { ...csvMapping, [field]: e.target.value || null } as ColumnMapping;
+                        reapplyMapping(m);
+                      }}
+                      style={{ fontSize: 11, minWidth: 120 }}
+                    >
+                      <option value="">— none —</option>
+                      {csvHeaders.map((h) => <option key={h} value={h}>{h}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* CSV Preview */}
+          {csvParsed.length > 0 && (
+            <div className="panel" style={{ padding: 10, marginBottom: 10, background: "rgba(99,102,241,.04)", border: "1px solid rgba(99,102,241,.15)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 600 }}>Parsed Test Cases — {csvParsed.length} detected</span>
+                <button className="btn-ghost btn-sm" onClick={() => setShowCsvPreview(!showCsvPreview)} style={{ fontSize: 10 }}>{showCsvPreview ? "▾ Hide" : "▸ Show"}</button>
+              </div>
+              {showCsvPreview && csvParsed.slice(0, 20).map((tc, i) => (
+                <div key={i} style={{ fontSize: 11, padding: "4px 0", borderBottom: "1px solid var(--border)" }}>
+                  <span style={{ fontWeight: 500 }}>{tc.name}</span>
+                  <span style={{ color: "var(--muted)", marginLeft: 8 }}>Steps: {tc.steps.length}</span>
+                  {tc.expected && <span style={{ color: "var(--muted)", marginLeft: 8 }}>Expected: {tc.expected.slice(0, 50)}{tc.expected.length > 50 ? "…" : ""}</span>}
+                </div>
+              ))}
+              {csvParsed.length > 20 && <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>... {csvParsed.length - 20} more</div>}
+            </div>
+          )}
+
           {genSuiteStatus && <div style={{ fontSize: 11, color: "var(--accent2)", marginBottom: 8 }}>{genSuiteStatus}</div>}
-          <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || !genSuitePrompt.trim() || !genSuiteTargetId}>{busy ? "Generating..." : "✨ Generate Test Suite"}</button>
+          <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || (!genSuitePrompt.trim() && csvParsed.length === 0) || !genSuiteTargetId}>{busy ? "Generating..." : csvParsed.length > 0 ? `✨ Generate ${csvParsed.length} Test Cases` : "✨ Generate Test Suite"}</button>
         </div>
       )}
 
@@ -1405,6 +1513,11 @@ export function LibraryPage({
             <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiEditRun} disabled={busy}>🤖 AI Edit</button>
           </div>
           {aiEditStatus && <div style={{ fontSize: 11, color: "var(--accent)", marginBottom: 8 }}>{aiEditStatus}</div>}
+          {editSteps.length === 0 && (
+            <div style={{ padding: "20px 16px", background: "rgba(255,176,32,.06)", border: "1px dashed rgba(255,176,32,.3)", borderRadius: 6, fontSize: 12, color: "var(--warn)", marginBottom: 12 }}>
+              No {editPfTab === "ios_sim" ? "iOS" : "Android"} steps generated for this test. Use AI Generate with {editPfTab === "ios_sim" ? "iOS" : "Android"} platform selected, or add steps manually below.
+            </div>
+          )}
           <StepBuilder steps={editSteps} setSteps={setEditSteps} stepStatuses={editStepStatuses} figmaNames={figmaNames} platform={editPfTab} />
           <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
             <button className="btn-primary btn-sm" onClick={saveEdit} disabled={busy}>Save Changes</button>

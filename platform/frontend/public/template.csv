@@ -1,0 +1,4 @@
+Test Name,Steps,Expected Result,Priority
+TC001 — Valid Login,"1. Open app; 2. Tap Login; 3. Enter valid email; 4. Enter password; 5. Tap Submit",Home screen shown with user greeting,High
+TC002 — Invalid Login,"1. Open app; 2. Tap Login; 3. Enter bad@email.com; 4. Enter wrongpass; 5. Tap Submit","Error message: Invalid credentials",High
+TC003 — Empty Email,"1. Open app; 2. Tap Login; 3. Leave email blank; 4. Enter password; 5. Tap Submit",Validation error shown under email field,Medium

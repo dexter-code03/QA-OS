@@ -91,7 +91,17 @@ export type AiFixResponse = {
     recommended_strategy?: string | null;
     recommended_value?: string | null;
   } | null;
+  fix_type?: "step" | "data" | "both";
+  data_fixes?: Record<string, string>;
+  data_set_updated?: boolean;
 };
+
+export interface ManualTestCase {
+  name: string;
+  steps: string[];
+  expected: string;
+  priority: string | null;
+}
 
 export type UploadProgressOpts = { onUploadProgress?: (pct: number | null) => void };
 
@@ -124,6 +134,13 @@ export interface TestHealthRow {
     ai_fix: { analysis: string; fixed_steps: any[]; changes: any[] } | null;
     platform: string;
     started_at: string | null;
+  } | null;
+  latest_run: {
+    id: number;
+    status: string;
+    platform: string;
+    started_at: string | null;
+    finished_at: string | null;
   } | null;
 }
 

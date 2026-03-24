@@ -128,8 +128,7 @@ def cancel_batch_run(batch_id: int) -> dict[str, Any]:
         children = db.query(Run).filter(Run.batch_run_id == batch_id, Run.status.in_(("queued", "running"))).all()
         cancelled_count = 0
         for r in children:
-            if r.status == "running":
-                run_engine.request_cancel(r.id)
+            run_engine.request_cancel(r.id)
             r.status = "cancelled"
             r.finished_at = r.finished_at or utcnow()
             cancelled_count += 1

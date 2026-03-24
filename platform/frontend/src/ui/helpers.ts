@@ -86,7 +86,7 @@ export function stepsForPlatform(test: TestDef | undefined | null, pf: Run["plat
   const ps = test.platform_steps;
   const android = (ps?.android?.length ? ps.android : test.steps) ?? [];
   const ios = ps?.ios_sim ?? [];
-  if (pf === "ios_sim") return ios.length ? ios : android;
+  if (pf === "ios_sim") return ios;
   return android;
 }
 

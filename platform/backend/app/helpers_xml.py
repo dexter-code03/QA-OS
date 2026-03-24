@@ -71,6 +71,12 @@ _IOS_SHORT = {
 }
 
 
+_INPUT_KEYWORDS = frozenset(["enter", "type", "input", "fill", "write", "submit", "form", "login", "sign"])
+
+EDITABLE_ANDROID = {"android.widget.EditText"}
+EDITABLE_IOS = {"XCUIElementTypeTextField", "XCUIElementTypeSecureTextField"}
+
+
 def _is_ios(platform: str) -> bool:
     return platform.lower() in ("ios_sim", "ios")
 
@@ -128,6 +134,55 @@ def _is_actionable_ios(attrs: dict[str, str], is_swiftui: bool) -> bool:
     if etype in IOS_INTERACTIVE_TYPES:
         return True
     return bool(name or label)
+
+
+# ---------------------------------------------------------------------------
+# Pass 2b — Contextual filters (FM-01, FM-02)
+# ---------------------------------------------------------------------------
+
+def filter_for_input_context(
+    elements: list[dict[str, str]],
+    description: str,
+    platform: str,
+) -> list[dict[str, str]]:
+    """FM-01 fix: when description implies form input, strip non-editable elements.
+
+    Keeps editable fields and clickable elements (buttons for form submission).
+    Returns all elements unchanged if no input keyword is detected.
+    """
+    if not description or not any(k in description.lower() for k in _INPUT_KEYWORDS):
+        return elements
+
+    editable = EDITABLE_IOS if _is_ios(platform) else EDITABLE_ANDROID
+    return [
+        e for e in elements
+        if e.get("class", "") in editable
+        or e.get("type", "") in editable
+        or e.get("clickable") == "true"
+    ]
+
+
+def promote_clickable_parents(
+    elements: list[dict[str, str]],
+    parent_map: dict[int, dict[str, str]],
+) -> list[dict[str, str]]:
+    """FM-02 fix: remove non-clickable children whose parent is clickable.
+
+    ``parent_map`` maps element id(attrs) → parent attrs dict.
+    When a non-clickable child has a clickable parent already in the result set,
+    it is dropped so the AI targets the parent instead.
+    """
+    clickable_ids = {
+        id(e) for e in elements if e.get("clickable") == "true"
+    }
+    result: list[dict[str, str]] = []
+    for e in elements:
+        if e.get("clickable") != "true":
+            parent = parent_map.get(id(e))
+            if parent is not None and id(parent) in clickable_ids:
+                continue
+        result.append(e)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -286,20 +341,29 @@ def preprocess_xml(
 
     total_count = 0
     actionable: list[dict[str, str]] = []
+    parent_map: dict[int, dict[str, str]] = {}
+    _el_attrs_cache: dict[ET.Element, dict[str, str]] = {}
 
-    for el in root.iter():
+    def _walk_with_parent(node: ET.Element, parent_attrs: dict[str, str] | None) -> None:
+        nonlocal total_count
         total_count += 1
-        attrs = strip_attributes(el, platform)
-        if not attrs:
-            continue
-        if not is_actionable(attrs, platform, is_compose=is_compose, is_swiftui=is_swiftui_flag):
-            continue
-        actionable.append(attrs)
+        attrs = strip_attributes(node, platform)
+        if attrs and is_actionable(attrs, platform, is_compose=is_compose, is_swiftui=is_swiftui_flag):
+            actionable.append(attrs)
+            _el_attrs_cache[node] = attrs
+            if parent_attrs is not None:
+                parent_map[id(attrs)] = parent_attrs
+        for child in node:
+            _walk_with_parent(child, _el_attrs_cache.get(node, parent_attrs))
 
+    _walk_with_parent(root, None)
+
+    filtered = promote_clickable_parents(actionable, parent_map)
     if description:
-        filtered = filter_by_relevance(actionable, description, platform, max_elements)
+        filtered = filter_for_input_context(filtered, description, platform)
+        filtered = filter_by_relevance(filtered, description, platform, max_elements)
     else:
-        filtered = actionable[:max_elements]
+        filtered = filtered[:max_elements]
 
     strategy = "compose" if is_compose else "swiftui" if is_swiftui_flag else "native"
     plat_label = "ios" if _is_ios(platform) else "android"

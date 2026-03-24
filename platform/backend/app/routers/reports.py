@@ -62,7 +62,7 @@ def _test_health_row(t: TestDefinition, test_runs: list[Run], days: int, prereq_
             "platform": plat,
             "pass_rate_pct": 0, "fail_streak": 0,
             "last_passed_at": None, "ai_fixes_count": len(t.fix_history or []),
-            "run_history": [], "last_failed_run": None,
+            "run_history": [], "last_failed_run": None, "latest_run": None,
         }
 
     platforms_seen = set(r.platform for r in test_runs if r.platform)
@@ -151,6 +151,16 @@ def _test_health_row(t: TestDefinition, test_runs: list[Run], days: int, prereq_
 
     run_history = [{"id": r.id, "status": r.status, "platform": r.platform} for r in test_runs[-14:]]
 
+    # Latest run info (most recent, regardless of pass/fail)
+    newest = test_runs[-1]
+    latest_run_info = {
+        "id": newest.id,
+        "status": newest.status,
+        "platform": newest.platform,
+        "started_at": newest.started_at.isoformat() if newest.started_at else None,
+        "finished_at": newest.finished_at.isoformat() if newest.finished_at else None,
+    }
+
     return {
         "id": t.id, "name": t.name, "status": status,
         "acceptance_criteria": t.acceptance_criteria or "",
@@ -160,6 +170,7 @@ def _test_health_row(t: TestDefinition, test_runs: list[Run], days: int, prereq_
         "ai_fixes_count": len(t.fix_history or []),
         "run_history": run_history,
         "last_failed_run": last_failed_run,
+        "latest_run": latest_run_info,
     }
 
 
@@ -594,24 +605,23 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
         prereq_def = None
         if test.prerequisite_test_id and test.prerequisite_test_id != test.id:
             prereq_def = db.query(TestDefinition).filter(TestDefinition.id == test.prerequisite_test_id).first()
-        step_html = ""
-        error_html = ""
-        fix_html = ""
-        fail_screenshot_html = ""
-        if last_failed:
-            rsummary = last_failed.summary or {}
+
+        def _build_run_detail(run_obj, label_prefix: str = ""):
+            """Build step HTML, error HTML, screenshot HTML for a given run."""
+            if not run_obj:
+                return "", "", "", 0
+            rsummary = run_obj.summary or {}
             rsteps = rsummary.get("stepResults") or []
-            arts = last_failed.artifacts or {}
-            screenshots = arts.get("screenshots") or []
-            # Skip prerequisite steps using the run's actual platform
-            run_pf = (last_failed.platform or "android").strip() or "android"
-            poffset = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else 0
-            own_rsteps = rsteps[poffset:]
-            own_screenshots = screenshots[poffset:]
-            step_detail = []
+            arts = run_obj.artifacts or {}
+            shots = arts.get("screenshots") or []
+            run_pf = (run_obj.platform or "android").strip() or "android"
+            poff = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else 0
+            own_rsteps = rsteps[poff:]
+            own_shots = shots[poff:]
+            sd_list = []
             for si, sr_item in enumerate(own_rsteps):
-                shot = own_screenshots[si] if si < len(own_screenshots) else None
-                step_detail.append({
+                shot = own_shots[si] if si < len(own_shots) else None
+                sd_list.append({
                     "index": si,
                     "type": (sr_item.get("step") or {}).get("type") or "",
                     "selector": (sr_item.get("step") or {}).get("selector") or (sr_item.get("details", {}).get("selector") if isinstance(sr_item.get("details"), dict) else None),
@@ -620,20 +630,29 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
                     "error": sr_item.get("details", {}).get("error") if isinstance(sr_item.get("details"), dict) else (sr_item.get("details") if sr_item.get("status") == "failed" else None),
                     "screenshot": shot,
                 })
-
-            step_html = _render_step_rows_html(step_detail, test.project_id, last_failed.id)
-
-            if last_failed.error_message:
-                error_html = f'<div class="error-box">{_esc(last_failed.error_message)}</div>'
-
-            # Failed step screenshot (full size)
-            for sd in step_detail:
+            s_html = _render_step_rows_html(sd_list, test.project_id, run_obj.id) if sd_list else ""
+            e_html = f'<div class="error-box">{_esc(run_obj.error_message)}</div>' if run_obj.error_message else ""
+            shot_html = ""
+            for sd in sd_list:
                 if sd["status"] == "failed" and sd.get("screenshot"):
-                    b64 = _screenshot_to_base64(test.project_id, last_failed.id, sd["screenshot"])
+                    b64 = _screenshot_to_base64(test.project_id, run_obj.id, sd["screenshot"])
                     if b64:
-                        fail_screenshot_html = f'<h2>Failure Screenshot (Step {sd["index"]+1})</h2><img class="screenshot-full" src="{b64}" />'
+                        shot_html = f'<h2>{label_prefix}Failure Screenshot (Step {sd["index"]+1})</h2><img class="screenshot-full" src="{b64}" />'
                     break
+            return s_html, e_html, shot_html, poff
 
+        # Latest run detail (always shown — whether passed or failed)
+        latest_step_html, latest_error_html, latest_shot_html, latest_poffset = _build_run_detail(latest_run, "")
+
+        # Last failed run detail (shown separately if different from latest)
+        step_html = ""
+        error_html = ""
+        fix_html = ""
+        fail_screenshot_html = ""
+        show_last_failed_section = last_failed and latest_run and last_failed.id != latest_run.id
+        poffset = 0
+        if last_failed:
+            step_html, error_html, fail_screenshot_html, poffset = _build_run_detail(last_failed, "")
             fh = test.fix_history or []
             if fh:
                 latest_fix = fh[-1]
@@ -651,20 +670,19 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
 
         steps_total = max(len(_steps_for_platform_record(test, "android")), len(_steps_for_platform_record(test, "ios_sim")))
         steps_ran = 0
-        if last_failed:
+        if latest_run:
+            sr_list = (latest_run.summary or {}).get("stepResults") or []
+            all_ran = sum(1 for s in sr_list if s.get("status") in ("passed", "failed"))
+            steps_ran = max(0, all_ran - latest_poffset)
+        elif last_failed:
             sr_list = (last_failed.summary or {}).get("stepResults") or []
             all_ran = sum(1 for s in sr_list if s.get("status") in ("passed", "failed"))
             steps_ran = max(0, all_ran - poffset)
-        elif latest_run:
-            sr_list = (latest_run.summary or {}).get("stepResults") or []
-            all_ran = sum(1 for s in sr_list if s.get("status") in ("passed", "failed"))
-            run_pf = (latest_run.platform or "android").strip() or "android"
-            lr_offset = len(_steps_for_platform_record(prereq_def, run_pf)) if prereq_def else 0
-            steps_ran = max(0, all_ran - lr_offset)
 
         dur_s = None
-        if last_failed and last_failed.finished_at and last_failed.started_at:
-            dur_s = round((last_failed.finished_at - last_failed.started_at).total_seconds(), 1)
+        ref_run = latest_run or last_failed
+        if ref_run and ref_run.finished_at and ref_run.started_at:
+            dur_s = round((ref_run.finished_at - ref_run.started_at).total_seconds(), 1)
 
         html = f'''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>{test.name} — Test Report</title>
 <style>{_REPORT_CSS}</style></head><body>
@@ -682,13 +700,13 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
 
 <div class="meta-grid">
 <div class="meta-item">Build: <strong>{build_info or "—"}</strong></div>
-<div class="meta-item">Platform: <strong>{last_failed.platform if last_failed else "—"}</strong></div>
-<div class="meta-item">Device: <strong>{last_failed.device_target if last_failed else "—"}</strong></div>
+<div class="meta-item">Platform: <strong>{latest_run.platform if latest_run else (last_failed.platform if last_failed else "—")}</strong></div>
+<div class="meta-item">Device: <strong>{latest_run.device_target if latest_run else (last_failed.device_target if last_failed else "—")}</strong></div>
 <div class="meta-item">Last passed: <strong>{last_passed_at[:10] if last_passed_at else "Never"}</strong></div>
 <div class="meta-item">Last run: <strong>{latest_run.finished_at.strftime("%Y-%m-%d %H:%M") if latest_run and latest_run.finished_at else "—"}</strong></div>
 <div class="meta-item">Duration: <strong>{f"{dur_s}s" if dur_s else "—"}</strong></div>
 <div class="meta-item">AI fixes used: <strong>{len(test.fix_history or [])}</strong></div>
-<div class="meta-item">Failure category: <strong>{last_failed.failure_category if last_failed and hasattr(last_failed, "failure_category") else "—"}</strong></div>
+<div class="meta-item">Latest status: <strong style="color:{"#00e5a0" if latest_run and latest_run.status == "passed" else "#ff3b5c"}">{latest_run.status.upper() if latest_run else "—"}</strong></div>
 </div>
 
 {f'<div class="section"><div style="font-size:11px;color:#6b7280;margin-bottom:6px">ACCEPTANCE CRITERIA</div><div style="font-size:12px;color:#c9d1d9;padding:10px 14px;background:#111820;border-radius:6px;border:1px solid #1e2430">{_esc(test.acceptance_criteria)}</div></div>' if test.acceptance_criteria else ""}
@@ -696,11 +714,9 @@ def export_test_html(test_id: int, days: int = 14) -> StreamingResponse:
 <h2>Run History (last {min(len(runs), 30)} runs)</h2>
 <div class="history-strip" style="margin-bottom:24px">{history_html}</div>
 
-{f'<h2>Step Execution — Run #{last_failed.id}</h2>{step_html}' if step_html else '<div style="color:#6b7280;padding:20px">No failed run to display steps for.</div>'}
+{f'<h2>Latest Run — #{latest_run.id} <span class="badge {"badge-pass" if latest_run.status == "passed" else "badge-fail"}">{latest_run.status.upper()}</span></h2>{latest_step_html}{latest_error_html}{latest_shot_html}' if latest_run and latest_step_html else '<div style="color:#6b7280;padding:20px">No runs to display steps for.</div>'}
 
-{error_html}
-{fix_html}
-{fail_screenshot_html}
+{f'<h2 style="margin-top:32px">Last Failed Run — #{last_failed.id}</h2>{step_html}{error_html}{fix_html}{fail_screenshot_html}' if show_last_failed_section and step_html else ""}
 
 <div class="footer">QA·OS Test Case Report · {test.name} · {utcnow().isoformat()}</div>
 </body></html>'''

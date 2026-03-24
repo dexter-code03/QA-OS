@@ -19,6 +19,77 @@ CAUSE_STALE_OR_STRATEGY = "STALE_OR_STRATEGY_MISMATCH"
 CAUSE_UNKNOWN = "UNKNOWN"
 CAUSE_SWIFTUI_SELECTOR_UNRELIABLE = "SWIFTUI_SELECTOR_UNRELIABLE"
 CAUSE_IOS_NO_ACCESSIBILITY_IDENTIFIER = "IOS_NO_ACCESSIBILITY_IDENTIFIER"
+CAUSE_KEYBOARD_COVERING = "KEYBOARD_COVERING_ELEMENT"
+CAUSE_ELEMENT_OFF_SCREEN = "ELEMENT_OFF_SCREEN"
+CAUSE_WRAPPER_NOT_EDITABLE = "WRAPPER_NOT_EDITABLE"
+
+
+def keyboard_likely_visible(step_results: list[dict[str, Any]]) -> bool:
+    """True if a type/clearAndType step ran within the last 3 steps — keyboard may be covering."""
+    recent = step_results[-3:] if len(step_results) >= 3 else step_results
+    for r in recent:
+        stype = (r.get("type") or r.get("step", {}).get("type") or "").lower()
+        if stype in ("type", "clearandtype"):
+            return True
+    return False
+
+
+def _xml_has_scrollable(xml: str) -> bool:
+    return 'scrollable="true"' in xml or "ScrollView" in xml
+
+
+_EDITABLE_CLASSES = {
+    "android.widget.EditText",
+    "XCUIElementTypeTextField",
+    "XCUIElementTypeSecureTextField",
+}
+
+
+def _detect_wrapper_with_child_input(
+    node: ET.Element,
+    platform: str,
+    android_package: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """If ``node`` is a non-editable wrapper with a child EditText/TextField, return the recommended selector.
+
+    Returns None if node IS an editable element or has no editable children.
+    """
+    node_cls = node.attrib.get("class", "") or node.attrib.get("type", "")
+    if node_cls in _EDITABLE_CLASSES:
+        return None
+
+    for child in node:
+        child_cls = child.attrib.get("class", "") or child.attrib.get("type", "")
+        if child_cls not in _EDITABLE_CLASSES:
+            continue
+        # Found a child editable element — build a recommended selector
+        node_rid = (node.attrib.get("resource-id") or "").strip()
+        if node_rid and child_cls == "android.widget.EditText":
+            rid = node_rid
+            if android_package and ":" not in rid:
+                rid = f"{android_package}:id/{rid}"
+            return {
+                "strategy": "-android uiautomator",
+                "value": f'new UiSelector().resourceId("{rid}").childSelector(new UiSelector().className("android.widget.EditText"))',
+                "evidence": f"Element '{node_rid}' is a wrapper (class={node_cls}) with a child EditText. "
+                            f"type/clearAndType must target the child EditText, not the wrapper.",
+            }
+        child_name = child.attrib.get("name", "") or child.attrib.get("label", "")
+        if child_name:
+            return {
+                "strategy": "-ios predicate string" if "ios" in platform.lower() else "-android uiautomator",
+                "value": f'name == "{child_name}"' if "ios" in platform.lower() else f'new UiSelector().className("{child_cls}")',
+                "evidence": f"Element is a wrapper (class={node_cls}) with a child {child_cls}. "
+                            f"type/clearAndType must target the child input, not the wrapper.",
+            }
+        return {
+            "strategy": "-android uiautomator" if "android" in platform.lower() else "xpath",
+            "value": f'new UiSelector().className("{child_cls}")' if "android" in platform.lower() else f'//{child_cls}',
+            "evidence": f"Element is a wrapper (class={node_cls}) with a child {child_cls}. "
+                        f"type/clearAndType must target the child input, not the wrapper.",
+        }
+
+    return None
 
 
 def parse_android_package(app_context: str) -> Optional[str]:
@@ -49,6 +120,8 @@ def _error_hints(error_message: str) -> set[str]:
         hints.add("interact")
     if "no such element" in e or "could not be located" in e or "unable to locate" in e:
         hints.add("missing")
+    if "cannot set the element" in e or "invalidelementstate" in e or "did you interact with the correct element" in e:
+        hints.add("invalid_element_state")
     return hints
 
 
@@ -199,6 +272,17 @@ def _classify_failure_ios(
         diagnosis["evidence"].append("Element matches but enabled=false — may need different flow or wait.")
         return diagnosis
 
+    # FM-06: wrapper-not-editable on iOS
+    if stype in ("type", "clearandtype"):
+        wrapper_info = _detect_wrapper_with_child_input(n, "ios")
+        if wrapper_info:
+            diagnosis["cause"] = CAUSE_WRAPPER_NOT_EDITABLE
+            diagnosis["evidence"].append(wrapper_info["evidence"])
+            diagnosis["recommended_fix"] = "target_child_input"
+            diagnosis["recommended_strategy"] = wrapper_info["strategy"]
+            diagnosis["recommended_value"] = wrapper_info["value"]
+            return diagnosis
+
     if swiftui and is_id_like:
         diagnosis["cause"] = CAUSE_SWIFTUI_SELECTOR_UNRELIABLE
         diagnosis["evidence"].append("Page source suggests SwiftUI (many XCUIElementTypeOther / sparse identifiers).")
@@ -235,6 +319,7 @@ def classify_failure_for_ai_fix(
     platform: str,
     android_package: Optional[str],
     tap_diagnosis: Optional[dict[str, Any]],
+    step_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Return a JSON-serializable diagnosis dict for the LLM and API response.
@@ -248,6 +333,58 @@ def classify_failure_for_ai_fix(
         "recommended_value": None,
     }
 
+    xml = (page_source_raw or page_source_fallback or "").strip()
+    stype = (failed_step.get("type") or "").lower()
+
+    # FM-03: keyboard covering element — check before other causes
+    if step_results and keyboard_likely_visible(step_results):
+        hints = _error_hints(error_message)
+        element_present = bool(xml) and bool(
+            (failed_step.get("selector") or {}).get("value")
+            and (failed_step.get("selector", {}).get("value", "") in xml)
+        )
+        if element_present and hints & {"timeout", "not_visible", "interact"}:
+            diagnosis["cause"] = CAUSE_KEYBOARD_COVERING
+            diagnosis["evidence"].append(
+                "A type step ran within last 3 steps — keyboard likely covering this element."
+            )
+            diagnosis["recommended_fix"] = "add_hide_keyboard_before_step"
+            return diagnosis
+
+    # FM-06: InvalidElementStateException on type/clearAndType — proactive wrapper scan
+    hints = _error_hints(error_message)
+    if stype in ("type", "clearandtype") and "invalid_element_state" in hints and xml:
+        try:
+            root = ET.fromstring(xml)
+            sel = failed_step.get("selector") or {}
+            nodes = [n for n in _walk(root) if _strategy_matches_node(n.attrib, sel.get("using", ""), sel.get("value", ""))]
+            if nodes:
+                wrapper_info = _detect_wrapper_with_child_input(nodes[0], platform, android_package)
+                if wrapper_info:
+                    diagnosis["cause"] = CAUSE_WRAPPER_NOT_EDITABLE
+                    diagnosis["evidence"].append(wrapper_info["evidence"])
+                    diagnosis["evidence"].append(
+                        f"Error: InvalidElementStateException — '{error_message[:120]}'"
+                    )
+                    diagnosis["recommended_fix"] = "target_child_input"
+                    diagnosis["recommended_strategy"] = wrapper_info["strategy"]
+                    diagnosis["recommended_value"] = wrapper_info["value"]
+                    return diagnosis
+        except ET.ParseError:
+            pass
+
+    # FM-05: element off-screen — scrollable context present
+    if xml and _xml_has_scrollable(xml):
+        if hints & {"timeout", "not_visible", "missing"} and stype in ("tap", "waitforvisible", "assertvisible"):
+            sel_val = (failed_step.get("selector") or {}).get("value", "")
+            if sel_val and sel_val not in xml:
+                diagnosis["cause"] = CAUSE_ELEMENT_OFF_SCREEN
+                diagnosis["evidence"].append(
+                    "ScrollView detected and element not in current viewport — likely off-screen."
+                )
+                diagnosis["recommended_fix"] = "scroll_before_step"
+                return diagnosis
+
     pf = (platform or "").lower().replace("-", "_")
     if pf in ("ios", "ios_sim"):
         return _classify_failure_ios(
@@ -258,7 +395,6 @@ def classify_failure_for_ai_fix(
         diagnosis["evidence"].append(f"Platform {platform!r} — classification tuned for Android.")
         return diagnosis
 
-    stype = (failed_step.get("type") or "").lower()
     if stype not in ("tap", "type", "waitforvisible", "assertvisible", "asserttext"):
         diagnosis["evidence"].append(f"Step type {stype!r} — structured locator classification skipped.")
         return diagnosis
@@ -317,6 +453,17 @@ def classify_failure_for_ai_fix(
         diagnosis["evidence"].append("Element matches but enabled=false — may need different flow or wait.")
         return diagnosis
 
+    # FM-06: wrapper-not-editable — type/clearAndType targeting a container instead of child EditText
+    if stype in ("type", "clearandtype"):
+        wrapper_info = _detect_wrapper_with_child_input(n, "android", android_package)
+        if wrapper_info:
+            diagnosis["cause"] = CAUSE_WRAPPER_NOT_EDITABLE
+            diagnosis["evidence"].append(wrapper_info["evidence"])
+            diagnosis["recommended_fix"] = "target_child_input"
+            diagnosis["recommended_strategy"] = wrapper_info["strategy"]
+            diagnosis["recommended_value"] = wrapper_info["value"]
+            return diagnosis
+
     strat_l = strategy.lower().replace("_", "").replace("-", "")
     is_id_like = strat_l in ("id", "resourceid")
     compose = _page_looks_compose(xml_l)
@@ -372,7 +519,20 @@ STRUCTURED FAILURE CLASSIFICATION — MANDATORY RULES:
    - Do not only bump timeout on the same tap.
 6. If Cause is ELEMENT_NOT_IN_XML:
    - The app is likely on the wrong screen — adjust earlier steps or add navigation; do NOT invent a new selector for an element absent from the XML.
-7. If Cause is UNKNOWN:
-   - Timeout increases are allowed only as a last resort when no better explanation exists.
+7. If Cause is KEYBOARD_COVERING_ELEMENT:
+   - Add a hideKeyboard step immediately before the failing step. The software keyboard is covering the target element.
+   - Do NOT increase timeout or change the selector — the element exists but is physically obscured.
+8. If Cause is ELEMENT_OFF_SCREEN:
+   - Add a scroll/swipe step before the failing step to bring it into view. The page is scrollable and the element is below the viewport.
+   - Do NOT only bump timeout.
+9. If Cause is WRAPPER_NOT_EDITABLE:
+   - The selector targets a WRAPPER/CONTAINER element, NOT the actual editable input inside it.
+   - You MUST use the Recommended selector value which targets the child input element.
+   - Android: use .childSelector(new UiSelector().className("android.widget.EditText")) appended to the parent's UiSelector.
+   - iOS: target XCUIElementTypeTextField or XCUIElementTypeSecureTextField child directly.
+   - Also split the step: tap the wrapper first, then type into the child EditText, then hideKeyboard.
+   - Do NOT keep targeting the wrapper — that will always fail with InvalidElementStateException.
+10. If Cause is UNKNOWN:
+    - Timeout increases are allowed only as a last resort when no better explanation exists.
 Still obey all other rules (keyboard actions, acceptance_criteria, complete fixed_steps JSON).
 """
