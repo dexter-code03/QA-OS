@@ -16,12 +16,33 @@ UNIVERSAL_RULES = """
 ALWAYS:
 - Prefer clickable=true parent over non-clickable child for all tap steps.
 - Add waitForVisible before every tap step.
-- Use the EXACT full resource-id from the XML (e.g. com.example.app:id/element) — never shorten or change the package prefix.
+- Use the EXACT resource-id as it appears in the XML — copy it verbatim, character for character.
+
+SELECTOR SOURCE OF TRUTH:
+- The XML/DOM CONTEXT is the ONLY valid source for selector values.
+- Screenshots are for VISUAL UNDERSTANDING ONLY — to see layout, screen state, and flow.
+- NEVER extract text visible in a screenshot to use as a selector value.
+- If an element is visible in the screenshot but absent from the XML, you CANNOT target it — skip it or note it as unresolvable.
+- Every selector.value you output MUST match verbatim against an attribute in the provided XML.
+
+RESOURCE-ID FORMAT (CRITICAL):
+- If the XML shows resource-id="home_button", use exactly "home_button" — do NOT add a package prefix.
+- If the XML shows resource-id="com.example:id/home_button", use exactly "com.example:id/home_button".
+- NEVER invent or guess a package name. NEVER add com.xxx:id/ to a resource-id that appears without a package prefix in the XML.
+- For UiSelector: resourceId("home_button") NOT resourceId("com.any.package:id/home_button") — unless the XML actually has that prefix.
+
+DATA DISCIPLINE (ZERO TOLERANCE):
+- EVERY value typed into a field (emails, passwords, names, phones, OTPs, URLs, amounts, dates, codes) MUST be a ${variable_name} reference.
+- The test_data / data_fixes object MUST contain the actual value for every ${variable}.
+- If you generate type or clearAndType, the text field MUST use ${variable_name}. Raw literal values are REJECTED.
+- If you generate assertText or assertTextContains, the expect field MUST use ${variable_name} for any dynamic data.
 
 NEVER:
 - Type into TextView or StaticText — these are labels, not inputs. Only EditText (Android) or TextField/SecureTextField (iOS) are editable.
 - Type into a wrapper element (View, FrameLayout, etc.) that CONTAINS a child EditText — always target the child EditText with .childSelector().
 - Generate assertText on password fields or SecureTextField elements — masked fields always return empty or dots.
+- Hardcode test data (emails, phones, passwords, OTPs, URLs, names, amounts) directly in step text/expect fields.
+- Invent package prefixes for resource-ids. Use EXACTLY what the XML shows.
 """
 
 # ---------------------------------------------------------------------------

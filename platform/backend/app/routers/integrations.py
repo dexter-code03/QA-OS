@@ -1,6 +1,7 @@
 """Connection tests (Appium, Confluence, AI), Figma components, Confluence sync, device listing."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -16,6 +17,22 @@ from ..helpers import ai_creds, load_settings, utcnow
 from ..models import Project, Run, TestDefinition, TestSuite
 from ..runner.appium_service import ensure_appium_running
 from ..settings import settings
+
+
+def _confluence_auth_headers(s: dict) -> dict[str, str]:
+    """Build auth headers for Confluence — Basic Auth for Atlassian Cloud, Bearer for Server/DC."""
+    base = (s.get("confluence_url") or "").strip()
+    token = (s.get("confluence_token") or "").strip()
+    email = (s.get("confluence_email") or "").strip()
+
+    if not token:
+        return {}
+
+    if ".atlassian.net" in base and email:
+        creds = base64.b64encode(f"{email}:{token}".encode()).decode()
+        return {"Authorization": f"Basic {creds}", "Accept": "application/json"}
+
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 router = APIRouter()
 
@@ -131,15 +148,16 @@ async def test_appium() -> dict[str, Any]:
 @router.post("/api/test-connection/confluence")
 async def test_confluence() -> dict[str, Any]:
     s = load_settings()
-    url = s.get("confluence_url", "")
-    token = s.get("confluence_token", "")
+    url = (s.get("confluence_url") or "").strip()
     if not url:
         return {"ok": False, "message": "No Confluence URL configured"}
+    headers = _confluence_auth_headers(s)
+    if not headers:
+        return {"ok": False, "message": "No Confluence API token configured"}
+    if ".atlassian.net" in url and not (s.get("confluence_email") or "").strip():
+        return {"ok": False, "message": "Atlassian Cloud requires an email address. Add it in the Confluence Email field."}
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            headers = {}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
             r = await client.get(url.rstrip("/") + "/rest/api/space?limit=1", headers=headers)
             if r.status_code == 200:
                 return {"ok": True, "message": "Connected to Confluence"}
@@ -176,7 +194,7 @@ async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
     if not base or not token:
         raise HTTPException(status_code=400, detail="Configure Confluence URL and API token in Settings")
 
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+    headers = {**_confluence_auth_headers(s), "Content-Type": "application/json"}
 
     with SessionLocal() as db:
         proj = db.query(Project).filter(Project.id == project_id).first()
@@ -310,6 +328,184 @@ async def sync_project_to_confluence(project_id: int) -> dict[str, Any]:
         base_ui = base.rstrip("/")
         page_url = f"{base_ui}{web_ui}" if web_ui else base_ui
         return {"ok": True, "page_id": page_id, "page_url": page_url, "space_key": space_key, "title": title}
+
+
+# ---------------------------------------------------------------------------
+# Confluence — fetch page content as PRD source
+# ---------------------------------------------------------------------------
+
+@router.get("/api/integrations/confluence/search")
+async def confluence_search(q: str = "", space: str = "", limit: int = 10) -> dict[str, Any]:
+    """Search Confluence pages by title (CQL). Used for autocomplete in suite generation."""
+    s = load_settings()
+    base = (s.get("confluence_url") or "").rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="Configure Confluence URL in Settings")
+    headers = _confluence_auth_headers(s)
+    if not headers:
+        raise HTTPException(status_code=400, detail="Configure Confluence API token in Settings")
+
+    space_key = space or (s.get("confluence_space_key") or "").strip()
+
+    cql_parts = ["type = page"]
+    if space_key:
+        cql_parts.append(f"space = {_confluence_cql_string_literal(space_key)}")
+    if q.strip():
+        cql_parts.append(f"title ~ {_confluence_cql_string_literal(q.strip())}")
+    cql = " AND ".join(cql_parts) + " ORDER BY lastModified DESC"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{base}/rest/api/content/search",
+            params={"cql": cql, "limit": min(limit, 25), "expand": "space"},
+            headers=headers,
+        )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Confluence search failed: HTTP {r.status_code}")
+        results = r.json().get("results") or []
+        pages = [
+            {
+                "id": str(p.get("id") or ""),
+                "title": str(p.get("title") or ""),
+                "space_key": (p.get("space") or {}).get("key", ""),
+            }
+            for p in results
+        ]
+        return {"pages": pages}
+
+
+@router.get("/api/integrations/confluence/page/{page_id}")
+async def confluence_fetch_page(page_id: str) -> dict[str, Any]:
+    """Fetch a Confluence page's body as plain text (strips HTML) for use as PRD."""
+    s = load_settings()
+    base = (s.get("confluence_url") or "").rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="Configure Confluence URL in Settings")
+    headers = _confluence_auth_headers(s)
+    if not headers:
+        raise HTTPException(status_code=400, detail="Configure Confluence API token in Settings")
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"{base}/rest/api/content/{page_id}",
+            params={"expand": "body.storage,space,version"},
+            headers=headers,
+        )
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="Confluence page not found")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Confluence fetch failed: HTTP {r.status_code}")
+
+        data = r.json()
+        title = str(data.get("title") or "")
+        html_body = (data.get("body") or {}).get("storage", {}).get("value", "")
+        plain_text = _html_to_text(html_body)
+        space_info = data.get("space") or {}
+
+        return {
+            "id": str(data.get("id") or ""),
+            "title": title,
+            "space_key": space_info.get("key", ""),
+            "text": plain_text,
+            "html_length": len(html_body),
+            "text_length": len(plain_text),
+        }
+
+
+def _html_to_text(html: str) -> str:
+    """Simple HTML→plaintext: strip tags, decode entities, collapse whitespace."""
+    import html as html_lib
+    import re as _re
+    text = _re.sub(r"<br\s*/?>", "\n", html, flags=_re.I)
+    text = _re.sub(r"</(p|div|h[1-6]|li|tr)>", "\n", text, flags=_re.I)
+    text = _re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Figma — enhanced fetch (component names + descriptions + frame structure)
+# ---------------------------------------------------------------------------
+
+_FIGMA_SKIP_TYPES = frozenset({"CONNECTOR", "VECTOR", "LINE", "REGULAR_POLYGON", "STAR", "ELLIPSE", "BOOLEAN_OPERATION", "SLICE"})
+
+
+@lru_cache(maxsize=16)
+def _cached_figma_file_overview(token: str, file_key: str, _ttl_bucket: int) -> dict[str, Any]:
+    """Fetch top-level frames and component descriptions from Figma file."""
+    r = httpx.get(
+        f"https://api.figma.com/v1/files/{file_key}?depth=3",
+        headers={"X-Figma-Token": token},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Figma API error: HTTP {r.status_code}")
+    data = r.json()
+
+    doc = data.get("document") or {}
+    pages: list[dict[str, Any]] = []
+    all_component_names: list[str] = []
+
+    for page_node in (doc.get("children") or []):
+        frames: list[dict[str, str]] = []
+        _collect_frames(page_node.get("children") or [], frames, all_component_names, depth=0)
+        pages.append({
+            "name": page_node.get("name", ""),
+            "frames": frames,
+        })
+
+    return {"name": data.get("name", ""), "pages": pages, "all_names": sorted(set(all_component_names))}
+
+
+def _collect_frames(
+    children: list[dict],
+    frames: list[dict[str, str]],
+    names: list[str],
+    depth: int,
+) -> None:
+    """Recursively collect meaningful frames/components from Figma node tree."""
+    for child in children:
+        ntype = child.get("type", "")
+        name = (child.get("name") or "").strip()
+
+        if ntype in _FIGMA_SKIP_TYPES or not name:
+            continue
+
+        if ntype in ("FRAME", "COMPONENT", "COMPONENT_SET", "GROUP", "SECTION", "INSTANCE"):
+            frames.append({"name": name, "type": ntype, "id": child.get("id", "")})
+            if ntype in ("COMPONENT", "COMPONENT_SET", "INSTANCE"):
+                names.append(name)
+
+        if depth < 2:
+            sub_children = child.get("children") or []
+            if sub_children:
+                _collect_frames(sub_children, frames, names, depth + 1)
+
+
+@router.get("/api/integrations/figma/overview")
+def figma_file_overview() -> dict[str, Any]:
+    """Return file structure: pages → frames/components (for understanding UI flow)."""
+    s = load_settings()
+    token = (s.get("figma_token") or "").strip()
+    file_key = (s.get("figma_file_key") or "").strip()
+    if not token or not file_key:
+        raise HTTPException(status_code=400, detail="Configure Figma token and file key in Settings")
+    try:
+        bucket = _figma_components_ttl_bucket()
+        overview = _cached_figma_file_overview(token, file_key, bucket)
+        try:
+            published = list(_cached_figma_component_names(token, file_key, bucket))
+        except Exception:
+            published = []
+        tree_names = overview.get("all_names") or []
+        all_names = sorted(set(published + tree_names))
+        return {"file_name": overview["name"], "pages": overview["pages"], "component_names": all_names}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Figma request failed: {e}") from e
 
 
 @router.post("/api/test-connection/ai")

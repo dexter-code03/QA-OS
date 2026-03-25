@@ -325,7 +325,7 @@ export function ExecutionPage({
       currentTest = freshTests.find(t => t.id === test.id) || currentTest;
       setAgentStatus(`Running ${currentTest.name} — attempt ${iter + 1}/${agentMaxIterations}`);
       addAgentLog(`Starting run for "${currentTest.name}" (attempt ${iter + 1})`);
-      const r = await api.createRun({ project_id: project.id, build_id: buildId!, test_id: currentTest.id, platform, device_target: deviceTarget });
+      const r = await api.createRun({ project_id: project.id, build_id: buildId!, test_id: currentTest.id, platform, device_target: deviceTarget, ...(dataSetId ? { data_set_id: dataSetId } : {}), ...(enableApiLogging ? { enable_api_logging: true } : {}) });
       onRunCreated(r.id);
       addAgentLog(`Run #${r.id} started — waiting for completion...`);
       let completed: Run;
@@ -537,11 +537,11 @@ export function ExecutionPage({
 
   // AI Fix state
   const [fixBusy, setFixBusy] = useState(false);
-  const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[]; fix_type?: string; data_fixes?: Record<string, string>; data_set_updated?: boolean } | null>(null);
+  const [fixResult, setFixResult] = useState<{ analysis: string; fixed_steps: any[]; changes: any[]; fix_type?: string; bug_report?: import("../types").BugReport | null; data_fixes?: Record<string, string>; data_set_updated?: boolean } | null>(null);
   const [tapDiagnosis, setTapDiagnosis] = useState<TapDiagnosisOut | null>(null);
   const [showFixPanel, setShowFixPanel] = useState(false);
   const [fixSuggestion, setFixSuggestion] = useState("");
-  const [relatedTests, setRelatedTests] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] } | null>(null);
+  const [relatedTests, setRelatedTests] = useState<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number; has_failed_step: boolean }[] } | null>(null);
 
   /** Shown run: full loaded row, or list cache while getRun() loads — avoids flashing Run setup when opening a recent run. */
   const displayRun = useMemo(() => {
@@ -585,6 +585,8 @@ export function ExecutionPage({
         test_id: displayRun.test_id!,
         platform: displayRun.platform,
         device_target: displayRun.device_target,
+        ...(displayRun.data_set_id ? { data_set_id: displayRun.data_set_id } : dataSetId ? { data_set_id: dataSetId } : {}),
+        ...((displayRun.summary as any)?.enable_api_logging || enableApiLogging ? { enable_api_logging: true } : {}),
       });
       setStepResults([]);
       setSelShot(null);
@@ -712,9 +714,11 @@ export function ExecutionPage({
       setRelatedTests(null);
       setFixBusy(false);
       if (targetTest) {
-        void api.getRelatedTests(targetTest.id).then(rel => setRelatedTests(rel)).catch(() => {});
+        const prereqStepsLenForRelated = prereq ? stepsForPlatform(prereq, displayRun.platform).length : 0;
+        const mainFailedIdxForRelated = prereq ? failedIdx - prereqStepsLenForRelated : failedIdx;
+        void api.getRelatedTests(targetTest.id, { failed_step_index: mainFailedIdxForRelated, platform: displayRun.platform }).then(rel => setRelatedTests(rel)).catch(() => {});
       }
-      const fixLabel = res.fix_type === "data" ? "data fix" : res.fix_type === "both" ? "step + data fix" : "step fix";
+      const fixLabel = res.fix_type === "bug" ? "bug detected" : res.fix_type === "data" ? "data fix" : res.fix_type === "both" ? "step + data fix" : "step fix";
       const changeCount = res.changes?.length || 0;
       let fixMsg = `AI found ${changeCount} ${fixLabel}${changeCount !== 1 ? "es" : ""}`;
       if (res.data_set_updated) fixMsg += " · DataSet updated";
@@ -839,7 +843,8 @@ export function ExecutionPage({
       await applyFix("update");
       return;
     }
-    if (!relatedTests?.similar?.length) return;
+    const eligible = relatedTests?.similar?.filter(s => s.has_failed_step) || [];
+    if (eligible.length === 0) return;
     const mainFailedIdx = prereq ? failedIdx - prereqStepsLenApply : failedIdx;
     const prefixLen = Math.min(mainFailedIdx + 1, stepsForPlatform(testForRun, displayRun.platform).length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
     if (prefixLen < 2) return;
@@ -852,6 +857,7 @@ export function ExecutionPage({
         fixed_steps: stepsToApply,
         prefix_length: prefixLen,
         original_steps: stepsForPlatform(testForRun, displayRun.platform),
+        test_ids: eligible.map(s => s.test.id),
         target_platform: displayRun.platform,
       });
       setShowFixPanel(false);
@@ -869,7 +875,7 @@ export function ExecutionPage({
     await applyFix("update");
     setTimeout(async () => {
       try {
-        const r = await api.createRun({ project_id: displayRun.project_id, build_id: displayRun.build_id ?? undefined, test_id: testForRun.id, platform: displayRun.platform, device_target: displayRun.device_target });
+        const r = await api.createRun({ project_id: displayRun.project_id, build_id: displayRun.build_id ?? undefined, test_id: testForRun.id, platform: displayRun.platform, device_target: displayRun.device_target, ...(displayRun.data_set_id ? { data_set_id: displayRun.data_set_id } : dataSetId ? { data_set_id: dataSetId } : {}), ...((displayRun.summary as any)?.enable_api_logging || enableApiLogging ? { enable_api_logging: true } : {}) });
         setStepResults([]); setSelShot(null); setFixResult(null); setTapDiagnosis(null); setShowFixPanel(false);
         onRunCreated(r.id);
         toast(`Rerun with fix → #${r.id}`, "success");
@@ -1416,8 +1422,8 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                         <div style={{ display: "flex", gap: 8, alignItems: "center", fontWeight: 600, marginBottom: 4, color: "#a78bfa", fontFamily: "var(--sans)" }}>
                           Root Cause
                           {fixResult.fix_type && (
-                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: fixResult.fix_type === "data" ? "rgba(34,197,94,.15)" : fixResult.fix_type === "both" ? "rgba(255,176,32,.15)" : "rgba(99,102,241,.15)", color: fixResult.fix_type === "data" ? "#22c55e" : fixResult.fix_type === "both" ? "#ffb020" : "#818cf8" }}>
-                              {fixResult.fix_type === "data" ? "Data Fix" : fixResult.fix_type === "both" ? "Step + Data Fix" : "Step Fix"}
+                            <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 4, background: fixResult.fix_type === "bug" ? "rgba(239,68,68,.15)" : fixResult.fix_type === "data" ? "rgba(34,197,94,.15)" : fixResult.fix_type === "both" ? "rgba(255,176,32,.15)" : "rgba(99,102,241,.15)", color: fixResult.fix_type === "bug" ? "#ef4444" : fixResult.fix_type === "data" ? "#22c55e" : fixResult.fix_type === "both" ? "#ffb020" : "#818cf8" }}>
+                              {fixResult.fix_type === "bug" ? "Bug Detected" : fixResult.fix_type === "data" ? "Data Fix" : fixResult.fix_type === "both" ? "Step + Data Fix" : "Step Fix"}
                             </span>
                           )}
                           {fixResult.data_set_updated && (
@@ -1425,6 +1431,22 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                           )}
                         </div>
                         {fixResult.analysis}
+                        {fixResult.fix_type === "bug" && fixResult.bug_report && (
+                          <div style={{ marginTop: 10, padding: 10, background: "rgba(239,68,68,.08)", borderRadius: 6, border: "1px solid rgba(239,68,68,.3)" }}>
+                            <div style={{ fontWeight: 700, fontSize: 12, color: "#ef4444", marginBottom: 6 }}>🐛 Bug Report: {fixResult.bug_report.title}</div>
+                            <div style={{ fontSize: 11, lineHeight: 1.5 }}>
+                              <div><strong>Severity:</strong> <span style={{ textTransform: "uppercase", color: fixResult.bug_report.severity === "critical" ? "#ef4444" : fixResult.bug_report.severity === "major" ? "#f59e0b" : "#6b7280" }}>{fixResult.bug_report.severity}</span></div>
+                              <div><strong>Expected Screen:</strong> {fixResult.bug_report.expected_screen}</div>
+                              <div><strong>Actual Screen:</strong> {fixResult.bug_report.actual_screen}</div>
+                              <div style={{ marginTop: 4 }}><strong>Expected:</strong> {fixResult.bug_report.expected_behavior}</div>
+                              <div><strong>Actual:</strong> {fixResult.bug_report.actual_behavior}</div>
+                              {fixResult.bug_report.evidence && <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--text-muted)" }}>{fixResult.bug_report.evidence}</div>}
+                            </div>
+                            <div style={{ marginTop: 8, fontSize: 10, color: "var(--text-muted)" }}>
+                              This is a bug in the app, not the test. The test steps were NOT modified.
+                            </div>
+                          </div>
+                        )}
                         {fixResult.data_fixes && Object.keys(fixResult.data_fixes).length > 0 && (
                           <div style={{ marginTop: 8, padding: 8, background: "rgba(34,197,94,.08)", borderRadius: 4, fontSize: 11 }}>
                             <div style={{ fontWeight: 600, marginBottom: 4, color: "#22c55e" }}>Data Fixes Applied</div>
@@ -1499,7 +1521,10 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                     </div>
 
                     {/* Related tests suggestion */}
-                    {relatedTests && (relatedTests.similar.length > 0 || relatedTests.dependents.length > 0) && (
+                    {relatedTests && (relatedTests.similar.length > 0 || relatedTests.dependents.length > 0) && (() => {
+                      const eligible = relatedTests.similar.filter(s => s.has_failed_step);
+                      const ineligible = relatedTests.similar.filter(s => !s.has_failed_step);
+                      return (
                       <div style={{ marginBottom: 14, padding: 10, background: "rgba(99,102,241,.08)", borderRadius: 6, border: "1px solid rgba(99,102,241,.3)" }}>
                         <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: "#a78bfa" }}>Related tests</div>
                         {relatedTests.dependents.length > 0 && (
@@ -1507,18 +1532,45 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
                             {relatedTests.dependents.length} test{relatedTests.dependents.length !== 1 ? "s" : ""} use this as prerequisite — they will get the fix automatically.
                           </div>
                         )}
-                        {relatedTests.similar.length > 0 && (
+                        {eligible.length > 0 && (
                           <>
-                            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>
-                              {relatedTests.similar.length} test{relatedTests.similar.length !== 1 ? "s" : ""} share similar steps: {relatedTests.similar.map(s => s.test.name).join(", ")}
+                            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>
+                              {eligible.length} test{eligible.length !== 1 ? "s" : ""} have the same failed step:
+                            </div>
+                            <div style={{ marginBottom: 6 }}>
+                              {eligible.map(s => (
+                                <div key={s.test.id} style={{ fontSize: 11, padding: "2px 0", display: "flex", alignItems: "center", gap: 6 }}>
+                                  <span style={{ color: "#22c55e" }}>✓</span>
+                                  <span>{s.test.name}</span>
+                                  <span style={{ color: "var(--muted)", fontSize: 10 }}>({s.shared_prefix_length} shared steps)</span>
+                                </div>
+                              ))}
                             </div>
                             <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)", fontSize: 11 }} onClick={applyFixAllRelated} disabled={busy}>
-                              🔧 Fix all related tests
+                              Fix {eligible.length} related test{eligible.length !== 1 ? "s" : ""}
                             </button>
                           </>
                         )}
+                        {ineligible.length > 0 && (
+                          <div style={{ marginTop: eligible.length > 0 ? 8 : 0, fontSize: 11, color: "var(--muted)" }}>
+                            {ineligible.length} test{ineligible.length !== 1 ? "s" : ""} share a prefix but diverge before the failed step:
+                            {ineligible.map(s => (
+                              <div key={s.test.id} style={{ padding: "2px 0", display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ color: "#f59e0b" }}>–</span>
+                                <span>{s.test.name}</span>
+                                <span style={{ fontSize: 10 }}>({s.shared_prefix_length} shared, diverges before step {(failedIdx ?? 0) + 1})</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {eligible.length === 0 && ineligible.length > 0 && (
+                          <div style={{ marginTop: 6, fontSize: 10, color: "var(--muted)", fontStyle: "italic" }}>
+                            No tests share the exact failed step — fix will only apply to the current test.
+                          </div>
+                        )}
                       </div>
-                    )}
+                      );
+                    })()}
 
                     {/* Prerequisite fix notice */}
                     {failureInPrereqApply && prereq && (
@@ -1529,18 +1581,31 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
 
                     {/* Action buttons */}
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      <button className="btn-primary" style={{ fontSize: 11, padding: "8px 16px", background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={rerunWithFix} disabled={busy}>
-                        🔄 Apply Fix & Rerun
-                      </button>
-                      <button className="btn-ghost btn-sm" onClick={() => applyFix("update")} disabled={busy}>
-                        {failureInPrereqApply ? `Update prerequisite "${prereq?.name}"` : "Update existing test"}
-                      </button>
-                      <button className="btn-ghost btn-sm" onClick={() => applyFix("new")} disabled={busy}>
-                        Save as new test
-                      </button>
-                      <button className="btn-ghost btn-sm" style={{ marginLeft: "auto" }} onClick={downloadFixReport}>
-                        📋 Download Report
-                      </button>
+                      {fixResult.fix_type === "bug" ? (
+                        <>
+                          <button className="btn-ghost btn-sm" style={{ color: "#ef4444", borderColor: "rgba(239,68,68,.3)" }} disabled>
+                            Fix not applicable — Bug detected
+                          </button>
+                          <button className="btn-ghost btn-sm" style={{ marginLeft: "auto" }} onClick={downloadFixReport}>
+                            📋 Download Bug Report
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button className="btn-primary" style={{ fontSize: 11, padding: "8px 16px", background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={rerunWithFix} disabled={busy}>
+                            🔄 Apply Fix & Rerun
+                          </button>
+                          <button className="btn-ghost btn-sm" onClick={() => applyFix("update")} disabled={busy}>
+                            {failureInPrereqApply ? `Update prerequisite "${prereq?.name}"` : "Update existing test"}
+                          </button>
+                          <button className="btn-ghost btn-sm" onClick={() => applyFix("new")} disabled={busy}>
+                            Save as new test
+                          </button>
+                          <button className="btn-ghost btn-sm" style={{ marginLeft: "auto" }} onClick={downloadFixReport}>
+                            📋 Download Report
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 )}

@@ -22,6 +22,7 @@ CAUSE_IOS_NO_ACCESSIBILITY_IDENTIFIER = "IOS_NO_ACCESSIBILITY_IDENTIFIER"
 CAUSE_KEYBOARD_COVERING = "KEYBOARD_COVERING_ELEMENT"
 CAUSE_ELEMENT_OFF_SCREEN = "ELEMENT_OFF_SCREEN"
 CAUSE_WRAPPER_NOT_EDITABLE = "WRAPPER_NOT_EDITABLE"
+CAUSE_WRONG_SCREEN_BUG = "WRONG_SCREEN_BUG_LIKELY"
 
 
 def keyboard_likely_visible(step_results: list[dict[str, Any]]) -> bool:
@@ -145,6 +146,58 @@ def _full_resource_id(android_package: Optional[str], selector_value: str, node_
 
 def _page_looks_compose(xml_lower: str) -> bool:
     return "androidx.compose" in xml_lower or "composeview" in xml_lower
+
+
+def check_screen_identity(
+    acceptance_criteria: str,
+    page_source_xml: str,
+) -> dict[str, Any] | None:
+    """Pre-classification: check if the current screen matches acceptance_criteria.
+
+    Returns a diagnosis dict with WRONG_SCREEN_BUG_LIKELY if no key terms from
+    acceptance_criteria appear in the XML. Returns None if the screen looks correct
+    or if there's insufficient data to judge.
+    """
+    if not acceptance_criteria or not page_source_xml:
+        return None
+
+    ac_lower = acceptance_criteria.lower()
+    xml_lower = page_source_xml.lower()
+
+    ac_terms = set(re.findall(r"\w{4,}", ac_lower))
+    _STOP_WORDS = frozenset({
+        "should", "must", "that", "this", "with", "from", "into", "when",
+        "then", "after", "before", "user", "screen", "page", "test", "step",
+        "verify", "check", "ensure", "visible", "click", "button", "field",
+        "enter", "type", "text", "value", "expected", "actual", "will", "does",
+        "have", "been", "able", "display", "show", "appear", "present",
+    })
+    meaningful_terms = ac_terms - _STOP_WORDS
+    if len(meaningful_terms) < 2:
+        return None
+
+    hits = sum(1 for term in meaningful_terms if term in xml_lower)
+    hit_ratio = hits / len(meaningful_terms) if meaningful_terms else 0
+
+    if hit_ratio < 0.15 and len(meaningful_terms) >= 3:
+        return {
+            "cause": CAUSE_WRONG_SCREEN_BUG,
+            "evidence": [
+                f"Screen identity check: only {hits}/{len(meaningful_terms)} key terms from "
+                f"acceptance_criteria found in current page source XML.",
+                f"Terms searched: {', '.join(sorted(list(meaningful_terms)[:10]))}",
+                "The app is likely on the wrong screen. This is probably a bug in the app, not a test issue.",
+            ],
+            "recommended_fix": "report_bug",
+            "recommended_strategy": None,
+            "recommended_value": None,
+            "message": (
+                "The current screen does not match the test's acceptance criteria. "
+                "The test is correct — the app behavior is wrong. Report as a bug."
+            ),
+        }
+
+    return None
 
 
 def build_failure_diagnosis_block(diagnosis: dict[str, Any]) -> str:
@@ -534,5 +587,14 @@ STRUCTURED FAILURE CLASSIFICATION — MANDATORY RULES:
    - Do NOT keep targeting the wrapper — that will always fail with InvalidElementStateException.
 10. If Cause is UNKNOWN:
     - Timeout increases are allowed only as a last resort when no better explanation exists.
+11. If Cause is WRONG_SCREEN_BUG_LIKELY:
+    - Set fix_type to "bug" and fill bug_report with title, severity, expected_screen, actual_screen, expected_behavior, actual_behavior, evidence.
+    - The app navigated to a screen that does NOT match the test's acceptance criteria.
+    - Do NOT change the test steps. The test is correct; the app behavior is wrong.
+    - Return fixed_steps as a copy of original_steps UNCHANGED.
+    - NEVER adapt the test to work on the wrong screen — that hides bugs.
+12. BUG DETECTION (applies to ALL causes):
+    - If at any point you determine the app is showing unexpected behavior (wrong screen, missing feature, error state, data mismatch) that contradicts the acceptance_criteria, set fix_type="bug".
+    - A bug means the TEST is correct but the APP is wrong. Do not rewrite the test to match broken app behavior.
 Still obey all other rules (keyboard actions, acceptance_criteria, complete fixed_steps JSON).
 """

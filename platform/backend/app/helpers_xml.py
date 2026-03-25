@@ -36,12 +36,21 @@ ANDROID_INTERACTIVE_CLASSES = {
     "android.widget.RadioButton", "android.widget.Spinner", "android.widget.ImageButton",
     "android.widget.Switch", "android.widget.ToggleButton", "android.widget.TextView",
     "android.widget.ImageView",
+    "android.widget.ProgressBar", "android.widget.SeekBar",
+    "androidx.recyclerview.widget.RecyclerView", "android.widget.ScrollView",
+    "android.widget.HorizontalScrollView", "android.widget.ListView",
+    "android.widget.FrameLayout", "android.view.ViewGroup",
+    "android.widget.TabWidget", "android.widget.TabHost",
 }
 
 IOS_INTERACTIVE_TYPES = {
     "XCUIElementTypeButton", "XCUIElementTypeTextField",
     "XCUIElementTypeSecureTextField", "XCUIElementTypeSwitch",
     "XCUIElementTypeSlider", "XCUIElementTypeStaticText",
+    "XCUIElementTypeScrollView", "XCUIElementTypeTable",
+    "XCUIElementTypeCell", "XCUIElementTypeCollectionView",
+    "XCUIElementTypeSegmentedControl", "XCUIElementTypeTabBar",
+    "XCUIElementTypeNavigationBar", "XCUIElementTypePicker",
 }
 
 # Short name mappings for token-efficient output
@@ -57,6 +66,15 @@ _ANDROID_SHORT = {
     "android.widget.TextView": "TextView",
     "android.widget.ImageView": "ImageView",
     "android.view.View": "View",
+    "android.view.ViewGroup": "ViewGroup",
+    "android.widget.FrameLayout": "FrameLayout",
+    "android.widget.ScrollView": "ScrollView",
+    "android.widget.HorizontalScrollView": "HScrollView",
+    "android.widget.ListView": "ListView",
+    "android.widget.ProgressBar": "ProgressBar",
+    "android.widget.SeekBar": "SeekBar",
+    "android.widget.TabWidget": "TabWidget",
+    "androidx.recyclerview.widget.RecyclerView": "RecyclerView",
 }
 
 _IOS_SHORT = {
@@ -68,6 +86,14 @@ _IOS_SHORT = {
     "XCUIElementTypeStaticText": "StaticText",
     "XCUIElementTypeImage": "Image",
     "XCUIElementTypeOther": "Other",
+    "XCUIElementTypeScrollView": "ScrollView",
+    "XCUIElementTypeTable": "Table",
+    "XCUIElementTypeCell": "Cell",
+    "XCUIElementTypeCollectionView": "CollectionView",
+    "XCUIElementTypeSegmentedControl": "SegmentedControl",
+    "XCUIElementTypeTabBar": "TabBar",
+    "XCUIElementTypeNavigationBar": "NavBar",
+    "XCUIElementTypePicker": "Picker",
 }
 
 
@@ -250,12 +276,22 @@ def filter_by_relevance(
     return result[:max_elements]
 
 
+_FLOW_INDICATORS = re.compile(
+    r"\b(after|then|next|from\s+\w+\s+to|navigate\s+to|go\s+to|land(?:s|ing)?\s+on|redirect|reach|arrive)\b",
+    re.IGNORECASE,
+)
+
+
 def select_relevant_screens(
     screens: list[Any],
     description: str,
     max_screens: int = 4,
 ) -> list[Any]:
-    """Pick only screens relevant to the FRD description."""
+    """Pick screens relevant to the description, with flow-aware ordering.
+
+    When the prompt mentions flow indicators (after, then, navigate to ...),
+    include adjacent screens in folder order so multi-screen flows are covered.
+    """
     if not description or not screens:
         return screens[:max_screens]
 
@@ -263,8 +299,8 @@ def select_relevant_screens(
     if not desc_words:
         return screens[:max_screens]
 
-    scored: list[tuple[Any, int]] = []
-    for screen in screens:
+    scored: list[tuple[Any, int, int]] = []
+    for idx, screen in enumerate(screens):
         name_words = set(re.findall(r"\w{3,}", (screen.name or "").lower()))
         name_overlap = len(desc_words & name_words) * 3
 
@@ -272,11 +308,28 @@ def select_relevant_screens(
         xml_lower = xml.lower()
         element_hits = sum(1 for word in desc_words if word in xml_lower)
 
-        scored.append((screen, name_overlap + element_hits))
+        scored.append((screen, name_overlap + element_hits, idx))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    result = [s for s, sc in scored[:max_screens] if sc > 0]
-    return result or [scored[0][0]] if scored else []
+    result = [s for s, sc, _ in scored[:max_screens] if sc > 0]
+    if not result:
+        result = [scored[0][0]] if scored else []
+
+    has_flow = bool(_FLOW_INDICATORS.search(description))
+    if has_flow and result and len(result) < max_screens:
+        selected_indices = {s[2] for s in scored[:max_screens] if s[1] > 0}
+        for s, sc, idx in scored[:max_screens]:
+            if sc > 0:
+                for neighbor_idx in (idx - 1, idx + 1):
+                    if 0 <= neighbor_idx < len(screens) and neighbor_idx not in selected_indices:
+                        result.append(screens[neighbor_idx])
+                        selected_indices.add(neighbor_idx)
+                        if len(result) >= max_screens:
+                            break
+            if len(result) >= max_screens:
+                break
+
+    return result[:max_screens]
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +430,7 @@ def build_xml_context_v2(
     screens: list[Any],
     description: str = "",
     max_screens: int = 4,
-    max_elements_per_screen: int = 20,
+    max_elements_per_screen: int = 35,
 ) -> str:
     """Replacement for build_xml_context() with relevance filtering.
 
@@ -410,7 +463,7 @@ def preprocess_live_xml(
     raw_xml: str,
     platform: str,
     description: str = "",
-    max_elements: int = 30,
+    max_elements: int = 50,
 ) -> str:
     """Process live driver.page_source() XML.
 
@@ -418,3 +471,133 @@ def preprocess_live_xml(
     Uses a slightly higher max_elements since there's only one screen.
     """
     return preprocess_xml(raw_xml, platform, description=description, max_elements=max_elements)
+
+
+# ---------------------------------------------------------------------------
+# Selector validation against raw XML
+# ---------------------------------------------------------------------------
+
+def validate_selectors_against_xml(
+    steps: list[dict],
+    raw_xml_sources: list[str],
+    platform: str,
+) -> tuple[list[dict], int, int]:
+    """Check each step's selector against raw XML sources.
+
+    Returns (annotated_steps, matched_count, total_selector_count).
+    Each step gets ``_grounded: True/False`` added.
+    """
+    from .runner.tap_debugger import _strategy_matches_node, _walk
+
+    roots: list[ET.Element] = []
+    for xml in raw_xml_sources:
+        if not xml or not xml.strip():
+            continue
+        try:
+            roots.append(ET.fromstring(xml.strip()))
+        except ET.ParseError:
+            continue
+
+    all_nodes: list[ET.Element] = []
+    for r in roots:
+        all_nodes.extend(_walk(r))
+
+    total = 0
+    matched = 0
+    annotated: list[dict] = []
+
+    _NO_SELECTOR_TYPES = frozenset({
+        "wait", "hideKeyboard", "launchApp", "closeApp", "resetApp",
+        "takeScreenshot", "getPageSource", "swipe", "scroll",
+        "pressKey", "keyboardAction",
+    })
+
+    for step in steps:
+        s = dict(step)
+        sel = s.get("selector")
+        stype = (s.get("type") or "").strip()
+
+        if not sel or stype in _NO_SELECTOR_TYPES:
+            s["_grounded"] = True
+            annotated.append(s)
+            continue
+
+        strategy = (sel.get("using") or "").strip()
+        value = (sel.get("value") or "").strip()
+        if not value:
+            s["_grounded"] = True
+            annotated.append(s)
+            continue
+
+        total += 1
+        found = any(_strategy_matches_node(n.attrib, strategy, value) for n in all_nodes)
+        s["_grounded"] = found
+        if found:
+            matched += 1
+        annotated.append(s)
+
+    return annotated, matched, total
+
+
+# ---------------------------------------------------------------------------
+# Post-generation selector sanitization
+# ---------------------------------------------------------------------------
+
+_FABRICATED_PKG_RE = re.compile(
+    r'resourceId\("([a-zA-Z][a-zA-Z0-9_.]*):id/([^"]+)"\)'
+)
+
+
+def sanitize_selector_packages(
+    steps: list[dict],
+    raw_xml_sources: list[str],
+) -> list[dict]:
+    """Strip fabricated package prefixes from UiSelector resourceId() calls.
+
+    The AI sometimes invents a package name (e.g. com.walit.app:id/btn)
+    when the XML only has the short form (btn). This function collects
+    all actual resource-ids from the XML and fixes any selector that
+    uses a package-prefixed form when only the short form exists.
+    """
+    xml_rids: set[str] = set()
+    for xml in raw_xml_sources:
+        if not xml or not xml.strip():
+            continue
+        xml_rids.update(re.findall(r'resource-id="([^"]+)"', xml))
+
+    if not xml_rids:
+        return steps
+
+    cleaned: list[dict] = []
+    for step in steps:
+        s = dict(step)
+        sel = s.get("selector")
+        if sel and isinstance(sel, dict):
+            val = sel.get("value", "")
+            if val and ":id/" in val:
+                def _fix_rid(m: re.Match) -> str:
+                    full_id = f"{m.group(1)}:id/{m.group(2)}"
+                    short_id = m.group(2)
+                    if full_id in xml_rids:
+                        return m.group(0)
+                    if short_id in xml_rids:
+                        return f'resourceId("{short_id}")'
+                    return f'resourceId("{short_id}")'
+
+                new_val = _FABRICATED_PKG_RE.sub(_fix_rid, val)
+
+                if new_val == val and "using" in sel:
+                    using = sel.get("using", "")
+                    if using == "id" and ":id/" in val:
+                        parts = val.split(":id/", 1)
+                        short = parts[1] if len(parts) == 2 else val
+                        full = val
+                        if full not in xml_rids and short in xml_rids:
+                            new_val = short
+
+                if new_val != val:
+                    sel = dict(sel)
+                    sel["value"] = new_val
+                    s["selector"] = sel
+        cleaned.append(s)
+    return cleaned

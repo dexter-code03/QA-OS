@@ -250,8 +250,13 @@ export const api = {
   ) => http<TestDef>(`/api/tests/${testId}`, { method: "PUT", body: JSON.stringify(payload) }),
   deleteTest: (testId: number) =>
     http<{ ok: boolean }>(`/api/tests/${testId}`, { method: "DELETE" }),
-  getRelatedTests: (testId: number) =>
-    http<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number }[] }>(`/api/tests/${testId}/related`),
+  getRelatedTests: (testId: number, opts?: { failed_step_index?: number; platform?: string }) => {
+    const params = new URLSearchParams();
+    if (opts?.failed_step_index != null) params.set("failed_step_index", String(opts.failed_step_index));
+    if (opts?.platform) params.set("platform", opts.platform);
+    const qs = params.toString();
+    return http<{ dependents: TestDef[]; similar: { test: TestDef; shared_prefix_length: number; has_failed_step: boolean }[] }>(`/api/tests/${testId}/related${qs ? `?${qs}` : ""}`);
+  },
   applyFixToRelated: (testId: number, payload: { fixed_steps: any[]; prefix_length: number; original_steps: any[]; test_ids?: number[]; target_platform?: "android" | "ios_sim" }) =>
     http<{ updated_test_ids: number[] }>(`/api/tests/${testId}/apply-fix-to-related`, { method: "POST", body: JSON.stringify(payload) }),
   appendFixHistory: (testId: number, payload: { analysis: string; fixed_steps: any[]; changes: any[]; run_id?: number; steps_before_fix?: any[]; target_platform?: "android" | "ios_sim" }) =>
@@ -484,6 +489,7 @@ export const api = {
     folderId?: number | null,
     buildIds?: number[],
     manualTests?: ManualTestCase[],
+    opts?: { confluencePageId?: string; useFigma?: boolean },
   ) =>
     http<{ created: number; test_cases: { id: number; name: string; steps_count: number }[]; data_set_id?: number | null }>("/api/ai/generate-suite", {
       method: "POST",
@@ -496,12 +502,52 @@ export const api = {
         ...(folderId ? { folder_id: folderId } : {}),
         ...(buildIds && buildIds.length > 0 ? { build_ids: buildIds } : {}),
         ...(manualTests && manualTests.length > 0 ? { manual_tests: manualTests } : {}),
+        ...(opts?.confluencePageId ? { confluence_page_id: opts.confluencePageId } : {}),
+        ...(opts?.useFigma ? { use_figma: true } : {}),
       }),
     }),
-  editSteps: (platform: string, currentSteps: any[], instruction: string) =>
-    http<{ steps: any[]; summary: string }>("/api/ai/edit-steps", {
+  confluenceSearch: (q: string, space?: string) =>
+    http<{ pages: { id: string; title: string; space_key: string }[] }>(
+      `/api/integrations/confluence/search?q=${encodeURIComponent(q)}${space ? `&space=${encodeURIComponent(space)}` : ""}`,
+    ),
+  confluenceFetchPage: (pageId: string) =>
+    http<{ id: string; title: string; space_key: string; text: string; html_length: number; text_length: number }>(
+      `/api/integrations/confluence/page/${pageId}`,
+    ),
+  figmaOverview: () =>
+    http<{ file_name: string; pages: { name: string; frames: { name: string; type: string; id: string }[] }[]; component_names: string[] }>(
+      "/api/integrations/figma/overview",
+    ),
+  editSteps: (
+    platform: string,
+    currentSteps: any[],
+    instruction: string,
+    opts?: { projectId?: number; folderId?: number; screenNames?: string[]; buildIds?: number[]; pageSourceXml?: string },
+  ) =>
+    http<{ steps: any[]; summary: string; data_fixes?: Record<string, string>; grounded?: boolean; grounding_score?: { matched: number; total: number } | null }>("/api/ai/edit-steps", {
       method: "POST",
-      body: JSON.stringify({ platform, current_steps: currentSteps, instruction }),
+      body: JSON.stringify({
+        platform,
+        current_steps: currentSteps,
+        instruction,
+        ...(opts?.projectId ? { project_id: opts.projectId } : {}),
+        ...(opts?.folderId ? { folder_id: opts.folderId } : {}),
+        ...(opts?.screenNames && opts.screenNames.length > 0 ? { screen_names: opts.screenNames } : {}),
+        ...(opts?.buildIds && opts.buildIds.length > 0 ? { build_ids: opts.buildIds } : {}),
+        ...(opts?.pageSourceXml ? { page_source_xml: opts.pageSourceXml } : {}),
+      }),
+    }),
+  validateTest: (payload: {
+    platform: string;
+    steps: any[];
+    project_id: number;
+    folder_id?: number;
+    screen_names?: string[];
+    build_ids?: number[];
+  }) =>
+    http<import("../types").ValidateTestResponse>("/api/ai/validate-test", {
+      method: "POST",
+      body: JSON.stringify(payload),
     }),
   capturePageSource: () =>
     http<{ ok: boolean; xml: string; message?: string }>("/api/appium/page-source", { method: "POST" }),

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import defaultdict
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -22,11 +25,13 @@ from ..helpers import (
     ios_selector_generation_rules,
     load_settings,
 )
-from ..helpers_xml import build_xml_context_v2, preprocess_live_xml
+from ..helpers_data_extraction import enforce_data_layer
+from ..helpers_xml import build_xml_context_v2, preprocess_live_xml, sanitize_selector_packages, validate_selectors_against_xml
 from ..models import Build, Project, ScreenLibrary, TestDefinition, TestSuite
 from ..runner.ai_fix_diagnosis import (
     AI_FIX_CLASSIFICATION_RULES,
     build_failure_diagnosis_block,
+    check_screen_identity,
     classify_failure_for_ai_fix,
     parse_android_package,
 )
@@ -63,6 +68,30 @@ def _variable_hint(project_id: Optional[int]) -> str:
         "when appropriate. E.g. ${username}, ${password}.\n"
     )
 
+def _figma_hint() -> str:
+    """Fetch Figma component names and format as a hint for the AI."""
+    try:
+        s = load_settings()
+        token = (s.get("figma_token") or "").strip()
+        file_key = (s.get("figma_file_key") or "").strip()
+        if not token or not file_key:
+            return ""
+        from .integrations import _cached_figma_component_names, _figma_components_ttl_bucket
+        bucket = _figma_components_ttl_bucket()
+        names = list(_cached_figma_component_names(token, file_key, bucket))
+        if not names:
+            return ""
+        preview = ", ".join(names[:30])
+        return (
+            "\n\nFIGMA COMPONENT NAMES (design intent — use for naming and understanding UI structure, NOT as selectors):\n"
+            f"{preview}\n"
+            "These are the developer's intended component names. Use them to understand what each UI element represents "
+            "and to generate meaningful step descriptions and test case names.\n"
+        )
+    except Exception:
+        return ""
+
+
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
 _RATE_LIMIT = 10
 _RATE_WINDOW = 60  # seconds
@@ -79,6 +108,96 @@ def _check_rate_limit(request: Request) -> None:
             detail="Rate limit exceeded. Max 10 AI requests per minute.",
         )
     bucket.append(now)
+
+
+def _build_gemini_body(
+    system_prompt: str,
+    user_msg: str,
+    images: list[tuple[str, str]] | None = None,
+    temperature: float = 0.1,
+    max_images: int = 6,
+) -> dict[str, Any]:
+    """Build Gemini API request body with proper system_instruction separation."""
+    parts: list[dict[str, Any]] = [{"text": user_msg}]
+    for img_name, img_b64 in (images or [])[:max_images]:
+        parts.append({"text": f"\n[Screenshot: {img_name}]"})
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
+    return {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": temperature, "responseMimeType": "application/json"},
+    }
+
+
+def _load_screen_context(
+    project_id: int | None,
+    folder_id: int | None,
+    screen_names: list[str],
+    build_ids: list[int] | None,
+    build_id: int | None,
+    platform: str,
+    description: str = "",
+    max_screens: int = 4,
+    max_elements_per_screen: int = 35,
+) -> tuple[str, list[tuple[str, str]], list[ScreenLibrary], list[str]]:
+    """Load screen library context: xml_context, images, screen objects, raw XMLs."""
+    xml_context = ""
+    screen_images: list[tuple[str, str]] = []
+    screens_for_prompt: list[ScreenLibrary] = []
+    raw_xmls: list[str] = []
+
+    if not project_id or not (folder_id or screen_names):
+        return xml_context, screen_images, screens_for_prompt, raw_xmls
+
+    with SessionLocal() as db:
+        if folder_id:
+            q = db.query(ScreenLibrary).filter(
+                ScreenLibrary.folder_id == folder_id,
+                ScreenLibrary.platform == platform,
+            )
+        else:
+            q = db.query(ScreenLibrary).filter(
+                ScreenLibrary.project_id == project_id,
+                ScreenLibrary.platform == platform,
+                ScreenLibrary.name.in_(screen_names),
+            )
+        q = filter_screen_library_by_build(q, build_ids, build_id)
+        screens = q.all()
+        if screens:
+            screens_for_prompt = list(screens)
+            xml_context = build_xml_context_v2(
+                screens, description=description,
+                max_screens=max_screens,
+                max_elements_per_screen=max_elements_per_screen,
+            )
+            for scr in screens:
+                raw_xmls.append(getattr(scr, "xml_snapshot", "") or "")
+                if scr.screenshot_path:
+                    fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
+                    if fpath.exists():
+                        img_b64 = compress_screenshot(fpath)
+                        if img_b64:
+                            screen_images.append((scr.name, img_b64))
+
+    return xml_context, screen_images, screens_for_prompt, raw_xmls
+
+
+async def _gemini_call(
+    api_key: str,
+    model: str,
+    body: dict[str, Any],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Make a Gemini API call and return parsed JSON."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": api_key}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=body, headers=headers)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
+        data = resp.json()
+        text = gemini_extract_text(data)
+        return json.loads(text)
 
 
 # ── AI Step Generation ─────────────────────────────────────────────────
@@ -107,37 +226,11 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
-    xml_context = ""
-    grounded = False
-    screen_images: list[tuple[str, str]] = []  # (name, base64_png)
-    screens_for_prompt: list[ScreenLibrary] = []
-
-    if payload.project_id and (payload.folder_id or payload.screen_names):
-        with SessionLocal() as db:
-            if payload.folder_id:
-                q = db.query(ScreenLibrary).filter(
-                    ScreenLibrary.folder_id == payload.folder_id,
-                    ScreenLibrary.platform == payload.platform,
-                )
-            else:
-                q = db.query(ScreenLibrary).filter(
-                    ScreenLibrary.project_id == payload.project_id,
-                    ScreenLibrary.platform == payload.platform,
-                    ScreenLibrary.name.in_(payload.screen_names),
-                )
-            q = filter_screen_library_by_build(q, payload.build_ids, payload.build_id)
-            screens = q.all()
-            if screens:
-                screens_for_prompt = list(screens)
-                xml_context = build_xml_context_v2(screens, description=payload.prompt)
-                grounded = True
-                for scr in screens:
-                    if scr.screenshot_path:
-                        fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
-                        if fpath.exists():
-                            img_b64 = compress_screenshot(fpath)
-                            if img_b64:
-                                screen_images.append((scr.name, img_b64))
+    xml_context, screen_images, screens_for_prompt, raw_xmls = _load_screen_context(
+        payload.project_id, payload.folder_id, payload.screen_names,
+        payload.build_ids, payload.build_id, payload.platform, payload.prompt,
+    )
+    grounded = bool(xml_context)
 
     using_choices = (
         "accessibilityId|id|xpath|-android uiautomator"
@@ -149,8 +242,7 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
         android_rules = android_selector_generation_rules(screens_for_prompt) if payload.platform == "android" else ""
         ios_rules = ios_selector_generation_rules(screens_for_prompt) if payload.platform == "ios_sim" else ""
 
-        # Detect screen_type for contextual rule injection
-        _any_xml = "".join(getattr(s, "xml_snapshot", "") or "" for s in screens_for_prompt[:3])
+        _any_xml = "".join(getattr(sc, "xml_snapshot", "") or "" for sc in screens_for_prompt[:3])
         if payload.platform == "android" and _any_xml and is_compose_screen(_any_xml):
             _screen_type = "compose"
         elif payload.platform == "ios_sim" and _any_xml and is_swiftui_screen(_any_xml):
@@ -193,9 +285,11 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             "No markdown, no explanation, only JSON."
         )
         var_hint = _variable_hint(payload.project_id)
-        user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}{var_hint}\n\nDOM CONTEXT\n==========\n{xml_context}"
+        figma_hint = _figma_hint()
+        user_msg = f"Platform: {payload.platform}\nTest objective:\n{payload.prompt}{var_hint}{figma_hint}\n\nDOM CONTEXT\n==========\n{xml_context}"
     else:
         _live_xml = (payload.page_source_xml or "").strip()
+        raw_xmls = [_live_xml] if _live_xml else []
         if payload.platform == "android" and _live_xml and is_compose_screen(payload.page_source_xml):
             _screen_type_ng = "compose"
         elif payload.platform == "ios_sim" and _live_xml and is_swiftui_screen(payload.page_source_xml):
@@ -235,48 +329,70 @@ async def generate_steps(request: Request, payload: GenerateStepsRequest) -> dic
             "No markdown, no explanation, only JSON."
         )
         var_hint = _variable_hint(payload.project_id)
-        user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}{var_hint}"
+        figma_hint = _figma_hint()
+        user_msg = f"Platform: {payload.platform}\nGoal:\n{payload.prompt}{var_hint}{figma_hint}"
         if live_xml_str:
             user_msg += f"\n\nCurrent page source (filtered):\n{live_xml_str}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gemini_headers = {"x-goog-api-key": api_key}
-    parts: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
-    for img_name, img_b64 in screen_images[:6]:
-        parts.append({"text": f"\n[Screenshot: {img_name}]"})
-        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
-    body = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": 0.15 if grounded else 0.2, "responseMimeType": "application/json"},
-    }
+    body = _build_gemini_body(system_prompt, user_msg, screen_images, temperature=0.1)
 
     screens_used = len(screen_images) if grounded else 0
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body, headers=gemini_headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
-            steps = parsed.get("steps")
-            if not isinstance(steps, list):
-                raise HTTPException(status_code=502, detail="AI did not return steps[]")
+        parsed = await _gemini_call(api_key, model, body)
+        steps = parsed.get("steps")
+        if not isinstance(steps, list):
+            raise HTTPException(status_code=502, detail="AI did not return steps[]")
 
-            # Auto-extract data layer from AI response or fallback
-            test_data = parsed.get("test_data") or {}
-            data_set_id: int | None = None
-            if not test_data:
-                from ..helpers_data_extraction import extract_variables_from_steps
-                steps, test_data = extract_variables_from_steps(steps)
-            if test_data and payload.project_id:
-                data_set_id = _auto_create_data_layer(
-                    payload.project_id,
-                    payload.prompt[:60].strip() or "AI Generated",
-                    test_data,
+        test_data = parsed.get("test_data") or {}
+        steps, test_data = enforce_data_layer(steps, test_data)
+        if raw_xmls:
+            steps = sanitize_selector_packages(steps, raw_xmls)
+
+        grounding_score = None
+        if raw_xmls:
+            steps, matched, total = validate_selectors_against_xml(steps, raw_xmls, payload.platform)
+            grounding_score = {"matched": matched, "total": total}
+
+            if grounded and total > 0 and matched / total < 0.8:
+                ungrounded = [
+                    f"Step {i}: {s.get('selector', {}).get('value', '?')}"
+                    for i, s in enumerate(steps) if not s.get("_grounded", True)
+                ]
+                correction_msg = (
+                    "You generated these steps but some selectors do NOT exist in the XML:\n"
+                    + "\n".join(ungrounded[:10])
+                    + "\n\nHere is the XML again. Fix ONLY the invalid selectors using attributes from the XML. "
+                    "Return the complete step list.\n\nDOM CONTEXT\n==========\n" + xml_context
                 )
+                correction_body = _build_gemini_body(system_prompt, correction_msg, screen_images, temperature=0.05)
+                try:
+                    parsed2 = await _gemini_call(api_key, model, correction_body)
+                    steps2 = parsed2.get("steps")
+                    if isinstance(steps2, list) and len(steps2) > 0:
+                        td2 = parsed2.get("test_data") or {}
+                        steps2, td2 = enforce_data_layer(steps2, td2)
+                        steps2 = sanitize_selector_packages(steps2, raw_xmls)
+                        test_data.update(td2)
+                        steps2, m2, t2 = validate_selectors_against_xml(steps2, raw_xmls, payload.platform)
+                        if t2 == 0 or m2 / t2 >= matched / max(total, 1):
+                            steps = steps2
+                            grounding_score = {"matched": m2, "total": t2}
+                except Exception:
+                    pass
 
-            return {"steps": steps, "grounded": grounded, "screens_used": screens_used, "data_set_id": data_set_id, "test_data": test_data}
+        data_set_id: int | None = None
+        if test_data and payload.project_id:
+            data_set_id = _auto_create_data_layer(
+                payload.project_id,
+                payload.prompt[:60].strip() or "AI Generated",
+                test_data,
+            )
+
+        return {
+            "steps": steps, "grounded": grounded, "screens_used": screens_used,
+            "data_set_id": data_set_id, "test_data": test_data,
+            "grounding_score": grounding_score,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -372,6 +488,8 @@ class GenerateSuiteRequest(BaseModel):
     folder_id: Optional[int] = None
     build_ids: Optional[list[int]] = None
     manual_tests: Optional[list[ManualTestCase]] = None
+    confluence_page_id: Optional[str] = None
+    use_figma: bool = False
 
 
 @router.post("/api/ai/generate-suite")
@@ -384,28 +502,73 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
-    xml_context = ""
-    screen_images: list[tuple[str, str]] = []
-    screens_for_prompt: list[ScreenLibrary] = []
-    if payload.folder_id:
-        with SessionLocal() as db:
-            q = db.query(ScreenLibrary).filter(
-                ScreenLibrary.folder_id == payload.folder_id,
-                ScreenLibrary.platform == payload.platform,
-            )
-            q = filter_screen_library_by_build(q, payload.build_ids, None)
-            screens = q.all()
-            if screens:
-                screens_for_prompt = list(screens)
-                xml_context = build_xml_context_v2(screens, description=payload.prompt)
-                for scr in screens:
-                    if scr.screenshot_path:
-                        fpath = settings.artifacts_dir / str(scr.project_id) / scr.screenshot_path
-                        if fpath.exists():
-                            img_b64 = compress_screenshot(fpath)
-                            if img_b64:
-                                screen_images.append((scr.name, img_b64))
+    # ── Confluence PRD fetch (if page_id provided) ──
+    confluence_prd = ""
+    confluence_title = ""
+    if payload.confluence_page_id:
+        try:
+            from .integrations import _confluence_auth_headers, _html_to_text
+            confluence_base = (s.get("confluence_url") or "").rstrip("/")
+            conf_headers = _confluence_auth_headers(s)
+            if confluence_base and conf_headers:
+                async with httpx.AsyncClient(timeout=20) as _cc:
+                    _cr = await _cc.get(
+                        f"{confluence_base}/rest/api/content/{payload.confluence_page_id}",
+                        params={"expand": "body.storage"},
+                        headers=conf_headers,
+                    )
+                    if _cr.status_code == 200:
+                        _cd = _cr.json()
+                        _html = (_cd.get("body") or {}).get("storage", {}).get("value", "")
+                        confluence_prd = _html_to_text(_html)
+                        confluence_title = _cd.get("title", "")
+        except Exception:
+            pass
 
+    # ── Figma context (if requested) ──
+    figma_context = ""
+    if payload.use_figma:
+        try:
+            figma_token = (s.get("figma_token") or "").strip()
+            figma_file_key = (s.get("figma_file_key") or "").strip()
+            if figma_token and figma_file_key:
+                from .integrations import (
+                    _cached_figma_component_names,
+                    _cached_figma_file_overview,
+                    _figma_components_ttl_bucket,
+                )
+                _fb = _figma_components_ttl_bucket()
+                _names = list(_cached_figma_component_names(figma_token, figma_file_key, _fb))
+                _overview = _cached_figma_file_overview(figma_token, figma_file_key, _fb)
+                parts: list[str] = [f"Figma File: {_overview.get('name', '')}"]
+                for pg in _overview.get("pages", []):
+                    parts.append(f"\nPage: {pg['name']}")
+                    for fr in pg.get("frames", []):
+                        parts.append(f"  {fr['type']}: {fr['name']}")
+                if _names:
+                    parts.append(f"\nComponents ({len(_names)}): {', '.join(_names[:50])}")
+                figma_context = "\n".join(parts)
+        except Exception:
+            pass
+
+    # Build the combined prompt with all sources
+    effective_prompt = payload.prompt
+    if confluence_prd:
+        effective_prompt = (
+            f"PRD SOURCE (from Confluence page: {confluence_title}):\n"
+            f"{'='*60}\n{confluence_prd[:12000]}\n{'='*60}\n\n"
+            f"Additional instructions: {payload.prompt}" if payload.prompt.strip() else
+            f"PRD SOURCE (from Confluence page: {confluence_title}):\n"
+            f"{'='*60}\n{confluence_prd[:12000]}\n{'='*60}\n\n"
+            "Generate comprehensive test cases covering all functional requirements described in this PRD."
+        )
+
+    xml_context, screen_images, screens_for_prompt, raw_xmls = _load_screen_context(
+        payload.project_id, payload.folder_id, [], payload.build_ids, None,
+        payload.platform, effective_prompt,
+        max_screens=10,
+        max_elements_per_screen=40,
+    )
     grounded = bool(xml_context)
     using_choices_suite = (
         "accessibilityId|id|xpath|-android uiautomator"
@@ -425,33 +588,100 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
             _suite_screen_type = "native"
         suite_rules_block = build_rules_block(payload.prompt, xml_context, payload.platform, _suite_screen_type)
 
+        # Build a screen inventory so AI knows all available screens and their order
+        screen_names_list = [getattr(s, "name", "") for s in screens_for_prompt if getattr(s, "name", "")]
+        screen_inventory = ", ".join(screen_names_list) if screen_names_list else "(see XML below)"
+        n_screens = len(screen_names_list)
+
         sel_tc = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
-            "You are a senior mobile QA automation engineer.\n"
-            "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
-            "You will receive real XML page source and screenshots from the app under test.\n"
-            "You MUST use only selectors (resource-id, content-desc, text, class) that exist in the provided XML. Never invent selectors.\n"
+            "You are a senior mobile QA automation engineer who writes THOROUGH, END-TO-END test cases.\n\n"
+            "## OUTPUT FORMAT\n"
             "Return ONLY valid JSON with this shape:\n"
             '{"test_cases": [{"name": "...", "acceptance_criteria": "...", "steps": [{"type": "<step_type>",'
             ' "selector": ' + sel_tc + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...],'
-            ' "test_data": {"variable_name": "value", ...}}\n'
-            "IMPORTANT: Extract ALL test data (emails, phones, passwords, OTPs, URLs, names, amounts) into the test_data object. "
-            "Use ${variable_name} syntax in step text/expect fields instead of hardcoded values.\n"
-            "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
+            ' "test_data": {"variable_name": "value", ...}}\n\n'
+            "## CRITICAL: END-TO-END FLOW TESTING (READ CAREFULLY)\n"
+            "Each test case MUST be a COMPLETE user journey that walks through MULTIPLE SCREENS in sequence.\n"
+            "You have access to " + str(n_screens) + " screens: [" + screen_inventory + "]\n"
+            "RULES FOR FLOW-BASED TESTS:\n"
+            "1. Every test case MUST start from the entry screen and navigate through screens in logical order.\n"
+            "2. Every test case should have AT LEAST 15-30 steps. A test with fewer than 10 steps is TOO SHORT.\n"
+            "3. When a screen has input fields (EditText, TextInputLayout), the test MUST fill them with test data.\n"
+            "4. When a screen has buttons/CTAs, the test MUST tap them to navigate to the next screen.\n"
+            "5. After each navigation action (tap a button, submit a form), add waitForVisible on an element "
+            "from the NEXT screen's XML to verify the transition happened.\n"
+            "6. After data entry on a screen, always hide the keyboard before tapping navigation buttons.\n"
+            "7. DO NOT create single-screen tests that just tap one element. Every test must cross multiple screens.\n"
+            "8. The test flow should mirror real user behavior: open app -> see screen -> interact -> navigate -> verify -> continue.\n\n"
+            "## SCREEN FLOW PATTERN (follow this for EVERY test)\n"
+            "For each screen the user visits in order:\n"
+            "  a. waitForVisible — verify you're on the right screen (use a unique element from that screen's XML)\n"
+            "  b. Interact — fill all input fields, make selections, toggle options\n"
+            "  c. Assert — verify current screen state if needed\n"
+            "  d. Navigate — tap the primary button/CTA to move to the next screen\n"
+            "  e. Repeat a-d for the next screen\n\n"
+            "## VERIFICATION RULES (CRITICAL — applies to ALL modules)\n"
+            "You MUST use assertText / assertTextContains / assertVisible to verify outcomes, not just navigate.\n"
+            "1. AFTER FORM SUBMISSION: When data is entered on Screen A and submitted to Screen B (confirmation/review), "
+            "use assertText on Screen B to verify EVERY piece of data that was entered on Screen A "
+            "(amounts, names, selections, counts). Do NOT just waitForVisible on Screen B.\n"
+            "2. AFTER CALCULATIONS: If the app computes values (split amounts, totals, taxes, discounts), "
+            "use assertText to verify the computed values are correct.\n"
+            "3. AFTER ITEM CREATION: If a flow creates an item (payment, order, message, request), "
+            "navigate to the list/inbox screen and assertVisible on the newly created item. "
+            "Verify the item shows correct status (e.g., Pending, Sent, Active).\n"
+            "4. SUCCESS SCREENS: On success/confirmation screens, assertVisible on the success indicator AND "
+            "assertText/assertVisible on each listed item or recipient.\n"
+            "5. ERROR STATES: When testing error scenarios, assertVisible on the error message/indicator AND "
+            "assertVisible that you are STILL on the same screen (did not navigate forward).\n"
+            "6. TOGGLE/CHECKBOX VERIFICATION: After tapping a toggle or checkbox, use assertChecked or assertAttribute "
+            "to verify the state changed.\n\n"
+            "## SELECTOR QUALITY (applies to ALL modules)\n"
+            "1. ALWAYS prefer resource-id selectors over class-based selectors.\n"
+            "2. NEVER use className('android.widget.EditText').instance(N) when a resource-id exists for that field. "
+            "Check the XML — if the EditText or its parent has a resource-id, use it.\n"
+            "3. For amount/text verification, use xpath only when asserting specific values within complex layouts. "
+            "Build xpath using resource-ids from the XML, not class names.\n"
+            "4. For list items, prefer resource-id with index (e.g., list_item_0, list_item_1) over generic xpath.\n\n"
+            "## MANDATORY TEST TYPES (for EVERY module, not just this one)\n"
+            "Your test suite MUST include at minimum:\n"
+            "- 1-2 HAPPY PATH tests: Complete end-to-end flows through the main feature\n"
+            "- 1 ERROR/NEGATIVE test: Invalid inputs, validation failures, mismatched data — verify error state and no forward navigation\n"
+            "- 1 NAVIGATION test: Back button at key screens, or cancel/abort mid-flow — verify correct screen after back\n"
+            "- 1 EDGE CASE test: Boundary values, single vs multiple items, empty states, minimum/maximum inputs\n"
+            "If the module has list/inbox views, add a test that verifies items appear correctly after creation.\n\n"
+            "## TEST DATA\n"
+            "Extract ALL test data (emails, phones, passwords, OTPs, URLs, names, amounts, etc.) into the test_data object.\n"
+            "Use ${variable_name} syntax in step text/expect fields instead of hardcoded values.\n\n"
+            "## AVAILABLE STEP TYPES\n"
+            "tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
             "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
             "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
             "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
             + suite_rules_block + "\n\n"
             + android_rules
             + ios_rules
-            + "SELECTOR PRIORITY ORDER for native Android / iOS (use first match; follow per-screen Compose rules above when applicable):\n"
+            + "## SELECTOR RULES\n"
+            "PRIORITY ORDER (use first match; follow per-screen Compose rules above when applicable):\n"
             "1. resource-id (most stable)\n"
             "2. content-desc / accessibility id (stable)\n"
             "3. text (fragile — only if no ID available)\n"
             "4. xpath (last resort — only if nothing else exists)\n"
-            "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
+            "IMPORTANT: You MUST use only selectors that exist in the provided XML. Never invent selectors.\n"
+            "Every selector must be found verbatim in the DOM CONTEXT below.\n\n"
+            "## ACCEPTANCE CRITERIA\n"
+            "For each test case, include acceptance_criteria that is SPECIFIC and VERIFIABLE:\n"
+            "- Name the EXACT screen the test should be on at each major step (reference resource-ids or screen names from XML)\n"
+            "- Name the EXACT elements that must be visible to confirm correct navigation\n"
+            "- List EVERY screen the test visits in order\n"
+            "- State the expected outcome with concrete, measurable conditions\n"
+            "BAD: 'User can split money'\n"
+            "GOOD: 'Start on Home screen (home_container visible). Tap Split Money. On Split screen "
+            "(split_title visible), enter amount ${amount} in amount_field, select contact ${contact_name}, "
+            "tap Continue. On Confirm screen (confirm_summary visible), verify amount matches, tap Send. "
+            "On Success screen (success_icon visible), verify confirmation message.'\n\n"
             "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
-            "Every selector you use must be found verbatim in the XML below.\n"
             "No markdown, no explanation, only JSON."
         )
         if payload.manual_tests:
@@ -465,10 +695,58 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                 "- Do NOT skip manual steps — every step must produce at least one Appium step.\n"
             )
         else:
-            system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+            if confluence_prd:
+                system_prompt += (
+                    "\n\n## CONFLUENCE PRD MODE\n"
+                    "A PRD document from Confluence is provided. You MUST:\n"
+                    "1. Read the PRD carefully and identify ALL user flows described.\n"
+                    "2. For EACH flow in the PRD, generate a test case that walks through the ENTIRE flow end-to-end.\n"
+                    "3. Map each PRD requirement to specific screens from the Screen Library XML.\n"
+                    "4. Each test should have 15-40 steps covering the full flow described in the PRD.\n"
+                    "5. Include: Happy path for each flow, edge cases, error/negative scenarios, validation tests.\n"
+                    "6. Generate 5-15 test cases to fully cover the PRD requirements.\n"
+                    "7. DO NOT generate shallow 2-3 step tests. Each PRD requirement needs thorough multi-screen coverage.\n"
+                )
+            else:
+                system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios. Each test should be 15-30 steps.\n"
+            if figma_context:
+                system_prompt += (
+                    "\n## FIGMA DESIGN CONTEXT RULES\n"
+                    "Figma design context is provided showing the app's screen structure and components.\n"
+                    "USE Figma context to:\n"
+                    "1. Understand the SCREEN FLOW ORDER — Figma frames show the sequence of screens the user visits.\n"
+                    "2. Identify ALL screens that exist in the app — every Figma frame represents a screen to test.\n"
+                    "3. Understand what UI components exist on each screen (buttons, inputs, lists, etc.).\n"
+                    "4. Map Figma component names to XML resource-ids to understand element purpose.\n"
+                    "DO NOT:\n"
+                    "- Use Figma component names as selectors — ONLY use XML resource-ids/content-desc.\n"
+                    "- Skip screens shown in Figma. If Figma shows 6 screens, your tests should collectively cover all 6.\n"
+                )
 
         var_hint_suite = _variable_hint(payload.project_id)
-        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}{var_hint_suite}\n\nDOM CONTEXT\n==========\n{xml_context}"
+        figma_hint_suite = _figma_hint() if not figma_context else ""
+
+        # Build screen flow summary for user_msg
+        screen_flow_summary = ""
+        if screen_names_list:
+            screen_flow_summary = "\n\nAVAILABLE SCREENS IN ORDER (visit these in your test flows):\n"
+            for i, sn in enumerate(screen_names_list, 1):
+                screen_flow_summary += f"  {i}. {sn}\n"
+            screen_flow_summary += (
+                "Each test case should start from an early screen and walk forward through this sequence.\n"
+                "Your tests COLLECTIVELY must cover ALL screens listed above.\n"
+            )
+
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{effective_prompt}{var_hint_suite}{figma_hint_suite}"
+        user_msg += screen_flow_summary
+        if figma_context:
+            user_msg += (
+                f"\n\nFIGMA DESIGN CONTEXT\n====================\n{figma_context}\n\n"
+                "IMPORTANT: Figma frames show the screens in flow order. Each frame is a screen the user visits. "
+                "Your tests must follow this screen sequence. Use Figma to understand WHAT the user does on each screen, "
+                "then use XML resource-ids/content-desc for actual selectors.\n"
+            )
+        user_msg += f"\n\nDOM CONTEXT (XML for each screen — use ONLY these selectors)\n{'='*50}\n{xml_context}"
         if payload.manual_tests:
             user_msg += f"\n\nMANUAL TEST CASES TO TRANSLATE:\n{_format_manual_tests(payload.manual_tests)}"
     else:
@@ -488,19 +766,33 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
 
         sel_tc_ng = '{"using":"' + using_choices_suite + '","value":"..."}'
         system_prompt = (
-            "You are a senior mobile QA automation engineer.\n"
-            "Generate MULTIPLE test cases for a test suite. Each test case should cover a different scenario.\n"
+            "You are a senior mobile QA automation engineer who writes THOROUGH, END-TO-END test cases.\n"
+            "Generate MULTIPLE test cases for a test suite. Each test case should be a COMPLETE user journey "
+            "with AT LEAST 15-30 steps.\n"
             "Return ONLY valid JSON with this shape:\n"
             '{"test_cases": [{"name": "...", "acceptance_criteria": "...", "steps": [{"type": "<step_type>",'
             ' "selector": ' + sel_tc_ng + ', "text": "...", "ms": 1000, "expect":"...", "meta": {...}}]}, ...],'
             ' "test_data": {"variable_name": "value", ...}}\n'
             "IMPORTANT: Extract ALL test data into the test_data object. Use ${variable_name} in step text/expect fields.\n"
+            "Each test must follow end-to-end screen flows: navigate, interact, verify at every screen.\n\n"
+            "VERIFICATION RULES:\n"
+            "- After form submission to a confirmation screen, use assertText to verify entered data carries over.\n"
+            "- After calculations (totals, splits), assertText on computed values.\n"
+            "- After item creation, navigate to list view and assertVisible on the new item.\n"
+            "- On error scenarios, assertVisible on error message AND assert you're still on the same screen.\n\n"
+            "MANDATORY TEST TYPES:\n"
+            "- 1-2 happy path tests, 1 error/negative test, 1 navigation/back test, 1 edge case test.\n\n"
+            "SELECTOR QUALITY:\n"
+            "- Always prefer resource-id over class+instance selectors.\n\n"
             "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
             "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
             "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
             "pressKey, keyboardAction, hideKeyboard, launchApp, closeApp, resetApp, takeScreenshot, getPageSource.\n\n"
             + suite_rules_ng + "\n\n"
-            "For each test case, include acceptance_criteria: a brief statement of what the test validates and when it should pass/fail.\n"
+            "For each test case, include acceptance_criteria that is SPECIFIC and VERIFIABLE:\n"
+            "- Name the EXACT screen the test should be on at each major step\n"
+            "- Name the EXACT elements that must be visible to confirm correct navigation\n"
+            "- State the expected outcome with concrete, measurable conditions\n"
             "For keyboard keys (return, done, go), use pressKey or keyboardAction. Use hideKeyboard when needed.\n"
             "No markdown, no explanation, only JSON."
         )
@@ -513,44 +805,83 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                 "- Every Expected Result must become an assertText or assertVisible step at the end of that test case.\n"
             )
         else:
-            system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios.\n"
+            if confluence_prd:
+                system_prompt += (
+                    "\n\nCONFLUENCE PRD MODE: Generate COMPREHENSIVE end-to-end test cases covering "
+                    "ALL functional requirements in the PRD. Each test must be 15+ steps. Generate 5-15 test cases.\n"
+                )
+            else:
+                system_prompt += "\nGenerate 3-8 test cases covering happy path, edge cases, and error scenarios. Each test should be 15-30 steps.\n"
+            if figma_context:
+                system_prompt += (
+                    "\nFigma design context is provided. Use frame names as screen flow order. "
+                    "Your tests must visit screens in the order shown by Figma frames. "
+                    "Do NOT use Figma names as selectors.\n"
+                )
 
         var_hint_suite_ng = _variable_hint(payload.project_id)
-        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{payload.prompt}{var_hint_suite_ng}"
+        figma_hint_ng = _figma_hint() if not figma_context else ""
+        user_msg = f"Platform: {payload.platform}\n\nDescribe the feature/suite to test:\n{effective_prompt}{var_hint_suite_ng}{figma_hint_ng}"
+        if figma_context:
+            user_msg += f"\n\nFIGMA DESIGN CONTEXT\n====================\n{figma_context}\n\nUse Figma frame names to understand the screen flow and component names for meaningful test descriptions.\n"
         if suite_live_xml_str:
             user_msg += f"\n\nCurrent page source (filtered):\n{suite_live_xml_str}"
         if payload.manual_tests:
             user_msg += f"\n\nMANUAL TEST CASES TO TRANSLATE:\n{_format_manual_tests(payload.manual_tests)}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gemini_headers = {"x-goog-api-key": api_key}
-    parts_list: list[dict[str, Any]] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
-    for img_name, img_b64 in screen_images[:6]:
-        parts_list.append({"text": f"\n[Screenshot: {img_name}]"})
-        parts_list.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
-    body = {
-        "contents": [{"parts": parts_list}],
-        "generationConfig": {"temperature": 0.15 if grounded else 0.3, "responseMimeType": "application/json"},
-    }
+    body = _build_gemini_body(system_prompt, user_msg, screen_images, temperature=0.1 if grounded else 0.15)
+
+    # Retry once on transient failures (timeout, rate-limit, malformed response)
+    last_error: Exception | None = None
+    parsed: dict[str, Any] | None = None
+    for attempt in range(2):
+        try:
+            parsed = await _gemini_call(api_key, model, body, timeout=120)
+            break
+        except HTTPException:
+            raise
+        except Exception as e:
+            last_error = e
+            logger.warning("generate-suite attempt %d failed: %s", attempt + 1, e)
+            if attempt == 0:
+                import asyncio
+                await asyncio.sleep(2)
+    if parsed is None:
+        logger.exception("generate-suite failed after retries: %s", last_error)
+        raise HTTPException(status_code=502, detail=f"AI generate suite failed after retry: {last_error}")
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body, headers=gemini_headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
-            raw_cases = parsed.get("test_cases")
-            if not isinstance(raw_cases, list):
-                raise HTTPException(status_code=502, detail="AI did not return test_cases[]")
+        raw_cases = parsed.get("test_cases")
+        if not isinstance(raw_cases, list):
+            raise HTTPException(status_code=502, detail="AI did not return test_cases[]")
 
-        # Extract test_data and auto-create data layer
         suite_test_data = parsed.get("test_data") or {}
-        if not suite_test_data:
-            from ..helpers_data_extraction import extract_variables_from_steps
-            all_steps = [s for tc in raw_cases if isinstance(tc.get("steps"), list) for s in tc["steps"]]
-            _, suite_test_data = extract_variables_from_steps(all_steps)
+        for tc in raw_cases:
+            tc_steps = tc.get("steps")
+            if isinstance(tc_steps, list):
+                cleaned, extra = enforce_data_layer(tc_steps, suite_test_data)
+                tc["steps"] = sanitize_selector_packages(cleaned, raw_xmls)
+                suite_test_data.update(extra)
+
+        # Post-generation quality scan
+        quality_warnings: list[str] = []
+        for tc in raw_cases:
+            tc_steps = tc.get("steps")
+            if not isinstance(tc_steps, list):
+                continue
+            tc_name = tc.get("name", "?")
+            n_steps = len(tc_steps)
+            if n_steps < 10:
+                quality_warnings.append(f"'{tc_name}' has only {n_steps} steps (expected 15+)")
+            step_types = [s.get("type", "") for s in tc_steps]
+            has_assert_text = any(t in ("assertText", "assertTextContains") for t in step_types)
+            has_any_assert = any(t.startswith("assert") for t in step_types)
+            if not has_assert_text and n_steps >= 10:
+                quality_warnings.append(f"'{tc_name}' has no assertText/assertTextContains — missing data verification")
+            if not has_any_assert:
+                quality_warnings.append(f"'{tc_name}' has zero assertion steps")
+        if quality_warnings:
+            logger.info("Suite generation quality warnings: %s", "; ".join(quality_warnings))
 
         created: list[dict] = []
         with SessionLocal() as db:
@@ -591,10 +922,16 @@ async def generate_suite(payload: GenerateSuiteRequest) -> dict[str, Any]:
                 suite_test_data,
             )
 
-        return {"created": len(created), "test_cases": created, "data_set_id": suite_data_set_id}
+        return {
+            "created": len(created),
+            "test_cases": created,
+            "data_set_id": suite_data_set_id,
+            "quality_warnings": quality_warnings if quality_warnings else None,
+        }
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("generate-suite post-processing failed: %s", e)
         raise HTTPException(status_code=502, detail=f"AI generate suite failed: {e}")
 
 
@@ -765,7 +1102,11 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         "2. Analyze WHY the step failed (wrong selector? element not present? wrong screen?)\n"
         "3. Cross-reference the screenshot with the page source XML to find the CORRECT selector\n"
         "4. Return FIXED steps that will work based on the actual screen state\n"
-        "5. Keep steps that passed unchanged. Only fix the failed step and any subsequent steps that need updating.\n\n"
+        "5. KEEP ALL PASSED STEPS EXACTLY AS-IS — do not change their selectors, types, order, or values.\n"
+        "6. ONLY modify the FAILED step and at most 1-2 steps immediately after it if they depend on the fix.\n"
+        "7. NEVER add new assertion steps (assertChecked, assertText, assertVisible) that were NOT in the original test.\n"
+        "8. NEVER expand the test with additional steps beyond what was originally there. The step count should stay approximately the same.\n"
+        "9. If you need to add a waitForVisible before a fixed step, that is OK. But do NOT add new verification steps.\n\n"
         + fix_rules_block + "\n\n"
         "SOURCE OF TRUTH (when provided): If acceptance_criteria is given, your fix MUST preserve the intended behavior. "
         "Do NOT change what the test validates. If the failure is because the app is on the WRONG screen (e.g., Sign Up instead of Login), "
@@ -792,13 +1133,22 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         "  Capture: takeScreenshot, getPageSource\n\n"
         "Return ONLY valid JSON with this shape:\n"
         '{"analysis": "Brief explanation of what went wrong and how you fixed it",'
-        ' "fix_type": "step|data|both",'
+        ' "fix_type": "step|data|both|bug",'
         ' "fixed_steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
         ' "text": "...", "ms": 1000, "expect":"...", "meta": {...}}],'
+        ' "bug_report": {"title": "...", "severity": "critical|major|minor", '
+        '"expected_screen": "...", "actual_screen": "...", '
+        '"expected_behavior": "...", "actual_behavior": "...", "evidence": "..."},'
         ' "data_fixes": {"variable_name": "new_value", ...},'
         ' "changes": [{"step_index": 0, "was": "...", "now": "...", "reason": "..."}]}\n\n'
-        "fix_type: 'step' = fix selector/structure only, 'data' = update variable values only, 'both' = fix steps AND update data.\n"
+        "fix_type:\n"
+        "  'step' = fix selector/structure only\n"
+        "  'data' = update variable values only\n"
+        "  'both' = fix steps AND update data\n"
+        "  'bug' = the app has a BUG — the test is correct but the app is wrong. Fill bug_report and return fixed_steps UNCHANGED.\n"
+        "When fix_type='bug': the app is showing unexpected behavior that contradicts the acceptance_criteria. "
+        "Do NOT rewrite the test to match broken app behavior. Report the bug instead.\n"
         "data_fixes: put ALL variable values here — both updated existing variables AND newly created ones. The backend will auto-apply them to the DataSet.\n\n"
         "CRITICAL DATA RULES (NEVER VIOLATE):\n"
         "1. NEVER hardcode raw test data (emails, phones, passwords, OTPs, URLs, names, amounts, codes, dates) in fixed_steps text/expect fields.\n"
@@ -810,6 +1160,9 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
         "4. set fix_type to 'both' whenever data_fixes is non-empty.\n"
         "Example: if adding a step that types '12345' as OTP, create data_fixes: {\"otp_code\": \"12345\"} and use ${otp_code} in the step text.\n\n"
         "IMPORTANT: fixed_steps must be the COMPLETE list (all steps, not just changed ones).\n"
+        "CRITICAL: The total step count of fixed_steps should be VERY CLOSE to the original step count. "
+        "If the original had 25 steps, your fix should have 25-27 steps (at most 2 new waits). "
+        "NEVER inflate a 25-step test to 50+ steps. Passed steps must be returned VERBATIM.\n"
         "Use accessibilityId or resource-id where possible, xpath as fallback.\n"
         "No markdown, no explanation outside the JSON."
         + AI_FIX_CLASSIFICATION_RULES
@@ -900,66 +1253,72 @@ async def fix_steps(request: Request, payload: FixStepsRequest) -> dict[str, Any
                 "=== END ESCALATION ===\n\n"
             )
 
+    if payload.acceptance_criteria:
+        screen_bug = check_screen_identity(payload.acceptance_criteria, payload.page_source_xml_raw or payload.page_source_xml or "")
+        if screen_bug:
+            user_msg += (
+                "\n=== SCREEN IDENTITY CHECK (PRE-ANALYSIS) ===\n"
+                + build_failure_diagnosis_block(screen_bug)
+                + "\n"
+            )
+
     if payload.page_source_xml:
         filtered_xml = preprocess_live_xml(
             payload.page_source_xml,
             payload.platform,
-            description=payload.error_message or "",
+            description=f"{payload.test_name} {payload.error_message}",
         )
         user_msg += f"\n=== PAGE SOURCE (filtered) ===\n{filtered_xml}\n"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gemini_headers = {"x-goog-api-key": api_key}
-
-    parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
+    fix_images: list[tuple[str, str]] = []
     if payload.screenshot_base64:
-        raw = payload.screenshot_base64
-        if "," in raw:
-            raw = raw.split(",", 1)[1]
-        parts.append({"inlineData": {"mimeType": "image/png", "data": raw}})
+        raw_b64 = payload.screenshot_base64
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        fix_images.append(("failure_screenshot", raw_b64))
 
-    body = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }
+    body = _build_gemini_body(system_prompt, user_msg, fix_images, temperature=0.1)
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body, headers=gemini_headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
-            data = resp.json()
-            text = gemini_extract_text(data)
-            parsed = json.loads(text)
-            fixed = parsed.get("fixed_steps")
-            if not isinstance(fixed, list):
-                raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
+        parsed = await _gemini_call(api_key, model, body)
+        fixed = parsed.get("fixed_steps")
+        if not isinstance(fixed, list):
+            raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
 
-            # Auto-apply data fixes to DataSet
-            fix_type = parsed.get("fix_type", "step")
-            data_fixes = parsed.get("data_fixes") or {}
-            if isinstance(data_fixes, dict):
-                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
-            data_set_updated = False
-            if data_fixes and payload.data_set_id:
-                from ..models import DataSet as DataSetModel
-                with SessionLocal() as db:
-                    ds = db.query(DataSetModel).filter(DataSetModel.id == payload.data_set_id).first()
-                    if ds:
-                        ds.variables = {**(ds.variables or {}), **data_fixes}
-                        db.commit()
-                        data_set_updated = True
+        fix_type = parsed.get("fix_type", "step")
+        bug_report = parsed.get("bug_report") if fix_type == "bug" else None
+        data_fixes = parsed.get("data_fixes") or {}
+        if isinstance(data_fixes, dict):
+            data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
 
-            return {
-                "analysis": parsed.get("analysis", ""),
-                "fixed_steps": fixed,
-                "changes": parsed.get("changes", []),
-                "fix_type": fix_type,
-                "data_fixes": data_fixes,
-                "data_set_updated": data_set_updated,
-                "tap_diagnosis": tap_diagnosis,
-                "failure_diagnosis": failure_diagnosis,
-            }
+        if fix_type != "bug":
+            fixed, extra = enforce_data_layer(fixed, data_fixes)
+            data_fixes.update(extra)
+            _fix_raw_xmls = [x for x in [payload.page_source_xml_raw, payload.page_source_xml] if x and x.strip()]
+            if _fix_raw_xmls:
+                fixed = sanitize_selector_packages(fixed, _fix_raw_xmls)
+
+        data_set_updated = False
+        if data_fixes and payload.data_set_id:
+            from ..models import DataSet as DataSetModel
+            with SessionLocal() as db:
+                ds = db.query(DataSetModel).filter(DataSetModel.id == payload.data_set_id).first()
+                if ds:
+                    ds.variables = {**(ds.variables or {}), **data_fixes}
+                    db.commit()
+                    data_set_updated = True
+
+        return {
+            "analysis": parsed.get("analysis", ""),
+            "fixed_steps": fixed,
+            "changes": parsed.get("changes", []),
+            "fix_type": fix_type,
+            "bug_report": bug_report,
+            "data_fixes": data_fixes,
+            "data_set_updated": data_set_updated,
+            "tap_diagnosis": tap_diagnosis,
+            "failure_diagnosis": failure_diagnosis,
+        }
     except HTTPException:
         raise
     except json.JSONDecodeError as e:
@@ -1125,44 +1484,39 @@ async def refine_fix(request: Request, payload: RefineFixRequest) -> dict[str, A
         filtered_xml = preprocess_live_xml(
             payload.page_source_xml,
             payload.target_platform or payload.platform,
-            description=payload.user_suggestion or payload.error_message or "",
+            description=f"{payload.test_name} {payload.user_suggestion or payload.error_message or ''}",
         )
         user_msg += f"=== PAGE SOURCE (filtered) ===\n{filtered_xml}\n"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gemini_headers = {"x-goog-api-key": api_key}
-    parts: list[dict] = [{"text": f"{system_prompt}\n\n{user_msg}"}]
+    refine_images: list[tuple[str, str]] = []
     if payload.screenshot_base64:
-        raw = payload.screenshot_base64
-        if "," in raw:
-            raw = raw.split(",", 1)[1]
-        parts.append({"inlineData": {"mimeType": "image/png", "data": raw}})
+        raw_b64 = payload.screenshot_base64
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        refine_images.append(("failure_screenshot", raw_b64))
 
-    body = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
+    body = _build_gemini_body(system_prompt, user_msg, refine_images, temperature=0.15)
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(url, json=body, headers=gemini_headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
-            data = resp.json()
-            text = gemini_extract_text(data)
-            parsed = json.loads(text)
-            fixed = parsed.get("fixed_steps")
-            if not isinstance(fixed, list):
-                raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
-            data_fixes = parsed.get("data_fixes") or {}
-            if isinstance(data_fixes, dict):
-                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
-                
-            return {
-                "analysis": parsed.get("analysis", ""),
-                "fixed_steps": fixed,
-                "changes": parsed.get("changes", []),
-                "data_fixes": data_fixes,
-                "tap_diagnosis": tap_diagnosis,
-                "failure_diagnosis": failure_diagnosis_rf,
-            }
+        parsed = await _gemini_call(api_key, model, body)
+        fixed = parsed.get("fixed_steps")
+        if not isinstance(fixed, list):
+            raise HTTPException(status_code=502, detail="AI did not return fixed_steps[]")
+        data_fixes = parsed.get("data_fixes") or {}
+        if isinstance(data_fixes, dict):
+            data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
+
+        fixed, extra = enforce_data_layer(fixed, data_fixes)
+        data_fixes.update(extra)
+
+        return {
+            "analysis": parsed.get("analysis", ""),
+            "fixed_steps": fixed,
+            "changes": parsed.get("changes", []),
+            "data_fixes": data_fixes,
+            "tap_diagnosis": tap_diagnosis,
+            "failure_diagnosis": failure_diagnosis_rf,
+        }
     except HTTPException:
         raise
     except json.JSONDecodeError as e:
@@ -1177,6 +1531,11 @@ class EditStepsRequest(BaseModel):
     platform: str
     current_steps: list[dict[str, Any]]
     instruction: str
+    page_source_xml: str = ""
+    project_id: Optional[int] = None
+    folder_id: Optional[int] = None
+    screen_names: list[str] = []
+    build_ids: Optional[list[int]] = None
 
 
 @router.post("/api/ai/edit-steps")
@@ -1187,10 +1546,44 @@ async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, A
     if not api_key:
         raise HTTPException(status_code=400, detail="AI API key not configured. Set it in Settings.")
 
+    xml_context, screen_images, screens_for_prompt, raw_xmls = _load_screen_context(
+        payload.project_id, payload.folder_id, payload.screen_names,
+        payload.build_ids, None, payload.platform, payload.instruction,
+    )
+    grounded = bool(xml_context)
+
+    if not grounded and payload.page_source_xml:
+        live_xml = preprocess_live_xml(payload.page_source_xml, payload.platform, description=payload.instruction)
+        if live_xml:
+            xml_context = live_xml
+            raw_xmls = [payload.page_source_xml]
+            grounded = True
+
+    if grounded:
+        _edit_xml = "".join(getattr(sc, "xml_snapshot", "") or "" for sc in screens_for_prompt[:3]) if screens_for_prompt else (payload.page_source_xml or "")
+        if payload.platform == "android" and _edit_xml and is_compose_screen(_edit_xml):
+            _edit_st = "compose"
+        elif payload.platform == "ios_sim" and _edit_xml and is_swiftui_screen(_edit_xml):
+            _edit_st = "swiftui"
+        else:
+            _edit_st = "native"
+        edit_rules = build_rules_block(payload.instruction, xml_context, payload.platform, _edit_st)
+    else:
+        edit_rules = ""
+
     system_prompt = (
         "You are a senior mobile QA engineer.\n"
         "The user has an existing set of Appium test steps and wants to modify them.\n"
-        "Apply the user's instruction to the steps and return the updated full list.\n\n"
+        "Apply the user's instruction to the steps and return the updated full list.\n"
+    )
+    if grounded:
+        system_prompt += (
+            "You will receive real XML page source from the app under test.\n"
+            "You MUST use only selectors that exist in the provided XML. Never invent selectors.\n\n"
+        )
+    if edit_rules:
+        system_prompt += edit_rules + "\n\n"
+    system_prompt += (
         "Return ONLY valid JSON:\n"
         '{"steps": [{"type": "<step_type>",'
         ' "selector": {"using":"accessibilityId|id|xpath","value":"..."},'
@@ -1201,10 +1594,7 @@ async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, A
         "1. NEVER hardcode raw test data (emails, phones, passwords, OTPs, URLs, names, amounts, codes, dates) in steps text/expect fields.\n"
         "2. If the user's instruction relies on ANY new data value, CREATE a new variable. Add it to data_fixes and use ${new_variable_name} in the step.\n"
         "   - CRITICAL: The dictionary key in data_fixes MUST be the raw variable name ONLY. Do NOT wrap the key in ${}.\n"
-        "   - CORRECT: \"data_fixes\": {\"amountToSplit\": 100}\n"
-        "   - INCORRECT (WILL FAIL): \"data_fixes\": {\"${amountToSplit}\": 100}\n"
-        "3. Existing ${variable_name} references must stay as ${variable_name}. If the value needs changing, update it ONLY in data_fixes (using the raw name as key).\n"
-        "Example: if adding a step that types '12345' as OTP, create data_fixes: {\"otp_code\": \"12345\"} and use ${otp_code} in the step text.\n\n"
+        "3. Existing ${variable_name} references must stay as ${variable_name}. If the value needs changing, update it ONLY in data_fixes.\n\n"
         "Available step types: tap, doubleTap, longPress, tapByCoordinates, type, clear, clearAndType, "
         "wait, waitForVisible, waitForNotVisible, waitForEnabled, waitForDisabled, swipe, scroll, "
         "assertText, assertTextContains, assertVisible, assertNotVisible, assertEnabled, assertChecked, assertAttribute, "
@@ -1217,37 +1607,141 @@ async def edit_steps(request: Request, payload: EditStepsRequest) -> dict[str, A
         f"=== CURRENT STEPS ===\n{json.dumps(payload.current_steps, indent=2)}\n\n"
         f"=== INSTRUCTION ===\n{payload.instruction}"
     )
+    if xml_context:
+        user_msg += f"\n\nDOM CONTEXT\n==========\n{xml_context}"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    gemini_headers = {"x-goog-api-key": api_key}
-    body = {
-        "contents": [{"parts": [{"text": f"{system_prompt}\n\n{user_msg}"}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }
+    body = _build_gemini_body(system_prompt, user_msg, screen_images, temperature=0.1)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=body, headers=gemini_headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"AI API error: {resp.text[:300]}")
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(text)
-            steps = parsed.get("steps")
-            if not isinstance(steps, list):
-                raise HTTPException(status_code=502, detail="AI did not return steps[]")
-            data_fixes = parsed.get("data_fixes") or {}
-            if isinstance(data_fixes, dict):
-                data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
-                
-            return {
-                "steps": steps,
-                "summary": parsed.get("summary", ""),
-                "data_fixes": data_fixes
-            }
+        parsed = await _gemini_call(api_key, model, body, timeout=30)
+        steps = parsed.get("steps")
+        if not isinstance(steps, list):
+            raise HTTPException(status_code=502, detail="AI did not return steps[]")
+        data_fixes = parsed.get("data_fixes") or {}
+        if isinstance(data_fixes, dict):
+            data_fixes = {k.replace("${", "").replace("}", ""): v for k, v in data_fixes.items()}
+
+        steps, extra = enforce_data_layer(steps, data_fixes)
+        data_fixes.update(extra)
+        if raw_xmls:
+            steps = sanitize_selector_packages(steps, raw_xmls)
+
+        grounding_score = None
+        if raw_xmls:
+            steps, matched, total = validate_selectors_against_xml(steps, raw_xmls, payload.platform)
+            grounding_score = {"matched": matched, "total": total}
+
+        return {
+            "steps": steps,
+            "summary": parsed.get("summary", ""),
+            "data_fixes": data_fixes,
+            "grounded": grounded,
+            "grounding_score": grounding_score,
+        }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI edit failed: {e}")
+
+
+# ── Validate Test Steps Against Screen Library ───────────────────────
+
+
+class ValidateTestRequest(BaseModel):
+    platform: str
+    steps: list[dict[str, Any]]
+    project_id: int
+    folder_id: Optional[int] = None
+    screen_names: list[str] = []
+    build_ids: Optional[list[int]] = None
+
+
+@router.post("/api/ai/validate-test")
+async def validate_test(payload: ValidateTestRequest) -> dict[str, Any]:
+    """Validate test step selectors against Screen Library XML and check data discipline."""
+    _, _, screens_for_prompt, raw_xmls = _load_screen_context(
+        payload.project_id, payload.folder_id, payload.screen_names,
+        payload.build_ids, None, payload.platform,
+    )
+
+    if not raw_xmls:
+        raise HTTPException(
+            status_code=400,
+            detail="No screens found in the library for validation. Capture screens first.",
+        )
+
+    annotated, matched, total = validate_selectors_against_xml(
+        payload.steps, raw_xmls, payload.platform,
+    )
+
+    issues: list[dict[str, Any]] = []
+    suggestions: list[dict[str, Any]] = []
+
+    from ..runner.tap_debugger import _walk, _collect_suggestions
+    import xml.etree.ElementTree as _ET
+
+    all_nodes = []
+    for xml_str in raw_xmls:
+        try:
+            root = _ET.fromstring(xml_str.strip())
+            all_nodes.extend(_walk(root))
+        except _ET.ParseError:
+            pass
+
+    for idx, step in enumerate(annotated):
+        if not step.get("_grounded", True):
+            sel = step.get("selector", {})
+            sel_val = sel.get("value", "?")
+            issues.append({
+                "step_index": idx,
+                "type": "selector_not_found",
+                "detail": f"Selector '{sel_val}' not found in any screen XML",
+            })
+            val_lower = (sel_val or "").lower()
+            for n in all_nodes[:500]:
+                pool = " ".join([
+                    n.attrib.get("resource-id", ""),
+                    n.attrib.get("content-desc", ""),
+                    n.attrib.get("text", ""),
+                    n.attrib.get("name", ""),
+                    n.attrib.get("label", ""),
+                ]).lower()
+                if val_lower and val_lower in pool:
+                    sug_list = _collect_suggestions(n.attrib, sel_val, payload.platform)
+                    if sug_list:
+                        top = sug_list[0]
+                        suggestions.append({
+                            "step_index": idx,
+                            "suggested_selector": {"using": top.strategy, "value": top.value},
+                            "confidence": top.score,
+                        })
+                    break
+
+        stype = (step.get("type") or "").strip()
+        text = step.get("text", "")
+        if stype in ("type", "clearAndType") and text and "${" not in text:
+            if len(text) >= 3:
+                issues.append({
+                    "step_index": idx,
+                    "type": "hardcoded_data",
+                    "detail": f"Step text '{text}' looks like test data — should use ${{variable}}",
+                })
+
+        expect = step.get("expect", "")
+        if stype in ("assertText", "assertTextContains") and expect and "${" not in expect:
+            if len(expect) >= 3:
+                issues.append({
+                    "step_index": idx,
+                    "type": "hardcoded_data",
+                    "detail": f"Expect value '{expect}' looks like test data — should use ${{variable}}",
+                })
+
+    return {
+        "valid": len(issues) == 0,
+        "grounding_score": matched,
+        "total_selectors": total,
+        "issues": issues,
+        "suggestions": suggestions,
+    }
 
 
 # ── Appium Page Source ────────────────────────────────────────────────

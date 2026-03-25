@@ -184,13 +184,15 @@ def _shared_prefix_length(steps_a: list[dict], steps_b: list[dict]) -> int:
 
 
 @router.get("/api/tests/{test_id}/related")
-def get_related_tests(test_id: int) -> dict[str, Any]:
+def get_related_tests(test_id: int, failed_step_index: Optional[int] = None, platform: str = "android") -> dict[str, Any]:
     with SessionLocal() as db:
         t = db.query(TestDefinition).filter(TestDefinition.id == test_id).first()
         if not t:
             raise HTTPException(status_code=404, detail="Test not found")
         project_id = t.project_id
-        my_steps = steps_for_platform_record(t, "android")
+        plat = platform if platform in ("android", "ios_sim") else "android"
+        my_steps = steps_for_platform_record(t, plat)
+        min_shared = (failed_step_index + 1) if failed_step_index is not None and failed_step_index >= 0 else 2
 
         dependents = db.query(TestDefinition).filter(
             TestDefinition.project_id == project_id,
@@ -206,10 +208,20 @@ def get_related_tests(test_id: int) -> dict[str, Any]:
         for o in others:
             if o.id in dep_ids:
                 continue
-            other_steps = steps_for_platform_record(o, "android")
+            other_steps = steps_for_platform_record(o, plat)
             prefix_len = _shared_prefix_length(my_steps, other_steps)
-            if prefix_len >= 2:
-                similar.append({"test": test_out(o), "shared_prefix_length": prefix_len})
+            if prefix_len >= min_shared:
+                has_failed_step = (
+                    failed_step_index is not None
+                    and failed_step_index < len(other_steps)
+                    and failed_step_index < len(my_steps)
+                    and _steps_equal(my_steps[failed_step_index], other_steps[failed_step_index])
+                ) if failed_step_index is not None else True
+                similar.append({
+                    "test": test_out(o),
+                    "shared_prefix_length": prefix_len,
+                    "has_failed_step": has_failed_step,
+                })
 
         return {
             "dependents": [test_out(d) for d in dependents],

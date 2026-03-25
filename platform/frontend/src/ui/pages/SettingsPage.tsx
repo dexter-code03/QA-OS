@@ -52,10 +52,14 @@ export function SettingsPage() {
                 <div className="form-section-title">Confluence</div>
                 <div className="form-row">
                   <div className="form-group"><div className="form-label">Base URL</div><input className={`form-input${s.confluence_url ? " connected" : ""}`} value={s.confluence_url || ""} onChange={e => upd("confluence_url", e.target.value)} placeholder="https://your-domain.atlassian.net/wiki" /></div>
+                  <div className="form-group"><div className="form-label">Email (for Atlassian Cloud)</div><input className={`form-input${s.confluence_email ? " connected" : ""}`} value={s.confluence_email || ""} onChange={e => upd("confluence_email", e.target.value)} placeholder="you@company.com" /></div>
                   <div className="form-group"><div className="form-label">API Token</div><input className={`form-input${s.confluence_token ? " connected" : ""}`} type="password" value={s.confluence_token || ""} onChange={e => upd("confluence_token", e.target.value)} />{confSt && <div className={`conn-status${confSt.startsWith("✓") ? "" : " err"}`}>{confSt}</div>}</div>
+                </div>
+                <div className="form-row">
                   <div className="form-group"><div className="form-label">Space key (optional)</div><input className="form-input" value={s.confluence_space_key || ""} onChange={e => upd("confluence_space_key", e.target.value)} placeholder="e.g. DEV — leave blank to use first space" /></div>
                 </div>
-                <button className="btn-ghost btn-sm" onClick={async () => { setConfSt("Testing..."); try { const r = await api.testConfluence(); setConfSt(r.ok ? `✓ ${r.message}` : r.message); } catch (e: any) { setConfSt(e.message); } }}>Test Connection</button>
+                {(s.confluence_url || "").includes(".atlassian.net") && !s.confluence_email && <div style={{ fontSize: 10, color: "#f59e0b", marginBottom: 6 }}>Atlassian Cloud requires your email address for authentication.</div>}
+                <button className="btn-ghost btn-sm" onClick={async () => { setConfSt("Saving & testing..."); try { await api.saveSettings(s); const r = await api.testConfluence(); setConfSt(r.ok ? `✓ ${r.message}` : r.message); } catch (e: any) { setConfSt(e.message); } }}>Test Connection</button>
               </div>
             </>
           )}

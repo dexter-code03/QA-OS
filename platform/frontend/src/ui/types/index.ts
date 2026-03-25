@@ -79,6 +79,16 @@ export type TapDiagnosisOut = {
   suggestions: { strategy: string; value: string; score: number; label: string }[];
 };
 
+export type BugReport = {
+  title: string;
+  severity: "critical" | "major" | "minor";
+  expected_screen: string;
+  actual_screen: string;
+  expected_behavior: string;
+  actual_behavior: string;
+  evidence: string;
+};
+
 export type AiFixResponse = {
   analysis: string;
   fixed_steps: any[];
@@ -91,9 +101,30 @@ export type AiFixResponse = {
     recommended_strategy?: string | null;
     recommended_value?: string | null;
   } | null;
-  fix_type?: "step" | "data" | "both";
+  fix_type?: "step" | "data" | "both" | "bug";
+  bug_report?: BugReport | null;
   data_fixes?: Record<string, string>;
   data_set_updated?: boolean;
+};
+
+export type ValidationIssue = {
+  step_index: number;
+  type: "selector_not_found" | "hardcoded_data" | "wrong_strategy";
+  detail: string;
+};
+
+export type ValidationSuggestion = {
+  step_index: number;
+  suggested_selector: { using: string; value: string };
+  confidence: number;
+};
+
+export type ValidateTestResponse = {
+  valid: boolean;
+  grounding_score: number;
+  total_selectors: number;
+  issues: ValidationIssue[];
+  suggestions: ValidationSuggestion[];
 };
 
 export interface ManualTestCase {

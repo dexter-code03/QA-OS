@@ -345,6 +345,18 @@ export function LibraryPage({
   const [genSuiteFolderScreens, setGenSuiteFolderScreens] = useState<ScreenEntry[]>([]);
   const [genSuiteBuildIds, setGenSuiteBuildIds] = useState<number[]>([]);
 
+  // Confluence PRD source
+  const [suiteSource, setSuiteSource] = useState<"prompt" | "confluence">("prompt");
+  const [confSearchQuery, setConfSearchQuery] = useState("");
+  const [confSearchResults, setConfSearchResults] = useState<{ id: string; title: string; space_key: string }[]>([]);
+  const [confSelectedPage, setConfSelectedPage] = useState<{ id: string; title: string; text?: string } | null>(null);
+  const [confSearching, setConfSearching] = useState(false);
+  const [confLoading, setConfLoading] = useState(false);
+
+  // Figma context toggle
+  const [useFigma, setUseFigma] = useState(false);
+  const [figmaPreview, setFigmaPreview] = useState<{ file_name: string; pages: { name: string; frames: { name: string; type: string }[] }[]; component_names: string[] } | null>(null);
+
   // CSV Import for Generate Suite
   const csvFileRef = useRef<HTMLInputElement>(null);
   const [csvParsed, setCsvParsed] = useState<import("../utils/csvParser").ManualTestCase[]>([]);
@@ -706,6 +718,45 @@ export function LibraryPage({
     setCsvRawText("");
   }, []);
 
+  // Confluence search with debounce
+  const confSearchTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const doConfluenceSearch = useCallback((q: string) => {
+    setConfSearchQuery(q);
+    if (confSearchTimeout.current) clearTimeout(confSearchTimeout.current);
+    if (!q.trim()) { setConfSearchResults([]); return; }
+    confSearchTimeout.current = setTimeout(async () => {
+      setConfSearching(true);
+      try {
+        const res = await api.confluenceSearch(q);
+        setConfSearchResults(res.pages);
+      } catch { setConfSearchResults([]); }
+      finally { setConfSearching(false); }
+    }, 400);
+  }, []);
+
+  const selectConfluencePage = useCallback(async (page: { id: string; title: string }) => {
+    setConfLoading(true);
+    try {
+      const full = await api.confluenceFetchPage(page.id);
+      setConfSelectedPage({ id: full.id, title: full.title, text: full.text });
+      setConfSearchResults([]);
+      setConfSearchQuery("");
+    } catch (e: any) {
+      toast(`Failed to load Confluence page: ${e.message}`, "error");
+    } finally { setConfLoading(false); }
+  }, []);
+
+  const loadFigmaPreview = useCallback(async () => {
+    try {
+      const res = await api.figmaOverview();
+      setFigmaPreview(res);
+    } catch { setFigmaPreview(null); }
+  }, []);
+
+  useEffect(() => {
+    if (useFigma && !figmaPreview) loadFigmaPreview();
+  }, [useFigma]);
+
   const reapplyMapping = useCallback((m: ColumnMapping) => {
     setCsvMapping(m);
     const parsed = parseCSV(csvRawText, m);
@@ -713,7 +764,8 @@ export function LibraryPage({
   }, [csvRawText]);
 
   const aiGenerateSuite = async () => {
-    if (!genSuitePrompt.trim() && csvParsed.length === 0) { toast("Describe the feature or upload CSV", "error"); return; }
+    const hasConfluence = suiteSource === "confluence" && confSelectedPage?.id;
+    if (!genSuitePrompt.trim() && csvParsed.length === 0 && !hasConfluence) { toast("Describe the feature, select a Confluence page, or upload CSV", "error"); return; }
     if (!genSuiteTargetId) { toast("Select a Test Suite", "error"); return; }
     if (genSuiteFolderId) {
       const hasTagged = genSuiteFolderScreens.some((s) => s.build_id != null);
@@ -723,8 +775,9 @@ export function LibraryPage({
       }
     }
     setBusy(true);
-    setTaskProgress({ label: genSuiteFolderId ? "Generating with Screen Library context (XML + screenshots)…" : "Capturing page source (Appium)…", pct: null });
-    setGenSuiteStatus(genSuiteFolderId ? "Generating with screen context..." : "Capturing page source...");
+    const sources = [genSuiteFolderId ? "Screen Library" : null, hasConfluence ? "Confluence PRD" : null, useFigma ? "Figma" : null].filter(Boolean).join(" + ");
+    setTaskProgress({ label: sources ? `Generating with ${sources}…` : "Capturing page source (Appium)…", pct: null });
+    setGenSuiteStatus(sources ? `Generating with ${sources}...` : "Capturing page source...");
     let xml = "";
     try {
       if (!genSuiteFolderId) {
@@ -732,15 +785,20 @@ export function LibraryPage({
       }
       setTaskProgress({ label: "AI is generating multiple test cases — may take a minute…", pct: null });
       setGenSuiteStatus("AI generating test cases...");
+      const suitePrompt = genSuitePrompt || (csvParsed.length > 0 ? `Convert ${csvParsed.length} manual test cases to Appium automation` : hasConfluence ? "" : "");
       const res = await api.generateSuite(
         platform,
-        genSuitePrompt || (csvParsed.length > 0 ? `Convert ${csvParsed.length} manual test cases to Appium automation` : ""),
+        suitePrompt,
         project.id,
         genSuiteTargetId,
         xml,
         genSuiteFolderId,
         genSuiteBuildIds.length > 0 ? genSuiteBuildIds : undefined,
         csvParsed.length > 0 ? csvParsed : undefined,
+        {
+          confluencePageId: hasConfluence ? confSelectedPage!.id : undefined,
+          useFigma: useFigma || undefined,
+        },
       );
       const dsMsg = res.data_set_id ? ` · Data Set #${res.data_set_id} created` : "";
       setGenSuiteStatus(`Created ${res.created} test cases${dsMsg}`);
@@ -1303,7 +1361,112 @@ export function LibraryPage({
             </div>
           )}
           {genSuiteFolderId && <div style={{ fontSize: 10, color: "var(--accent)", marginBottom: 8 }}>AI will use real selectors + screenshots from the selected folder and builds above.</div>}
-          <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder={csvParsed.length > 0 ? "Optional context to supplement CSV import..." : "Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..."} rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
+
+          {/* Figma toggle */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, cursor: "pointer" }}>
+              <input type="checkbox" checked={useFigma} onChange={e => setUseFigma(e.target.checked)} />
+              Include Figma design context
+            </label>
+            {useFigma && figmaPreview && (
+              <span style={{ fontSize: 10, color: "var(--accent2)" }}>
+                {figmaPreview.file_name} — {figmaPreview.component_names.length} components, {figmaPreview.pages.reduce((a, p) => a + p.frames.length, 0)} frames
+              </span>
+            )}
+            {useFigma && !figmaPreview && <span style={{ fontSize: 10, color: "var(--muted)" }}>Loading Figma...</span>}
+          </div>
+
+          {/* Figma preview */}
+          {useFigma && figmaPreview && figmaPreview.pages.length > 0 && (
+            <div style={{ marginBottom: 10, padding: 8, background: "rgba(168,85,247,.06)", border: "1px solid rgba(168,85,247,.2)", borderRadius: 6, maxHeight: 120, overflowY: "auto" }}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "#a855f7", marginBottom: 4 }}>Figma Frames (will be sent as design context)</div>
+              {figmaPreview.pages.map((pg, pi) => (
+                <div key={pi} style={{ fontSize: 10 }}>
+                  <span style={{ fontWeight: 500 }}>{pg.name}:</span>{" "}
+                  {pg.frames.map(f => f.name).join(", ") || "no frames"}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* PRD Source tabs */}
+          <div style={{ display: "flex", gap: 0, marginBottom: 10, borderBottom: "1px solid var(--border)" }}>
+            <button
+              onClick={() => setSuiteSource("prompt")}
+              style={{ fontSize: 11, padding: "6px 14px", background: suiteSource === "prompt" ? "rgba(99,102,241,.1)" : "transparent", border: "none", borderBottom: suiteSource === "prompt" ? "2px solid var(--accent)" : "2px solid transparent", color: suiteSource === "prompt" ? "var(--accent)" : "var(--muted)", cursor: "pointer", fontWeight: suiteSource === "prompt" ? 600 : 400 }}
+            >
+              Manual Prompt
+            </button>
+            <button
+              onClick={() => setSuiteSource("confluence")}
+              style={{ fontSize: 11, padding: "6px 14px", background: suiteSource === "confluence" ? "rgba(99,102,241,.1)" : "transparent", border: "none", borderBottom: suiteSource === "confluence" ? "2px solid var(--accent)" : "2px solid transparent", color: suiteSource === "confluence" ? "var(--accent)" : "var(--muted)", cursor: "pointer", fontWeight: suiteSource === "confluence" ? 600 : 400 }}
+            >
+              Confluence PRD
+            </button>
+          </div>
+
+          {/* Prompt source */}
+          {suiteSource === "prompt" && (
+            <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder={csvParsed.length > 0 ? "Optional context to supplement CSV import..." : "Describe the feature: e.g. Login flow — happy path, invalid email, wrong password, empty fields..."} rows={3} className="form-input" style={{ width: "100%", marginBottom: 10 }} />
+          )}
+
+          {/* Confluence source */}
+          {suiteSource === "confluence" && (
+            <div style={{ marginBottom: 10 }}>
+              {!confSelectedPage ? (
+                <div>
+                  <div style={{ position: "relative" }}>
+                    <input
+                      className="form-input"
+                      style={{ width: "100%", marginBottom: 4 }}
+                      placeholder="Search Confluence pages by title..."
+                      value={confSearchQuery}
+                      onChange={e => doConfluenceSearch(e.target.value)}
+                    />
+                    {confSearching && <span style={{ position: "absolute", right: 10, top: 8, fontSize: 10, color: "var(--muted)" }}>Searching...</span>}
+                  </div>
+                  {confSearchResults.length > 0 && (
+                    <div style={{ border: "1px solid var(--border)", borderRadius: 6, maxHeight: 180, overflowY: "auto", background: "var(--bg-raised)" }}>
+                      {confSearchResults.map(p => (
+                        <div
+                          key={p.id}
+                          onClick={() => selectConfluencePage(p)}
+                          style={{ padding: "8px 12px", cursor: "pointer", fontSize: 11, borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between" }}
+                          onMouseEnter={e => (e.currentTarget.style.background = "rgba(99,102,241,.08)")}
+                          onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                        >
+                          <span style={{ fontWeight: 500 }}>{p.title}</span>
+                          <span style={{ color: "var(--muted)", fontSize: 10 }}>{p.space_key}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {confSearchQuery && !confSearching && confSearchResults.length === 0 && (
+                    <div style={{ fontSize: 10, color: "var(--muted)", padding: 4 }}>No pages found. Make sure Confluence is configured in Settings.</div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ padding: 10, background: "rgba(34,111,235,.06)", border: "1px solid rgba(34,111,235,.2)", borderRadius: 6 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <div>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{confSelectedPage.title}</span>
+                      {confLoading && <span style={{ fontSize: 10, color: "var(--muted)", marginLeft: 8 }}>Loading content...</span>}
+                    </div>
+                    <button className="btn-ghost btn-sm" onClick={() => { setConfSelectedPage(null); setConfSearchQuery(""); }} style={{ fontSize: 10, color: "var(--danger)" }}>✕ Remove</button>
+                  </div>
+                  {confSelectedPage.text && (
+                    <div style={{ fontSize: 10, color: "var(--muted)", maxHeight: 100, overflowY: "auto", whiteSpace: "pre-wrap", lineHeight: 1.4 }}>
+                      {confSelectedPage.text.slice(0, 1000)}{confSelectedPage.text.length > 1000 ? "..." : ""}
+                    </div>
+                  )}
+                  {confSelectedPage.text && (
+                    <div style={{ fontSize: 10, color: "var(--accent2)", marginTop: 4 }}>{confSelectedPage.text.length.toLocaleString()} characters of PRD content will be sent to AI</div>
+                  )}
+                </div>
+              )}
+              <textarea value={genSuitePrompt} onChange={e => setGenSuitePrompt(e.target.value)} placeholder="Additional instructions (optional) — e.g. focus on error handling, skip admin flows..." rows={2} className="form-input" style={{ width: "100%", marginTop: 8 }} />
+            </div>
+          )}
 
           {/* CSV Import Section */}
           <div style={{ borderTop: "1px dashed var(--border)", margin: "8px 0 12px", position: "relative" }}>
@@ -1360,7 +1523,7 @@ export function LibraryPage({
           )}
 
           {genSuiteStatus && <div style={{ fontSize: 11, color: "var(--accent2)", marginBottom: 8 }}>{genSuiteStatus}</div>}
-          <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || (!genSuitePrompt.trim() && csvParsed.length === 0) || !genSuiteTargetId}>{busy ? "Generating..." : csvParsed.length > 0 ? `✨ Generate ${csvParsed.length} Test Cases` : "✨ Generate Test Suite"}</button>
+          <button className="btn-primary btn-sm" style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }} onClick={aiGenerateSuite} disabled={busy || (!genSuitePrompt.trim() && csvParsed.length === 0 && !(suiteSource === "confluence" && confSelectedPage?.id)) || !genSuiteTargetId}>{busy ? "Generating..." : csvParsed.length > 0 ? `✨ Generate ${csvParsed.length} Test Cases` : confSelectedPage ? "✨ Generate from Confluence PRD" : "✨ Generate Test Suite"}</button>
         </div>
       )}
 

@@ -268,7 +268,7 @@ def classify_failure_message(msg: str, platform: str | None) -> dict[str, Any]:
 # ── Screen / XML helpers ─────────────────────────────────────────────
 
 
-def compress_screenshot(fpath: Path, max_dim: int = 512) -> str:
+def compress_screenshot(fpath: Path, max_dim: int = 768) -> str:
     """Resize a screenshot to fit within max_dim and return base64 JPEG."""
     try:
         from PIL import Image
@@ -276,7 +276,7 @@ def compress_screenshot(fpath: Path, max_dim: int = 512) -> str:
         img = Image.open(fpath)
         img.thumbnail((max_dim, max_dim), Image.LANCZOS)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=60)
+        img.convert("RGB").save(buf, format="JPEG", quality=75)
         return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return ""
