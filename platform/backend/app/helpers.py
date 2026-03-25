@@ -202,6 +202,7 @@ def test_out(t: TestDefinition) -> TestOut:
         platform_steps={"android": android_steps, "ios_sim": ios_steps},
         acceptance_criteria=getattr(t, "acceptance_criteria", None),
         fix_history=getattr(t, "fix_history", None) or [],
+        sort_order=getattr(t, "sort_order", 0) or 0,
         created_at=t.created_at,
     )
 

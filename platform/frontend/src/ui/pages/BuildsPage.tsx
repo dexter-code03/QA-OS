@@ -33,7 +33,7 @@ export function BuildsPage({ project, builds, runs, onRefresh, onRunTest }: { pr
       </div>
 
       <div className="builds-grid">
-        {builds.map((b, i) => {
+        {builds.filter(b => b.platform === platform).map((b, i) => {
           const meta = b.metadata as any || {};
           const bRuns = runs.filter(r => r.build_id === b.id);
           const bPassed = bRuns.filter(r => r.status === "passed").length;
@@ -62,7 +62,7 @@ export function BuildsPage({ project, builds, runs, onRefresh, onRunTest }: { pr
             </div>
           );
         })}
-        {builds.length === 0 && <div style={{ color: "var(--muted)", padding: 20, fontSize: 12 }}>No builds uploaded yet. Click Upload or drop a file above.</div>}
+        {builds.filter(b => b.platform === platform).length === 0 && <div style={{ color: "var(--muted)", padding: 20, fontSize: 12 }}>{builds.length === 0 ? "No builds uploaded yet. Click Upload or drop a file above." : `No ${platform === "android" ? "Android" : "iOS"} builds. Switch platform or upload one.`}</div>}
       </div>
     </>
   );

@@ -82,6 +82,7 @@ class TestOut(BaseModel):
     platform_steps: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     acceptance_criteria: Optional[str] = None
     fix_history: list[dict[str, Any]] = Field(default_factory=list)
+    sort_order: int = 0
     created_at: datetime
 
 

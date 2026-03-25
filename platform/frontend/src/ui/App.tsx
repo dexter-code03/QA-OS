@@ -295,7 +295,7 @@ export function App() {
               builds={builds}
               modules={modules}
               suites={suites}
-              onNav={setPage}
+              onNav={(p) => { if (p === "execution") { setActiveRunId(null); setActiveBatchId(null); } setPage(p); }}
               onOpenRun={id => { setActiveRunId(id); setPage("execution"); }}
             />
           </ErrorBoundary>)}

@@ -716,7 +716,7 @@ export function ExecutionPage({
       if (targetTest) {
         const prereqStepsLenForRelated = prereq ? stepsForPlatform(prereq, displayRun.platform).length : 0;
         const mainFailedIdxForRelated = prereq ? failedIdx - prereqStepsLenForRelated : failedIdx;
-        void api.getRelatedTests(targetTest.id, { failed_step_index: mainFailedIdxForRelated, platform: displayRun.platform }).then(rel => setRelatedTests(rel)).catch(() => {});
+        void api.getRelatedTests(targetTest.id, { failed_step_index: mainFailedIdxForRelated, platform: displayRun.platform }).then(rel => setRelatedTests(rel)).catch((e) => console.warn("Failed to load related tests", e));
       }
       const fixLabel = res.fix_type === "bug" ? "bug detected" : res.fix_type === "data" ? "data fix" : res.fix_type === "both" ? "step + data fix" : "step fix";
       const changeCount = res.changes?.length || 0;
@@ -844,10 +844,10 @@ export function ExecutionPage({
       return;
     }
     const eligible = relatedTests?.similar?.filter(s => s.has_failed_step) || [];
-    if (eligible.length === 0) return;
+    if (eligible.length === 0) { toast("No related tests share the exact failed step", "info"); return; }
     const mainFailedIdx = prereq ? failedIdx - prereqStepsLenApply : failedIdx;
     const prefixLen = Math.min(mainFailedIdx + 1, stepsForPlatform(testForRun, displayRun.platform).length, (prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps).length);
-    if (prefixLen < 2) return;
+    if (prefixLen < 2) { toast("Fix prefix too short to apply to related tests", "info"); return; }
     setBusy(true);
     try {
       const stepsToApply = prereq ? fixResult.fixed_steps.slice(prereqStepsLenApply) : fixResult.fixed_steps;

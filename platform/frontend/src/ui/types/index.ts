@@ -19,6 +19,7 @@ export type TestDef = {
   platform_steps?: { android?: Array<Record<string, unknown>>; ios_sim?: Array<Record<string, unknown>> };
   acceptance_criteria?: string | null;
   fix_history?: Array<Record<string, unknown>>;
+  sort_order?: number;
   created_at: string;
 };
 export type Run = {

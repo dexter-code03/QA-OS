@@ -225,6 +225,8 @@ export const api = {
 
   // Tests
   listTests: (projectId: number) => http<TestDef[]>(`/api/projects/${projectId}/tests`),
+  reorderTests: (projectId: number, testIds: number[]) =>
+    http<{ ok: boolean; count: number }>(`/api/projects/${projectId}/tests/reorder`, { method: "POST", body: JSON.stringify({ test_ids: testIds }) }),
   createTest: (
     projectId: number,
     payload: {

@@ -27,8 +27,21 @@ function truncateUrl(url: string): string {
 
 type StatusFilter = "all" | "2xx" | "4xx" | "5xx";
 
+function buildCurl(log: ApiLog): string {
+  let cmd = `curl -X ${log.method} '${log.url}'`;
+  for (const [k, v] of Object.entries(log.req_headers || {})) {
+    cmd += ` \\\n  -H '${k}: ${v}'`;
+  }
+  if (log.req_body) {
+    const escaped = log.req_body.replace(/'/g, "'\\''");
+    cmd += ` \\\n  -d '${escaped}'`;
+  }
+  return cmd;
+}
+
 function ApiLogTabs({ log }: { log: ApiLog }) {
   const [tab, setTab] = useState<"res-body" | "res-headers" | "req-body" | "req-headers">("res-body");
+  const [copied, setCopied] = useState(false);
 
   const tabs = [
     { id: "res-body" as const, label: "Response Body" },
@@ -50,6 +63,22 @@ function ApiLogTabs({ log }: { log: ApiLog }) {
     }
   };
 
+  const copyContent = async () => {
+    try {
+      await navigator.clipboard.writeText(content());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
+  const copyCurl = async () => {
+    try {
+      await navigator.clipboard.writeText(buildCurl(log));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
   return (
     <div className="alog-detail-tabs">
       <div className="alog-detail-tab-bar">
@@ -63,7 +92,17 @@ function ApiLogTabs({ log }: { log: ApiLog }) {
           </button>
         ))}
       </div>
-      <pre className="alog-detail-content">{content()}</pre>
+      <div style={{ position: "relative" }}>
+        <div style={{ position: "absolute", top: 6, right: 8, display: "flex", gap: 4, zIndex: 2 }}>
+          <button className="btn-ghost btn-sm" style={{ fontSize: 10, padding: "2px 8px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 4 }} onClick={copyContent}>
+            {copied ? "Copied!" : "Copy"}
+          </button>
+          <button className="btn-ghost btn-sm" style={{ fontSize: 10, padding: "2px 8px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: 4 }} onClick={copyCurl} title="Copy as cURL command">
+            cURL
+          </button>
+        </div>
+        <pre className="alog-detail-content">{content()}</pre>
+      </div>
     </div>
   );
 }

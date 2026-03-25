@@ -528,7 +528,7 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
 .alog-detail-full-url { font-family: var(--mono); font-size: 11px; word-break: break-all; color: var(--text); }
 .alog-detail-meta  { display: flex; gap: 12px; padding: 6px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border); }
 .alog-detail-tabs  { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
-.alog-detail-tab-bar { display: flex; border-bottom: 1px solid var(--border); }
+.alog-detail-tab-bar { display: flex; align-items: center; border-bottom: 1px solid var(--border); }
 .alog-detail-tab   { padding: 5px 12px; font-size: 11px; border: none; background: none; cursor: pointer; color: var(--muted); font-family: var(--mono); }
 .alog-detail-tab:hover { color: var(--text); }
 .alog-detail-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }

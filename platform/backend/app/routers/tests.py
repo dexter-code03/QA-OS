@@ -48,8 +48,25 @@ def create_test(project_id: int, payload: TestCreate) -> TestOut:
 @router.get("/api/projects/{project_id}/tests", response_model=list[TestOut])
 def list_tests(project_id: int) -> list[TestOut]:
     with SessionLocal() as db:
-        tests = db.query(TestDefinition).filter(TestDefinition.project_id == project_id).order_by(TestDefinition.created_at.desc()).all()
+        tests = db.query(TestDefinition).filter(TestDefinition.project_id == project_id).order_by(
+            TestDefinition.sort_order.asc(), TestDefinition.created_at.desc()
+        ).all()
         return [test_out(t) for t in tests]
+
+
+class ReorderTestsRequest(BaseModel):
+    test_ids: list[int]
+
+
+@router.post("/api/projects/{project_id}/tests/reorder")
+def reorder_tests(project_id: int, payload: ReorderTestsRequest) -> dict[str, Any]:
+    with SessionLocal() as db:
+        for idx, tid in enumerate(payload.test_ids):
+            t = db.query(TestDefinition).filter(TestDefinition.id == tid, TestDefinition.project_id == project_id).first()
+            if t:
+                t.sort_order = idx
+        db.commit()
+        return {"ok": True, "count": len(payload.test_ids)}
 
 
 @router.put("/api/tests/{test_id}", response_model=TestOut)

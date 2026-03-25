@@ -44,6 +44,18 @@ const SELECTOR_STRATEGIES: Record<"android" | "ios_sim", string[]> = {
   ios_sim: ["accessibilityId", "id", "xpath", "className", "-ios predicate string", "-ios class chain"],
 };
 
+function SortableTestRow({ id, children }: { id: string; children: React.ReactNode }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  return (
+    <tr ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }}>
+      <td style={{ width: 28, padding: "0 4px" }}>
+        <span {...attributes} {...listeners} style={{ fontSize: 12, color: "var(--muted)", cursor: "grab", userSelect: "none" }} title="Drag to reorder">⋮⋮</span>
+      </td>
+      {children}
+    </tr>
+  );
+}
+
 function SortableStepRow({ s, i, steps, setSteps, stepStatuses, selectorPickStepIndex, onPickStep, figmaNames, platform }: { s: any; i: number; steps: any[]; setSteps: (s: any[]) => void; stepStatuses?: string[]; selectorPickStepIndex?: number | null; onPickStep?: (idx: number) => void; figmaNames?: string[]; platform?: "android" | "ios_sim" }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: `step-${i}` });
   const st = stepStatuses?.[i];
@@ -288,7 +300,7 @@ export function LibraryPage({
     };
   }, [libTab, showCapture, screenBuildFilter, captureDeviceId, project.id, builds]);
 
-  useEffect(() => { loadScreenFolders(); }, [loadScreenFolders]);
+  useEffect(() => { loadScreenFolders(); }, [loadScreenFolders, libTab]);
   useEffect(() => { loadDataFolders(); }, [loadDataFolders]);
   useEffect(() => { if (libTab === "data") loadDataSets(); }, [libTab, loadDataSets]);
   useEffect(() => {
@@ -868,6 +880,20 @@ export function LibraryPage({
     const stepBlob = JSON.stringify([...stepsForPlatform(t, "android"), ...stepsForPlatform(t, "ios_sim")]).toLowerCase();
     return stepBlob.includes(q);
   });
+
+  const testDndIds = useMemo(() => filteredTests.map(t => `test-${t.id}`), [filteredTests]);
+  const testDndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
+  const handleTestDragEnd = useCallback(async (event: DragEndEvent) => {
+    if (!event.over || event.active.id === event.over.id) return;
+    const oldIdx = testDndIds.indexOf(String(event.active.id));
+    const newIdx = testDndIds.indexOf(String(event.over.id));
+    if (oldIdx < 0 || newIdx < 0) return;
+    const reordered = arrayMove(filteredTests, oldIdx, newIdx);
+    try {
+      await api.reorderTests(project.id, reordered.map(t => t.id));
+      onRefresh();
+    } catch (e: any) { toast(e.message, "error"); }
+  }, [filteredTests, testDndIds, project.id, onRefresh]);
 
   return (
     <>
@@ -1730,31 +1756,35 @@ export function LibraryPage({
 
       {/* Test table */}
       <div className="panel">
+        <DndContext sensors={testDndSensors} collisionDetection={closestCenter} onDragEnd={handleTestDragEnd}>
+        <SortableContext items={testDndIds} strategy={verticalListSortingStrategy}>
         <table className="tc-table">
-          <thead><tr><th>ID</th><th>Title</th><th>Collection</th><th>Suite</th><th>Steps</th><th>Status</th><th></th></tr></thead>
+          <thead><tr><th style={{ width: 28 }}></th><th>ID</th><th>Title</th><th>Collection</th><th>Suite</th><th>Steps</th><th>Status</th><th></th></tr></thead>
           <tbody>
             {filteredTests.map(t => {
               const st = lastRunStatus(t.id);
               return (
-                <tr key={t.id} style={{ cursor: "pointer" }} onClick={() => { if (editId !== t.id) openEdit(t); }}>
-                  <td><div className="tc-id">TC-{t.id}</div></td>
-                  <td>{t.name}</td>
-                  <td style={{ fontSize: 11, color: "var(--accent2)" }}>{moduleName(t.suite_id) || guessModule(t.name)}</td>
-                  <td style={{ fontSize: 11, color: "var(--muted)" }}>{suiteName(t.suite_id)}</td>
-                  <td style={{ fontSize: 11, color: "var(--muted)" }}>{Math.max(stepsForPlatform(t, "android").length, stepsForPlatform(t, "ios_sim").length)}</td>
-                  <td>{st ? <div className="tc-status"><div className={`dot ${statusDot(st)}`} />{st}</div> : <span style={{ color: "var(--muted)", fontSize: 11 }}>—</span>}</td>
-                  <td onClick={e => e.stopPropagation()}>
+                <SortableTestRow key={t.id} id={`test-${t.id}`}>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer" }}><div className="tc-id">TC-{t.id}</div></td>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer" }}>{t.name}</td>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer", fontSize: 11, color: "var(--accent2)" }}>{moduleName(t.suite_id) || guessModule(t.name)}</td>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer", fontSize: 11, color: "var(--muted)" }}>{suiteName(t.suite_id)}</td>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer", fontSize: 11, color: "var(--muted)" }}>{Math.max(stepsForPlatform(t, "android").length, stepsForPlatform(t, "ios_sim").length)}</td>
+                  <td onClick={() => { if (editId !== t.id) openEdit(t); }} style={{ cursor: "pointer" }}>{st ? <div className="tc-status"><div className={`dot ${statusDot(st)}`} />{st}</div> : <span style={{ color: "var(--muted)", fontSize: 11 }}>—</span>}</td>
+                  <td>
                     <div style={{ display: "flex", gap: 4 }}>
                       <button className="btn-ghost btn-sm" onClick={() => openEdit(t)}>Edit</button>
                       <button className="btn-ghost btn-sm" style={{ color: "var(--danger)" }} onClick={async () => { if (confirm(`Delete "${t.name}"?`)) { await api.deleteTest(t.id); toast("Deleted", "info"); onRefresh(); } }}>Del</button>
                     </div>
                   </td>
-                </tr>
+                </SortableTestRow>
               );
             })}
-            {filteredTests.length === 0 && <tr><td colSpan={7} style={{ color: "var(--muted)", padding: 18 }}>{tests.length === 0 ? "No tests yet. Click \"+ New Test\" to create one." : "No test cases match the filter."}</td></tr>}
+            {filteredTests.length === 0 && <tr><td colSpan={8} style={{ color: "var(--muted)", padding: 18 }}>{tests.length === 0 ? "No tests yet. Click \"+ New Test\" to create one." : "No test cases match the filter."}</td></tr>}
           </tbody>
         </table>
+        </SortableContext>
+        </DndContext>
       </div>
       </>}
 

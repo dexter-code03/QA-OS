@@ -110,6 +110,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE runs ADD COLUMN batch_run_id INTEGER REFERENCES batch_runs(id) ON DELETE SET NULL")
         con.commit()
 
+    # -- tests: sort_order --
+    test_cols = [row[1] for row in cur.execute("PRAGMA table_info(tests)").fetchall()]
+    if "sort_order" not in test_cols:
+        cur.execute("ALTER TABLE tests ADD COLUMN sort_order INTEGER DEFAULT 0")
+        con.commit()
+
     # -- runs: data_set_id, data_row_index --
     run_cols3 = [row[1] for row in cur.execute("PRAGMA table_info(runs)").fetchall()]
     if "data_set_id" not in run_cols3:
