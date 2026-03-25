@@ -21,6 +21,11 @@ from .recording_ios_sim import start_recording as start_ios_recording, stop as s
 from .video_compat import postprocess_mp4_for_broad_playback, transcode_mov_to_mp4
 from .session import SessionConfig, create_driver
 from .steps import parse_steps
+from .proxy import start_proxy, stop_proxy, configure_android_proxy, clear_android_proxy, configure_ios_proxy, clear_ios_proxy, is_mitmdump_available, ensure_mitm_cert_installed, _DEFAULT_PORT
+from .logcat_capture import start_logcat_capture, stop_logcat_capture
+from .chucker_capture import start_chucker_capture, stop_chucker_capture, is_chucker_available
+from .pulse_capture import start_pulse_capture, stop_pulse_capture, is_pulse_available
+from .api_log_store import save_api_logs
 
 
 def _utcnow():
@@ -184,6 +189,7 @@ class RunEngine:
 
             project_id = r.project_id
             run_dir = ensure_run_dir(settings.artifacts_dir, project_id, r.id)
+            api_logging_enabled = bool((r.summary or {}).get("enable_api_logging"))
 
         await event_bus.publish(RunEvent(run_id=run_id, type="started", payload={"runId": run_id}))
 
@@ -205,9 +211,83 @@ class RunEngine:
             ios_rec = None
             artifacts: dict = {"screenshots": [], "pageSources": [], "video": None}
 
+            import time as _time
+            from ..helpers import load_settings
+
+            api_logs: list = []
+            proxy_handle = None
+            logcat_handle = None
+            chucker_handle = None
+            pulse_handle = None
+            current_step_idx = [-1]
+            device_serial = device_target or "emulator-5554"
+            capture_mode = load_settings().get("api_capture_mode", "auto")
+            app_package = (build_meta or {}).get("package", "")
+            app_bundle_id = (build_meta or {}).get("bundle_id", "")
+
+            if api_logging_enabled:
+                def _on_api_log(entry):
+                    entry["run_id"] = run_id
+                    entry["step_index"] = current_step_idx[0]
+                    api_logs.append(entry)
+                    asyncio.run_coroutine_threadsafe(
+                        event_bus.publish(RunEvent(run_id=run_id, type="api_log", payload=entry)),
+                        loop,
+                    )
+
+                _capture_started = False
+
+                # ── Pre-session: clear Chucker DB before app install ─
+                if platform == "android" and capture_mode in ("chucker", "auto"):
+                    if app_package:
+                        from .chucker_capture import clear_chucker_db
+                        clear_chucker_db(device_serial, app_package)
+
+                # ── Logcat (Android, pre-session — no DB contention) ─
+                if not _capture_started and platform == "android" and capture_mode in ("logcat", "auto"):
+                    logcat_handle = start_logcat_capture(device_serial, _on_api_log)
+                    if logcat_handle:
+                        _capture_started = True
+
+                # ── Pulse (iOS) ──────────────────────────────
+                if not _capture_started and platform == "ios_sim" and capture_mode in ("pulse", "auto"):
+                    if app_bundle_id and is_pulse_available(device_target, app_bundle_id):
+                        pulse_handle = start_pulse_capture(device_target, app_bundle_id, _on_api_log)
+                        if pulse_handle:
+                            _capture_started = True
+
+                # ── mitmproxy fallback (any platform) ────────
+                if not _capture_started and capture_mode in ("mitmproxy", "auto"):
+                    if is_mitmdump_available():
+                        if platform == "android":
+                            clear_android_proxy(device_serial)
+                        elif platform == "ios_sim":
+                            clear_ios_proxy()
+                        _time.sleep(0.5)
+
+                        proxy_handle = start_proxy(_on_api_log)
+                        if proxy_handle and platform == "android":
+                            ensure_mitm_cert_installed(device_serial)
+                            configure_android_proxy(device_serial)
+                            _time.sleep(1)
+                        elif proxy_handle and platform == "ios_sim":
+                            configure_ios_proxy(port=_DEFAULT_PORT)
+                            _time.sleep(1)
+
             try:
                 raw_driver = create_driver(SessionConfig(platform=platform, device_target=device_target, app_path=app_path, build_meta=build_meta or {}))
                 driver = wrap_driver_with_debug(raw_driver, run_id, loop)
+
+                # ── Chucker (Android, post-session — app is running) ─
+                if api_logging_enabled and not _capture_started and platform == "android" and capture_mode in ("chucker", "auto"):
+                    if app_package and is_chucker_available(device_serial, app_package):
+                        chucker_handle = start_chucker_capture(device_serial, app_package, _on_api_log)
+                        if chucker_handle:
+                            chucker_handle.driver = raw_driver
+                            _capture_started = True
+
+                if chucker_handle is not None and chucker_handle.driver is None:
+                    chucker_handle.driver = raw_driver
 
                 if platform == "android":
                     rec = start_screenrecord(device_target)
@@ -242,7 +322,10 @@ class RunEngine:
                         loop,
                     )
 
-                summary = run_steps(driver, steps, on_step=on_step, cancel_check=cancel_check, run_id=run_id)
+                def on_step_start(idx):
+                    current_step_idx[0] = idx
+
+                summary = run_steps(driver, steps, on_step=on_step, cancel_check=cancel_check, run_id=run_id, on_step_start=on_step_start)
 
                 if rec:
                     video_name = "run.mp4"
@@ -284,6 +367,20 @@ class RunEngine:
                 _result["verdict"] = "error"
                 _result["error"] = str(e)
             finally:
+                if proxy_handle:
+                    if platform == "android":
+                        clear_android_proxy(device_serial)
+                    elif platform == "ios_sim":
+                        clear_ios_proxy()
+                    stop_proxy(proxy_handle)
+                if logcat_handle:
+                    stop_logcat_capture(logcat_handle)
+                if chucker_handle:
+                    stop_chucker_capture(chucker_handle)
+                if pulse_handle:
+                    stop_pulse_capture(pulse_handle)
+                if api_logs:
+                    save_api_logs(run_dir, api_logs)
                 try:
                     if driver:
                         driver.quit()

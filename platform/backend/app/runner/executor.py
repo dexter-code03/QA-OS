@@ -614,6 +614,7 @@ def run_steps(
     on_step: callable,
     cancel_check: callable | None = None,
     run_id: int | None = None,
+    on_step_start: callable | None = None,
 ) -> dict[str, Any]:
     passed = 0
     failed = 0
@@ -623,6 +624,8 @@ def run_steps(
     for idx, step in enumerate(steps):
         if cancel_check and cancel_check():
             break
+        if on_step_start:
+            on_step_start(idx)
         t0 = time.time()
         try:
             handler = STEP_HANDLERS.get(step.type)

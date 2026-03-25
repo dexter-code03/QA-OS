@@ -28,13 +28,21 @@ _VERSION = "0.1.0"
 
 @router.get("/api/health")
 def health() -> dict[str, Any]:
+    from ..runner.proxy import is_mitmdump_available
+
     uptime_s = int(time.monotonic() - _BOOT_TIME)
     db_ok = settings.db_path.exists()
+    capture_mode = load_settings().get("api_capture_mode", "auto")
     return {
         "status": "ok",
         "version": _VERSION,
         "uptime_seconds": uptime_s,
         "database": "connected" if db_ok else "missing",
+        "mitmdump_available": is_mitmdump_available(),
+        "logcat_available": True,
+        "chucker_available": True,
+        "pulse_available": True,
+        "api_capture_mode": capture_mode,
         "time": utcnow().isoformat(),
     }
 

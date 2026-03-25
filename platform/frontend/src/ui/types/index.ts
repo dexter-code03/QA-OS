@@ -234,6 +234,23 @@ export interface ScreenEntryFull extends ScreenEntry {
   xml_snapshot: string;
 }
 
+// ── API Logs ────────────────────────────────────────────────────────
+
+export interface ApiLog {
+  id: string;
+  run_id?: number;
+  step_index?: number;
+  timestamp: string;
+  method: string;
+  url: string;
+  status_code: number;
+  duration_ms: number;
+  req_headers: Record<string, string>;
+  req_body: string | null;
+  res_headers: Record<string, string>;
+  res_body: string | null;
+}
+
 // ── Data Layer ──────────────────────────────────────────────────────
 
 export interface DataFolder {

@@ -211,7 +211,7 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
 }
 .panel-header {
   padding: 14px 18px; border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
 }
 .panel-title { font-family: var(--sans); font-size: 13px; font-weight: 600; }
 .panel-body { padding: 4px 0; }
@@ -461,6 +461,81 @@ div.sidebar-run-row:focus-within > .sidebar-delete-btn {
   background: rgba(99,102,241,.2);
   color: #a78bfa;
 }
+
+/* ── Exec-left panel tab bar ── */
+.exec-left-tabs { display: flex; gap: 0; }
+.exec-left-tab {
+  padding: 6px 14px; font-size: 11px; font-family: var(--mono);
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
+}
+.exec-left-tab:hover { color: var(--text); }
+.exec-left-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* Scope toggle (Step / All) */
+.alog-scope-toggle { display: flex; gap: 0; border: 1px solid var(--border2); border-radius: 4px; overflow: hidden; }
+.alog-scope-btn { padding: 3px 10px; font-size: 10px; font-family: var(--mono); background: none; border: none; color: var(--muted); cursor: pointer; border-right: 1px solid var(--border2); }
+.alog-scope-btn:last-child { border-right: none; }
+.alog-scope-btn:hover { color: var(--text); }
+.alog-scope-btn.active { background: var(--accent); color: var(--bg); font-weight: 600; }
+
+/* ── API Logs panel ── */
+.alog-panel       { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.alog-toolbar     { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.alog-search      { flex: 1; padding: 4px 8px; border: 1px solid var(--border2); border-radius: 4px; font-size: 12px; font-family: var(--mono); background: var(--bg); color: var(--text); }
+.alog-search::placeholder { color: var(--muted); }
+.alog-live-badge  { color: #e53935; font-size: 11px; font-weight: bold; animation: pulse 1.5s infinite; }
+.alog-count       { font-size: 11px; color: var(--muted); margin-left: auto; white-space: nowrap; }
+.alog-body        { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+.alog-list        { width: 50%; border-right: 1px solid var(--border); overflow-y: auto; }
+.alog-empty       { padding: 24px; text-align: center; color: var(--muted); font-size: 12px; }
+.alog-detail      { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+
+.alog-row          { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--border); font-size: 11px; }
+.alog-row:hover    { background: rgba(255,255,255,.03); }
+.alog-row.selected { background: rgba(0,229,160,.08); }
+.alog-url          { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--text); }
+.alog-dur          { color: var(--muted); white-space: nowrap; font-size: 10px; }
+
+/* Method badges */
+.alog-method       { padding: 2px 6px; border-radius: 3px; font-size: 9px; font-weight: 700; white-space: nowrap; text-transform: uppercase; }
+.m-get             { background: rgba(74,222,128,.15); color: #4ade80; }
+.m-post            { background: rgba(96,165,250,.15); color: #60a5fa; }
+.m-put             { background: rgba(251,191,36,.15); color: #fbbf24; }
+.m-delete          { background: rgba(255,59,92,.15); color: var(--danger); }
+.m-patch           { background: rgba(167,139,250,.15); color: #a78bfa; }
+.m-options         { background: rgba(255,255,255,.06); color: var(--muted); }
+.m-head            { background: rgba(255,255,255,.06); color: var(--muted); }
+
+/* Status badges */
+.alog-status       { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; }
+.s-2xx             { background: rgba(74,222,128,.15); color: #4ade80; }
+.s-3xx             { background: rgba(96,165,250,.15); color: #60a5fa; }
+.s-4xx             { background: rgba(251,191,36,.15); color: #fbbf24; }
+.s-5xx             { background: rgba(255,59,92,.15); color: var(--danger); }
+
+/* Status filter buttons */
+.alog-status-filters { display: flex; gap: 4px; }
+.alog-status-btn   { padding: 3px 8px; border: 1px solid var(--border2); border-radius: 3px; font-size: 10px; cursor: pointer; background: var(--bg); color: var(--muted); font-family: var(--mono); }
+.alog-status-btn:hover { border-color: var(--accent); color: var(--text); }
+.alog-status-btn.active.sf-all { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.alog-status-btn.active.sf-2xx { background: rgba(74,222,128,.2); color: #4ade80; border-color: #4ade80; }
+.alog-status-btn.active.sf-4xx { background: rgba(251,191,36,.2); color: #fbbf24; border-color: #fbbf24; }
+.alog-status-btn.active.sf-5xx { background: rgba(255,59,92,.2); color: var(--danger); border-color: var(--danger); }
+
+/* Detail panel */
+.alog-detail-url   { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.alog-detail-full-url { font-family: var(--mono); font-size: 11px; word-break: break-all; color: var(--text); }
+.alog-detail-meta  { display: flex; gap: 12px; padding: 6px 10px; font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.alog-detail-tabs  { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+.alog-detail-tab-bar { display: flex; border-bottom: 1px solid var(--border); }
+.alog-detail-tab   { padding: 5px 12px; font-size: 11px; border: none; background: none; cursor: pointer; color: var(--muted); font-family: var(--mono); }
+.alog-detail-tab:hover { color: var(--text); }
+.alog-detail-tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+.alog-detail-content { flex: 1; overflow: auto; padding: 10px; font-size: 11px; font-family: var(--mono); margin: 0; background: var(--bg); color: var(--text); white-space: pre-wrap; word-break: break-all; min-height: 0; }
+.alog-detail-url   { flex-shrink: 0; }
+.alog-detail-meta  { flex-shrink: 0; }
+.alog-detail-tab-bar { flex-shrink: 0; }
 
 /* ── Test library table ── */
 .tc-table { width: 100%; border-collapse: collapse; }

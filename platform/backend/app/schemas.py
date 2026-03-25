@@ -95,6 +95,7 @@ class RunCreate(BaseModel):
     device_target: str = ""
     data_set_id: Optional[int] = None
     environment: Optional[str] = None
+    enable_api_logging: bool = False
 
 
 class RunOut(BaseModel):
@@ -126,6 +127,7 @@ class BatchRunCreate(BaseModel):
     device_target: str = ""
     data_set_id: Optional[int] = None
     environment: Optional[str] = None
+    enable_api_logging: bool = False
 
 class BatchRunChildOut(BaseModel):
     run_id: int

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, Build, DataSet, DeviceList, ModuleDef, Project, Run, SuiteDef, TapDiagnosisOut, TestDef } from "../api";
+import type { ApiLog } from "../types";
 import {
   toast,
   stepsForPlatform,
@@ -8,6 +9,7 @@ import {
   type ExecutionSetupPreset,
 } from "../helpers";
 import { XmlElementTree, simplifyXmlForAI } from "../XmlElementTree";
+import { ApiLogsPanel } from "../components/execution/ApiLogsPanel";
 
 const WS_BASE_DELAY = 1000;
 const WS_MAX_DELAY = 30_000;
@@ -61,6 +63,7 @@ export function ExecutionPage({
   const [dataSetId, setDataSetId] = useState<number | null>(null);
   const [projectDataSets, setProjectDataSets] = useState<DataSet[]>([]);
   const [agentMode, setAgentMode] = useState(false);
+  const [enableApiLogging, setEnableApiLogging] = useState(false);
   const [agentMaxIterations] = useState(5);
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentStatus, setAgentStatus] = useState("");
@@ -82,6 +85,9 @@ export function ExecutionPage({
   const runTerminalRef = useRef(false);
   const [wsLive, setWsLive] = useState(true);
   const [wsReconnectFailed, setWsReconnectFailed] = useState(false);
+  const [leftPanelTab, setLeftPanelTab] = useState<"xml" | "api_logs">("xml");
+  const [apiLogs, setApiLogs] = useState<ApiLog[]>([]);
+  const [apiLogScope, setApiLogScope] = useState<"all" | "step">("step");
 
   const bfp = useMemo(() => builds.filter(b => b.platform === platform), [builds, platform]);
   const devList = platform === "android" ? devices.android : devices.ios_simulators;
@@ -126,6 +132,8 @@ export function ExecutionPage({
       setLiveXmlName(null);
       setWsLive(true);
       setWsReconnectFailed(false);
+      setApiLogs([]);
+      setLeftPanelTab("xml");
       return;
     }
     setRun(null);
@@ -135,10 +143,16 @@ export function ExecutionPage({
     setLiveXmlName(null);
     setWsLive(true);
     setWsReconnectFailed(false);
+    setApiLogs([]);
+    setLeftPanelTab("xml");
     wsRetryRef.current = 0;
     wsDelayRef.current = WS_BASE_DELAY;
     lastWsEventSeqRef.current = 0;
-    loadRun(activeRunId);
+    loadRun(activeRunId).then(r => {
+      if (r && r.status !== "running" && r.status !== "queued") {
+        api.getApiLogs(activeRunId).then(res => { if (res.logs?.length) setApiLogs(res.logs); }).catch(() => {});
+      }
+    });
     wsRef.current?.close();
     if (wsReconnectTimerRef.current) {
       clearTimeout(wsReconnectTimerRef.current);
@@ -165,9 +179,13 @@ export function ExecutionPage({
             .catch(() => {});
         }
       }
+      if (ev.type === "api_log" && ev.payload) {
+        setApiLogs(prev => [...prev, ev.payload as ApiLog]);
+      }
       if (ev.type === "finished") {
         loadRun(activeRunId);
         onRefresh();
+        api.getApiLogs(activeRunId).then(r => { if (r.logs?.length) setApiLogs(r.logs); }).catch(() => {});
       }
     };
     const connect = () => {
@@ -492,6 +510,7 @@ export function ExecutionPage({
           platform,
           device_target: deviceTarget,
           ...(dataSetId ? { data_set_id: dataSetId } : {}),
+          ...(enableApiLogging ? { enable_api_logging: true } : {}),
         });
         setStepResults([]); setSelShot(null);
         onBatchCreated(batch.id);
@@ -499,7 +518,7 @@ export function ExecutionPage({
       } else {
         const created: Run[] = [];
         for (const t of toRun) {
-          const r = await api.createRun({ project_id: project.id, build_id: buildId, test_id: t.id, platform, device_target: deviceTarget, ...(dataSetId ? { data_set_id: dataSetId } : {}) });
+          const r = await api.createRun({ project_id: project.id, build_id: buildId, test_id: t.id, platform, device_target: deviceTarget, ...(dataSetId ? { data_set_id: dataSetId } : {}), ...(enableApiLogging ? { enable_api_logging: true } : {}) });
           created.push(r);
         }
         setStepResults([]); setSelShot(null);
@@ -1084,6 +1103,11 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
               <span style={{ color: agentMode ? "#a78bfa" : "var(--muted)" }}>Agent mode</span>
               <span style={{ fontSize: 10, color: "var(--muted)" }} title="Auto-fix on failure until pass or max 5 attempts">(auto-fix)</span>
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, cursor: "pointer", marginLeft: 8, paddingLeft: 12, borderLeft: "1px solid var(--border)" }}>
+              <input type="checkbox" checked={enableApiLogging} onChange={e => setEnableApiLogging(e.target.checked)} />
+              <span style={{ color: enableApiLogging ? "#60a5fa" : "var(--muted)" }}>API Logging</span>
+              <span style={{ fontSize: 10, color: "var(--muted)" }} title="Capture HTTP/HTTPS traffic via mitmproxy during the run">(network)</span>
+            </label>
           </div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
             <select value={platform} onChange={e => setPlatform(e.target.value as any)}><option value="android">Android</option><option value="ios_sim">iOS Simulator</option></select>
@@ -1170,25 +1194,53 @@ ${shotEntries.length > 0 ? `<h2>Screenshots</h2><div class="shots-grid">${screen
               <div className="progress-bar"><div className="progress-fill" style={{ width: `${pct}%`, background: displayRun.status === "cancelled" ? "var(--muted)" : completedSteps > passedSteps ? "var(--danger)" : undefined }} /></div>
             </div>
 
-            {/* Live XML Panel */}
-            <div className="panel">
+            {/* XML / API Logs tabbed panel */}
+            <div className="panel" style={leftPanelTab === "api_logs" ? { display: "flex", flexDirection: "column", height: 480, overflow: "hidden" } : undefined}>
               <div className="panel-header">
-                <div className="panel-title">Page Source XML — Step {selShotIdx >= 0 ? `S${selShotIdx + 1}` : "—"}</div>
-                <div style={{ fontSize: 11, color: "var(--muted)" }}>Captured after each step · click a step to view</div>
-              </div>
-              <div style={{ padding: 12 }}>
-                {liveXml ? (
-                  <XmlElementTree
-                    key={`${displayRun.id}-${selShotIdx}-${selXmlArtifactKey}`}
-                    xml={liveXml}
-                    onCopy={(msg) => toast(msg, "success")}
-                  />
-                ) : (
-                  <div className="xml-panel" style={{ color: "var(--muted)" }}>
-                    {displayRun.status === "running" ? "Waiting for page source..." : pageSources.length > 0 ? "Click a step to view its XML" : "No page source captured"}
+                <div className="exec-left-tabs">
+                  <button className={`exec-left-tab ${leftPanelTab === "xml" ? "active" : ""}`} onClick={() => setLeftPanelTab("xml")}>Page Source</button>
+                  <button className={`exec-left-tab ${leftPanelTab === "api_logs" ? "active" : ""}`} onClick={() => setLeftPanelTab("api_logs")}>
+                    API Logs{apiLogs.length > 0 ? ` (${apiLogs.length})` : ""}
+                  </button>
+                </div>
+                {leftPanelTab === "xml" && (
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>Step {selShotIdx >= 0 ? `S${selShotIdx + 1}` : "—"} · click a step to view</div>
+                )}
+                {leftPanelTab === "api_logs" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div className="alog-scope-toggle">
+                      <button className={`alog-scope-btn ${apiLogScope === "step" ? "active" : ""}`} onClick={() => setApiLogScope("step")}>
+                        Step {selShotIdx >= 0 ? `S${selShotIdx + 1}` : "—"}
+                      </button>
+                      <button className={`alog-scope-btn ${apiLogScope === "all" ? "active" : ""}`} onClick={() => setApiLogScope("all")}>
+                        All
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
+              {leftPanelTab === "xml" ? (
+                <div style={{ padding: 12 }}>
+                  {liveXml ? (
+                    <XmlElementTree
+                      key={`${displayRun.id}-${selShotIdx}-${selXmlArtifactKey}`}
+                      xml={liveXml}
+                      onCopy={(msg) => toast(msg, "success")}
+                    />
+                  ) : (
+                    <div className="xml-panel" style={{ color: "var(--muted)" }}>
+                      {displayRun.status === "running" ? "Waiting for page source..." : pageSources.length > 0 ? "Click a step to view its XML" : "No page source captured"}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <ApiLogsPanel
+                  logs={apiLogScope === "step" && selShotIdx >= 0 ? apiLogs.filter(l => l.step_index === selShotIdx) : apiLogs}
+                  isLive={displayRun.status === "running"}
+                  stepLabel={apiLogScope === "step" && selShotIdx >= 0 ? `S${selShotIdx + 1}` : undefined}
+                  disabled={!displayRun.summary?.enable_api_logging && apiLogs.length === 0}
+                />
+              )}
             </div>
 
             {displayRun.error_message && <div className="error-box" style={{ marginTop: 12 }}><strong>Error:</strong> {displayRun.error_message}</div>}

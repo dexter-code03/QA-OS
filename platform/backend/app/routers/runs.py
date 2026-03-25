@@ -11,7 +11,9 @@ from ..events import RunEvent, event_bus
 from ..helpers import classify_failure_message, run_to_out, utcnow
 from ..models import BatchRun, Build, DataSet, Project, Run, TestDefinition
 from ..runner.engine import RunEngine, run_engine
+from ..runner.api_log_store import load_api_logs
 from ..schemas import RunCreate, RunOut
+from ..settings import settings
 
 router = APIRouter()
 
@@ -75,7 +77,7 @@ async def create_run(payload: RunCreate):
                     data_set_id=data_set_id,
                     data_row_index=idx,
                     artifacts={},
-                    summary={},
+                    summary={"enable_api_logging": payload.enable_api_logging} if payload.enable_api_logging else {},
                 )
                 db.add(r)
                 db.commit()
@@ -98,7 +100,7 @@ async def create_run(payload: RunCreate):
                 data_set_id=data_set_id,
                 data_row_index=0 if rows else None,
                 artifacts={},
-                summary={},
+                summary={"enable_api_logging": payload.enable_api_logging} if payload.enable_api_logging else {},
             )
             db.add(r)
             db.commit()
@@ -187,3 +189,14 @@ def triage_run(run_id: int) -> dict[str, Any]:
                 }
             ]
         }
+
+
+@router.get("/api/runs/{run_id}/api-logs")
+def get_api_logs(run_id: int) -> dict:
+    with SessionLocal() as db:
+        r = db.query(Run).filter(Run.id == run_id).first()
+        if not r:
+            raise HTTPException(status_code=404, detail="Run not found")
+        run_dir = settings.artifacts_dir / str(r.project_id) / str(r.id)
+    logs = load_api_logs(run_dir)
+    return {"logs": logs}

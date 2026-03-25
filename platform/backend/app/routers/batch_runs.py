@@ -78,7 +78,7 @@ async def create_batch_run(payload: BatchRunCreate) -> BatchRunOut:
                 platform=payload.platform,
                 data_set_id=data_set_id,
                 artifacts={},
-                summary={},
+                summary={"enable_api_logging": payload.enable_api_logging} if payload.enable_api_logging else {},
             )
             db.add(r)
             child_runs.append(r)

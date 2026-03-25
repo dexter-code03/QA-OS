@@ -24,6 +24,7 @@ export type {
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
+  ApiLog,
 } from "../types";
 
 import type {
@@ -51,6 +52,7 @@ import type {
   ScreenFolder,
   ScreenEntry,
   ScreenEntryFull,
+  ApiLog,
 } from "../types";
 
 let authBootstrapped = false;
@@ -171,7 +173,7 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   bootstrapAuth,
-  health: () => http<{ status: string }>("/api/health"),
+  health: () => http<{ status: string; mitmdump_available?: boolean; logcat_available?: boolean; chucker_available?: boolean; pulse_available?: boolean; api_capture_mode?: string }>("/api/health"),
 
   // Projects
   listProjects: () => http<Project[]>("/api/projects"),
@@ -417,6 +419,7 @@ export const api = {
     device_target?: string;
     data_set_id?: number | null;
     environment?: string;
+    enable_api_logging?: boolean;
   }) => http<BatchRun>("/api/batch-runs", { method: "POST", body: JSON.stringify(payload) }),
   getBatchRun: (batchId: number) => http<BatchRun>(`/api/batch-runs/${batchId}`),
   listBatchRuns: (projectId: number) => http<BatchRun[]>(`/api/projects/${projectId}/batch-runs`),
@@ -432,6 +435,7 @@ export const api = {
     device_target?: string;
     data_set_id?: number | null;
     environment?: string;
+    enable_api_logging?: boolean;
   }) => http<Run>("/api/runs", { method: "POST", body: JSON.stringify(payload) }),
   getRun: (runId: number) => http<Run>(`/api/runs/${runId}`),
   /** Missed run events after a sequence number (WebSocket reconnection recovery). */
@@ -439,6 +443,7 @@ export const api = {
     http<{ events: unknown[]; after: number }>(`/api/runs/${runId}/events?after=${after}`),
   cancelRun: (runId: number) => http<{ ok: boolean; message?: string }>(`/api/runs/${runId}/cancel`, { method: "POST" }),
   deleteRun: (runId: number) => http<{ ok: boolean }>(`/api/runs/${runId}`, { method: "DELETE" }),
+  getApiLogs: (runId: number) => http<{ logs: ApiLog[] }>(`/api/runs/${runId}/api-logs`),
 
   // Devices
   listDevices: () => http<DeviceList>("/api/devices"),
